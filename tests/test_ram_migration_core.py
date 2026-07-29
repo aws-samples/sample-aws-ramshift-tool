@@ -1,0 +1,1001 @@
+"""Offline RAM/CFN fidelity tests: unsigned clients, strict stubs, no credentials."""
+import copy
+import json
+from contextlib import ExitStack
+
+import botocore.session
+import pytest
+import yaml
+from botocore import UNSIGNED
+from botocore.config import Config
+from botocore.stub import Stubber
+
+from ram_migration_common import PURPOSE, Api, Group, MigrationError, check_sdk
+from ram_migration_discovery import (
+    ApprovedGroup, CfnLoader, Discovery, external_catalog, permission_snapshot,
+    policy_semantics, resolve,
+)
+from ram_migration_stacks import (
+    Stacks, accept, additive_template, stack_name, template_for, validate_changes,
+    verify_group,
+)
+
+OWNER, CONSUMER, OTHER, DEPARTED = ("000000000001", "000000000002",
+                                    "000000000003", "000000000004")
+REGION, MIGRATION = "us-east-1", "offline-canary"
+KIND = "route53resolver:ResolverRule"
+PERMISSION = "arn:aws:ram::aws:permission/AWSRAMDefaultPermissionRoute53ResolverRule"
+SOURCE = f"arn:aws:ram:{REGION}:{OWNER}:resource-share/source"
+TEMP = f"arn:aws:ram:{REGION}:{OWNER}:resource-share/temporary"
+RESOURCE = f"arn:aws:route53resolver:{REGION}:{OWNER}:resolver-rule/rslvr-rr-offline1"
+STACK_ID = f"arn:aws:cloudformation:{REGION}:{OWNER}:stack/offline/identifier"
+CHANGE_ID = f"arn:aws:cloudformation:{REGION}:{OWNER}:changeSet/offline/identifier"
+POLICY = {"Version": "2012-10-17", "Statement": [{
+    "Effect": "Allow", "Action": ["route53resolver:GetResolverRule",
+                                "route53resolver:AssociateResolverRule"], "Resource": "*"}]}
+
+
+@pytest.fixture(autouse=True)
+def prohibit_authentication_and_network(monkeypatch):
+    monkeypatch.setenv("AWS_CONFIG_FILE", "/dev/null")
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", "/dev/null")
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Offline core tests must not load credentials or send requests")
+
+    monkeypatch.setattr("botocore.session.Session.get_credentials", forbidden)
+    monkeypatch.setattr("botocore.endpoint.Endpoint._send", forbidden)
+    monkeypatch.setattr("urllib.request.urlopen", forbidden)
+
+
+@pytest.fixture
+def clients():
+    with ExitStack() as stack:
+        clients, stubs = {}, {}
+        session = botocore.session.get_session()
+        for name in ("ram", "cloudformation", "organizations"):
+            clients[name] = session.create_client(name, region_name=REGION,
+                                                  config=Config(signature_version=UNSIGNED))
+            stubs[name] = stack.enter_context(Stubber(clients[name]))
+        yield clients, stubs
+        for stub in stubs.values():
+            stub.assert_no_pending_responses()
+
+
+class OfflineRouter:
+    def __init__(self, clients, readonly=False, consumer=None):
+        self.clients, self.readonly, self.consumer = clients, readonly, consumer
+
+    def client(self, account, service, region, write=False):
+        assert account in (OWNER, CONSUMER, OTHER, DEPARTED)
+        assert region == REGION
+        client = self.consumer if account != OWNER and service == "ram" else self.clients[service]
+        assert client is not None
+        return Api(client, write and not self.readonly)
+
+
+def permission(version="2", policy=None, default=True, arn=PERMISSION, kind=KIND):
+    return {"arn": arn, "version": version, "defaultVersion": default,
+            "resourceType": kind, "permission": json.dumps(policy or POLICY),
+            "status": "ATTACHABLE", "featureSet": "STANDARD", "permissionType": "AWS_MANAGED"}
+
+
+def snapshot():
+    return {"Arn": PERMISSION, "Version": "2", "ResourceType": KIND,
+            "Policy": policy_semantics(POLICY), "DefaultVersion": True}
+
+
+def group(resources=None, consumers=(CONSUMER,), sources=None, approved=False):
+    args = (OWNER, REGION, consumers, {KIND: PERMISSION},
+            resources or {RESOURCE: KIND}, sources or [SOURCE])
+    if approved:
+        return ApprovedGroup(*args, {KIND: snapshot()}, [STACK_ID])
+    return Group(*args)
+
+
+def resource(arn=RESOURCE, kind=KIND):
+    return {"arn": arn, "type": kind, "status": "AVAILABLE"}
+
+
+def migration_share(g=None):
+    g = g or group()
+    props = template_for([g], MIGRATION)["Resources"][g.logical_id]["Properties"]
+    return {"resourceShareArn": TEMP, "owningAccountId": OWNER,
+            "name": props["Name"], "status": "ACTIVE", "allowExternalPrincipals": True,
+            "resourceShareConfiguration": {"retainSharingOnAccountLeaveOrganization": True},
+            "tags": [{"key": tag["Key"], "value": tag["Value"]} for tag in props["Tags"]]}
+
+
+def association(entity, kind, status="ASSOCIATED", share=TEMP):
+    return {"resourceShareArn": share, "associatedEntity": entity,
+            "associationType": kind, "status": status}
+
+
+def stack_info(state="CREATE_COMPLETE"):
+    return {"StackId": STACK_ID, "StackName": stack_name(MIGRATION, OWNER, REGION),
+            "CreationTime": "2026-10-13T00:00:00Z", "StackStatus": state,
+            "Tags": [{"Key": "Purpose", "Value": PURPOSE},
+                     {"Key": "MigrationId", "Value": MIGRATION},
+                     {"Key": "OwnerAccount", "Value": OWNER}]}
+
+
+def no_stack(stub, physical=False, arn=SOURCE):
+    kwargs = {"PhysicalResourceId": arn} if physical else {
+        "StackName": stack_name(MIGRATION, OWNER, REGION)}
+    stub.add_client_error("describe_stack_resources" if physical else "describe_stacks",
+                          service_error_code="ValidationError",
+                          service_message="Stack for the requested resource does not exist",
+                          expected_params=kwargs)
+
+
+def owning_stack(stub, template, logical, arn, stack=None):
+    stub.add_response("describe_stack_resources", {"StackResources": [{
+        "StackId": STACK_ID, "StackName": "offline", "LogicalResourceId": logical,
+        "PhysicalResourceId": arn, "ResourceType": "AWS::RAM::ResourceShare",
+        "Timestamp": "2026-10-13T00:00:00Z", "ResourceStatus": "CREATE_COMPLETE"}]},
+        {"PhysicalResourceId": arn})
+    stub.add_response("describe_stacks", {"Stacks": [stack or stack_info()]},
+                      {"StackName": STACK_ID})
+    stub.add_response("get_template", {"TemplateBody": json.dumps(template)},
+                      {"StackName": STACK_ID, "TemplateStage": "Processed"})
+
+
+def stub_discovery(stubs, shares=None, principals=None, kinds=None,
+                   attached_version="2", attached_policy=None, read_permissions=None,
+                   principal_status="ASSOCIATED"):
+    shares = shares or [(SOURCE, RESOURCE)]
+    kinds = kinds or {}
+    stubs["ram"].add_response("get_resource_shares", {"resourceShares": [
+        {"resourceShareArn": arn, "owningAccountId": OWNER, "status": "ACTIVE", "tags": []}
+        for arn, _ in shares]}, {"resourceOwner": "SELF"})
+    for arn, resource_arn in shares:
+        kind = kinds.get(resource_arn, KIND)
+        stubs["ram"].add_response("list_resources", {"resources": [resource(resource_arn, kind)]},
+                                 {"resourceOwner": "SELF", "resourceShareArns": [arn]})
+        ids = (principals or {}).get(arn, [CONSUMER])
+        stubs["ram"].add_response("get_resource_share_associations",
+                                 {"resourceShareAssociations": [
+                                     association(p, "PRINCIPAL", status=principal_status, share=arn)
+                                     for p in ids]},
+                                 {"associationType": "PRINCIPAL", "resourceShareArns": [arn]})
+        no_stack(stubs["cloudformation"], physical=True, arn=arn)
+        # An empty/service-only inventory stops before permission discovery.
+        if read_permissions is False or (read_permissions is None and
+                (not ids or all(p.endswith(".amazonaws.com") for p in ids))):
+            continue
+        stubs["ram"].add_response("list_resource_share_permissions", {"permissions": [{
+            "arn": PERMISSION, "version": attached_version, "resourceType": kind,
+            "defaultVersion": attached_version == "2"}]}, {"resourceShareArn": arn})
+        stubs["ram"].add_response("get_permission", {"permission": permission(kind=kind)},
+                                 {"permissionArn": PERMISSION})
+        if attached_version != "2":
+            stubs["ram"].add_response(
+                "get_permission", {"permission": permission(attached_version, attached_policy,
+                                                           default=False, kind=kind)},
+                {"permissionArn": PERMISSION, "permissionVersion": int(attached_version)})
+
+
+def inspect(clients, consumers=None, capabilities=None, overrides=None):
+    return Discovery(OfflineRouter(clients), consumers or {CONSUMER}, MIGRATION,
+                     overrides or {}, capabilities if capabilities is not None else {
+                         KIND.lower(): True}).inspect(OWNER, REGION)
+
+
+def stub_original_principals(stubs, live, configured):
+    stub = stubs["ram"]
+    stub.add_response("get_resource_shares", {"resourceShares": [{
+        "resourceShareArn": SOURCE, "owningAccountId": OWNER, "status": "ACTIVE", "tags": []}]},
+        {"resourceOwner": "SELF"})
+    stub.add_response("list_resources", {"resources": [resource()]},
+                      {"resourceOwner": "SELF", "resourceShareArns": [SOURCE]})
+    stub.add_response("get_resource_share_associations", {"resourceShareAssociations": [
+        association(p, "PRINCIPAL", share=SOURCE) for p in live]},
+        {"associationType": "PRINCIPAL", "resourceShareArns": [SOURCE]})
+    original = {"Resources": {"Original": {"Type": "AWS::RAM::ResourceShare",
+                                          "Properties": {"Principals": configured}}}}
+    owning_stack(stubs["cloudformation"], original, "Original", SOURCE,
+                 {**stack_info(), "Tags": []})
+
+
+def test_installed_sdk_supports_retention_without_authentication():
+    check_sdk()
+    model = botocore.session.get_session().get_service_model("cloudformation")
+    assert "DisableRollback" in model.operation_model("ExecuteChangeSet").input_shape.members
+    assert "IncludePropertyValues" in model.operation_model("DescribeChangeSet").input_shape.members
+
+
+@pytest.mark.parametrize("name,value", [
+    ("Principal", {"AWS": f"arn:aws:iam::{CONSUMER}:root"}),
+    ("Principal", "*"),
+    ("NotPrincipal", {"AWS": f"arn:aws:iam::{OTHER}:role/Restricted"}),
+    ("Condition", {"StringEquals": {"aws:PrincipalOrgID": "o-offline123"}}),
+    ("Condition", {"Bool": {"aws:SecureTransport": True}}),
+    ("Condition", {"NumericEquals": {"service:Limit": 1}}),
+])
+def test_policy_semantics_scalar_and_list_values_are_equivalent_and_idempotent(name, value):
+    scalar = copy.deepcopy(POLICY)
+    scalar["Statement"][0][name] = value
+    listed = copy.deepcopy(scalar)
+    if name == "Condition":
+        operator = next(iter(value))
+        condition_key = next(iter(value[operator]))
+        listed["Statement"][0][name][operator][condition_key] = [value[operator][condition_key]]
+    elif isinstance(value, dict):
+        key = next(iter(value))
+        listed["Statement"][0][name][key] = [value[key]]
+    else:
+        listed["Statement"][0][name] = [value]
+    normalized = policy_semantics(scalar)
+    assert normalized == policy_semantics(listed)
+    assert policy_semantics(normalized) == normalized
+    assert policy_semantics(json.dumps(scalar)) == normalized
+
+
+def test_policy_semantics_preserves_principal_and_condition_restrictions():
+    original = copy.deepcopy(POLICY)
+    original["Statement"][0]["Principal"] = {
+        "AWS": [f"arn:aws:iam::{CONSUMER}:root", f"arn:aws:iam::{OTHER}:root"]}
+    original["Statement"][0]["Condition"] = {
+        "StringEquals": {"aws:PrincipalOrgID": ["o-first", "o-second"]}}
+    reordered = copy.deepcopy(original)
+    reordered["Statement"][0]["Principal"]["AWS"].reverse()
+    reordered["Statement"][0]["Condition"]["StringEquals"]["aws:PrincipalOrgID"].reverse()
+    assert policy_semantics(original) == policy_semantics(reordered)
+    different_principal = copy.deepcopy(original)
+    different_principal["Statement"][0]["Principal"]["AWS"] = [f"arn:aws:iam::{DEPARTED}:root"]
+    different_condition = copy.deepcopy(original)
+    different_condition["Statement"][0]["Condition"]["StringEquals"]["aws:PrincipalOrgID"] = "o-third"
+    different_operator = copy.deepcopy(original)
+    different_operator["Statement"][0]["Condition"] = {
+        "StringLike": {"aws:PrincipalOrgID": ["o-first", "o-second"]}}
+    assert policy_semantics(original) != policy_semantics(different_principal)
+    assert policy_semantics(original) != policy_semantics(different_condition)
+    assert policy_semantics(original) != policy_semantics(different_operator)
+
+
+def test_permission_snapshot_supports_scalar_principal_and_string_equals(clients):
+    cs, stubs = clients
+    conditional = copy.deepcopy(POLICY)
+    conditional["Statement"][0]["Principal"] = {"AWS": f"arn:aws:iam::{CONSUMER}:root"}
+    conditional["Statement"][0]["Condition"] = {"StringEquals": {
+        "ram:ResourceShareOwnerAccountId": OWNER}}
+    stubs["ram"].add_response("get_permission", {"permission": permission(policy=conditional)},
+                             {"permissionArn": PERMISSION})
+    captured = permission_snapshot(Api(cs["ram"]), PERMISSION)
+    statement = captured["Policy"]["Statement"][0]
+    assert statement["Principal"]["AWS"] == [f"arn:aws:iam::{CONSUMER}:root"]
+    assert statement["Condition"]["StringEquals"]["ram:ResourceShareOwnerAccountId"] == [OWNER]
+    assert policy_semantics(captured["Policy"]) == captured["Policy"]
+
+
+def test_catalogue_multicode_and_conditional_rows():
+    text = """| `network-firewall:StatefulRuleGroup` and `network-firewall:StatelessRuleGroup` | a | b | ![Yes](images/icon-yes.png) | d | e |
+| `route53resolver:ResolverRule` | a | b | ![Yes](images/icon-yes.png) | d | e |
+| `ec2:CapacityReservation` | a | b | ![Yes](images/icon-yes.png) reservations; ![No](images/icon-no.png) Capacity Blocks | d | e |
+| `ec2:Subnet` | a | b | ![No](images/icon-no.png) | d | e |
+| `service:Qualified` | a | b | ![Yes](images/icon-yes.png) except some resources | d | e |"""
+    values = external_catalog(text)
+    assert values["network-firewall:statefulrulegroup"] is True
+    assert values["network-firewall:statelessrulegroup"] is True
+    assert values[KIND.lower()] is True
+    assert values["ec2:subnet"] is False
+    assert "ec2:capacityreservation" not in values
+    assert "service:qualified" not in values
+
+
+def test_catalogue_conflicting_rows_fail_closed():
+    with pytest.raises(MigrationError, match="Conflicting"):
+        external_catalog("""| `ec2:Subnet` | a | b | ![Yes](images/icon-yes.png) | d | e |
+| `ec2:Subnet` | a | b | ![No](images/icon-no.png) | d | e |""")
+
+
+def test_qualified_catalogue_row_overrides_unqualified_row_conservatively():
+    values = external_catalog("""| `ec2:CapacityReservation` | a | b | ![Yes](images/icon-yes.png) | d | e |
+| `ec2:CapacityReservation` | a | b | ![Yes](images/icon-yes.png) except Capacity Blocks | d | e |
+| `route53resolver:ResolverRule` | a | b | ![Yes](images/icon-yes.png) | d | e |""")
+    assert "ec2:capacityreservation" not in values
+    assert values[KIND.lower()] is True
+
+
+def test_principal_resolution_preserves_leading_zeros():
+    template = yaml.load(
+        "Parameters:\n  Consumers:\n    Type: CommaDelimitedList\n"
+        "Resources:\n  Share:\n    Properties:\n      Principals: !Ref Consumers\n", Loader=CfnLoader)
+    assert resolve(template["Resources"]["Share"]["Properties"]["Principals"],
+                   {"Consumers": CONSUMER + "," + OTHER}, template, {}) == [CONSUMER, OTHER]
+    assert group().consumers == (CONSUMER,)
+
+
+@pytest.mark.parametrize("expression", [
+    {"Ref": "Missing"}, {"Ref": "Consumers", "Fn::Sub": "anything"},
+    {"Fn::Join": ["", [2]]}, {"Fn::Split": [",", 2]},
+    {"Fn::Sub": ["${Consumer}", {"Consumer": 2}]},
+])
+def test_ambiguous_or_numeric_principal_resolution_fails(expression):
+    with pytest.raises(MigrationError):
+        resolve(expression, {"Consumers": CONSUMER}, {}, {})
+
+
+def test_native_non_cfn_share_stack_not_found(clients):
+    cs, stubs = clients
+    no_stack(stubs["cloudformation"], physical=True)
+    discovery = Discovery(OfflineRouter(cs), {CONSUMER}, MIGRATION, {}, {})
+    assert discovery._stack_principals(OWNER, REGION, SOURCE) is None
+
+
+def test_native_missing_consumers_block_instead_of_service_exclusion(clients):
+    cs, stubs = clients
+    stub_discovery(stubs, principals={SOURCE: []})
+    result = inspect(cs)
+    assert not result.groups and not result.excluded
+    assert "consumers are unresolved" in result.blocked[0]
+
+
+def test_owning_template_recovers_missing_live_principals_and_stack_lineage(clients):
+    cs, stubs = clients
+    stub = stubs["ram"]
+    stub.add_response("get_resource_shares", {"resourceShares": [{
+        "resourceShareArn": SOURCE, "owningAccountId": OWNER, "status": "ACTIVE", "tags": []}]},
+        {"resourceOwner": "SELF"})
+    stub.add_response("list_resources", {"resources": [resource()]},
+                      {"resourceOwner": "SELF", "resourceShareArns": [SOURCE]})
+    stub.add_response("get_resource_share_associations", {"resourceShareAssociations": []},
+                      {"associationType": "PRINCIPAL", "resourceShareArns": [SOURCE]})
+    original = {"Parameters": {"Consumers": {"Type": "CommaDelimitedList"}},
+                "Resources": {"Original": {"Type": "AWS::RAM::ResourceShare", "Properties": {
+                    "Principals": {"Ref": "Consumers"}}}}}
+    original_stack = {**stack_info(), "Tags": [],
+                      "Parameters": [{"ParameterKey": "Consumers", "ParameterValue": CONSUMER}]}
+    owning_stack(stubs["cloudformation"], original, "Original", SOURCE, original_stack)
+    stub.add_response("list_resource_share_permissions", {"permissions": [{
+        "arn": PERMISSION, "version": "2", "resourceType": KIND}]}, {"resourceShareArn": SOURCE})
+    stub.add_response("get_permission", {"permission": permission()}, {"permissionArn": PERMISSION})
+    result = inspect(cs)
+    assert not result.blocked
+    assert result.groups[0].consumers == (CONSUMER,)
+    assert result.groups[0].source_stacks == [STACK_ID]
+
+
+def test_service_only_is_excluded_without_organizations_calls(clients):
+    cs, stubs = clients
+    stub_discovery(stubs, principals={SOURCE: ["service.amazonaws.com"]})
+    result = inspect(cs)
+    assert not result.blocked
+    assert "service-principal-only" in result.excluded[0]
+
+
+@pytest.mark.parametrize("principal", [
+    f"arn:aws:iam::{CONSUMER}:role/Restricted", f"arn:aws:iam::{CONSUMER}:user/Restricted",
+])
+def test_restricted_principals_are_not_converted_to_account_wide_grants(clients, principal):
+    cs, _ = clients
+    with pytest.raises(MigrationError, match="Unsupported account-level principal conversion"):
+        Discovery(OfflineRouter(cs), {CONSUMER}, MIGRATION, {}, {})._expand(OWNER, principal)
+
+
+@pytest.mark.parametrize("override", [False, True])
+@pytest.mark.parametrize("principal", [
+    f"arn:aws:iam::{CONSUMER}:role/Restricted",
+    f"arn:aws:iam::{CONSUMER}:user/Restricted",
+    f"arn:aws:iam::{CONSUMER}:role/logs.amazonaws.com",
+])
+def test_override_cannot_broaden_live_role_or_user_restrictions(clients, override, principal):
+    cs, stubs = clients
+    stub_discovery(stubs, principals={SOURCE: [principal]}, read_permissions=False)
+    result = inspect(cs, overrides={SOURCE: [CONSUMER]} if override else {})
+    assert not result.groups
+    assert "overrides cannot broaden restricted access" in result.blocked[0]
+    assert principal in result.blocked[0]
+
+
+@pytest.mark.parametrize("principal_status", ["DISASSOCIATING", "FAILED", "DISASSOCIATED"])
+def test_override_cannot_hide_observed_role_restrictions_outside_active_inventory(
+        clients, principal_status):
+    cs, stubs = clients
+    principal = f"arn:aws:iam::{CONSUMER}:role/Restricted"
+    stub_discovery(stubs, principals={SOURCE: [principal]}, read_permissions=False,
+                   principal_status=principal_status)
+    result = inspect(cs, overrides={SOURCE: [CONSUMER]})
+    assert not result.groups
+    assert "overrides cannot broaden restricted access" in result.blocked[0]
+
+
+@pytest.mark.parametrize("live", [[], [CONSUMER]])
+@pytest.mark.parametrize("restriction", ["role/Restricted", "user/Restricted"])
+def test_override_cannot_hide_resolved_owning_template_restrictions(clients, live, restriction):
+    cs, stubs = clients
+    principal = f"arn:aws:iam::{CONSUMER}:{restriction}"
+    stub_original_principals(stubs, live, [principal])
+    result = inspect(cs, overrides={SOURCE: [CONSUMER]})
+    assert not result.groups
+    assert principal in result.blocked[0]
+    assert "overrides cannot broaden restricted access" in result.blocked[0]
+
+
+def test_override_cannot_hide_live_restriction_when_template_is_account_scoped(clients):
+    cs, stubs = clients
+    principal = f"arn:aws:iam::{CONSUMER}:role/Restricted"
+    stub_original_principals(stubs, [principal], [CONSUMER])
+    result = inspect(cs, overrides={SOURCE: [CONSUMER]})
+    assert not result.groups
+    assert "overrides cannot broaden restricted access" in result.blocked[0]
+
+
+def test_override_cannot_skip_unresolved_template_principal_expression(clients):
+    cs, stubs = clients
+    stub_original_principals(stubs, [CONSUMER], {"Fn::GetAtt": ["PrincipalRole", "Arn"]})
+    result = inspect(cs, overrides={SOURCE: [CONSUMER]})
+    assert not result.groups
+    assert "Unresolved principal intrinsic" in result.blocked[0]
+
+
+def test_override_cannot_convert_service_only_share_to_account_wide_access(clients):
+    cs, stubs = clients
+    stub_discovery(stubs, principals={SOURCE: ["service.amazonaws.com"]})
+    result = inspect(cs, overrides={SOURCE: [CONSUMER]})
+    assert not result.groups
+    assert "cannot broaden a service-principal-only share" in result.blocked[0]
+
+
+@pytest.mark.parametrize("partition", ["aws", "aws-us-gov", "aws-cn"])
+def test_root_principal_preserves_account_id_in_the_same_partition(clients, partition):
+    cs, _ = clients
+    root = f"arn:{partition}:iam::{CONSUMER}:root"
+    discovery = Discovery(OfflineRouter(cs), {CONSUMER}, MIGRATION, {}, {})
+    assert discovery._expand(OWNER, root, partition=partition) == {CONSUMER}
+
+
+@pytest.mark.parametrize("partition", [None, "aws-us-gov", "aws-cn"])
+def test_root_principal_rejects_unproven_or_mismatched_partition(clients, partition):
+    cs, _ = clients
+    root = f"arn:aws:iam::{CONSUMER}:root"
+    with pytest.raises(MigrationError, match="partition"):
+        Discovery(OfflineRouter(cs), {CONSUMER}, MIGRATION, {}, {})._expand(
+            OWNER, root, partition=partition)
+
+
+@pytest.mark.parametrize("principal", [
+    f"arn:aws:iam:us-east-1:{CONSUMER}:root", f"arn:aws:iam::{CONSUMER}:root/path",
+    "arn:aws:iam::123:root", f"arn:aws:iam::{CONSUMER}:role/root",
+    f"arn:aws:iam::{CONSUMER}:user/root",
+])
+def test_only_exact_account_root_arns_can_be_normalized(clients, principal):
+    cs, _ = clients
+    with pytest.raises(MigrationError, match="Unsupported account-level principal conversion"):
+        Discovery(OfflineRouter(cs), {CONSUMER}, MIGRATION, {}, {})._expand(
+            OWNER, principal, partition="aws")
+
+
+def test_live_root_and_account_id_principals_have_identical_entitlement_identity(clients):
+    cs, stubs = clients
+    stub_discovery(stubs)
+    first = inspect(cs)
+    stub_discovery(stubs, principals={SOURCE: [f"arn:aws:iam::{CONSUMER}:root", CONSUMER]})
+    second = inspect(cs)
+    assert not first.blocked and not second.blocked
+    assert first.groups == second.groups
+    assert second.groups[0].consumers == (CONSUMER,)
+
+
+def test_mixed_ou_and_departed_root_principal_proves_direct_account_entitlement(clients, monkeypatch):
+    cs, stubs = clients
+    organization = {"Id": "o-offline123", "ManagementAccountId": OWNER}
+    ou = f"arn:aws:organizations::{OWNER}:ou/o-offline123/ou-offline-first"
+    root = f"arn:aws:iam::{DEPARTED}:root"
+    discovery = Discovery(OfflineRouter(cs), {CONSUMER, DEPARTED}, MIGRATION, {},
+                          {KIND.lower(): True})
+    monkeypatch.setattr(discovery, "_org", lambda owner: (Api(cs["organizations"]), organization))
+    stub_discovery(stubs, principals={SOURCE: [ou, root]})
+    stubs["organizations"].add_response("list_accounts_for_parent", {
+        "Accounts": [{"Id": CONSUMER, "State": "ACTIVE"}]}, {"ParentId": "ou-offline-first"})
+    stubs["organizations"].add_response("list_organizational_units_for_parent", {
+        "OrganizationalUnits": []}, {"ParentId": "ou-offline-first"})
+    stubs["organizations"].add_response("list_accounts", {"Accounts": [
+        {"Id": OWNER, "State": "ACTIVE"}, {"Id": CONSUMER, "State": "ACTIVE"}]}, {})
+    result = discovery.inspect(OWNER, REGION)
+    assert not result.blocked
+    assert result.groups[0].consumers == (CONSUMER, DEPARTED)
+
+
+@pytest.mark.parametrize("capabilities", [{}, {KIND.lower(): False}])
+def test_unsupported_or_unknown_external_type_blocks(clients, capabilities):
+    cs, stubs = clients
+    stub_discovery(stubs)
+    result = inspect(cs, capabilities=capabilities)
+    assert not result.groups
+    assert "external-sharing capability" in result.blocked[0]
+
+
+def test_semantically_equivalent_permission_versions_are_supported(clients):
+    cs, stubs = clients
+    reordered = copy.deepcopy(POLICY)
+    reordered["Statement"][0]["Action"].reverse()
+    reordered["Statement"][0]["Sid"] = "AnInertIdentifier"
+    reordered["Statement"][0]["Resource"] = ["*"]
+    stub_discovery(stubs, attached_version="1", attached_policy=reordered)
+    result = inspect(cs)
+    assert not result.blocked
+    assert result.groups[0].permission_snapshots[KIND]["Version"] == "2"
+
+
+def test_broader_default_permission_is_not_substituted(clients):
+    cs, stubs = clients
+    narrower = copy.deepcopy(POLICY)
+    narrower["Statement"][0]["Action"] = ["route53resolver:GetResolverRule"]
+    stub_discovery(stubs, attached_version="1", attached_policy=narrower)
+    result = inspect(cs)
+    assert not result.groups
+    assert "Non-default permission differs" in result.blocked[0]
+
+
+def test_compatible_grouping_merges_resources_and_preserves_sources(clients):
+    cs, stubs = clients
+    second_source, second_resource = SOURCE + "2", RESOURCE + "2"
+    stub_discovery(stubs, shares=[(SOURCE, RESOURCE), (second_source, second_resource)])
+    result = inspect(cs)
+    assert not result.blocked and len(result.groups) == 1
+    assert set(result.groups[0].resources) == {RESOURCE, second_resource}
+    assert result.groups[0].source_shares == [SOURCE, second_source]
+    assert result.groups[0].consumers == (CONSUMER,)
+
+
+def test_different_consumers_are_never_grouped_together(clients):
+    cs, stubs = clients
+    second_source, second_resource = SOURCE + "2", RESOURCE + "2"
+    stub_discovery(stubs, shares=[(SOURCE, RESOURCE), (second_source, second_resource)],
+                   principals={SOURCE: [CONSUMER], second_source: [OTHER]})
+    result = inspect(cs, consumers={CONSUMER, OTHER})
+    assert not result.blocked
+    assert {(g.consumers, tuple(g.resources)) for g in result.groups} == {
+        ((CONSUMER,), (RESOURCE,)), ((OTHER,), (second_resource,))}
+
+
+def test_ou_members_in_other_ous_are_unrelated_but_departed_accounts_block(clients, monkeypatch):
+    cs, stubs = clients
+    organization = {"Id": "o-offline123", "ManagementAccountId": OWNER}
+    ou = f"arn:aws:organizations::{OWNER}:ou/o-offline123/ou-offline-first"
+    discovery = Discovery(OfflineRouter(cs), {CONSUMER, OTHER}, MIGRATION, {},
+                          {KIND.lower(): True})
+    monkeypatch.setattr(discovery, "_org", lambda owner: (Api(cs["organizations"]), organization))
+    stub_discovery(stubs, principals={SOURCE: [ou]})
+    stubs["organizations"].add_response("list_accounts_for_parent", {
+        "Accounts": [{"Id": CONSUMER, "State": "ACTIVE"}]}, {"ParentId": "ou-offline-first"})
+    stubs["organizations"].add_response("list_organizational_units_for_parent", {
+        "OrganizationalUnits": []}, {"ParentId": "ou-offline-first"})
+    stubs["organizations"].add_response("list_accounts", {"Accounts": [
+        {"Id": OWNER, "State": "ACTIVE"}, {"Id": CONSUMER, "State": "ACTIVE"},
+        {"Id": OTHER, "State": "ACTIVE"}]}, {})
+    result = discovery.inspect(OWNER, REGION)
+    assert not result.blocked and result.groups[0].consumers == (CONSUMER,)
+    assert OTHER in result.excluded[0] and "outside this principal scope" in result.excluded[0]
+
+    discovery.consumers.add(DEPARTED)
+    # Discovery stops at historical resolution, before permission reads.
+    stub = stubs["ram"]
+    stub.add_response("get_resource_shares", {"resourceShares": [{
+        "resourceShareArn": SOURCE, "owningAccountId": OWNER, "status": "ACTIVE", "tags": []}]},
+        {"resourceOwner": "SELF"})
+    stub.add_response("list_resources", {"resources": [resource()]},
+                      {"resourceOwner": "SELF", "resourceShareArns": [SOURCE]})
+    stub.add_response("get_resource_share_associations", {"resourceShareAssociations": [
+        association(ou, "PRINCIPAL", share=SOURCE)]},
+        {"associationType": "PRINCIPAL", "resourceShareArns": [SOURCE]})
+    no_stack(stubs["cloudformation"], physical=True)
+    stubs["organizations"].add_response("list_accounts_for_parent", {
+        "Accounts": [{"Id": CONSUMER, "State": "ACTIVE"}]}, {"ParentId": "ou-offline-first"})
+    stubs["organizations"].add_response("list_organizational_units_for_parent", {
+        "OrganizationalUnits": []}, {"ParentId": "ou-offline-first"})
+    stubs["organizations"].add_response("list_accounts", {"Accounts": [
+        {"Id": CONSUMER, "State": "ACTIVE"}, {"Id": OTHER, "State": "ACTIVE"}]}, {})
+    result = discovery.inspect(OWNER, REGION)
+    assert not result.groups
+    assert DEPARTED in result.blocked[0] and OTHER not in result.blocked[0]
+
+
+def test_two_source_ous_do_not_cross_grant_and_active_members_are_cached(clients, monkeypatch):
+    cs, stubs = clients
+    organization = {"Id": "o-offline123", "ManagementAccountId": OWNER}
+    second_source, second_resource = SOURCE + "2", RESOURCE + "2"
+    ou_ids = ("ou-offline-first", "ou-offline-second")
+    ou_arns = [f"arn:aws:organizations::{OWNER}:ou/o-offline123/{ou}" for ou in ou_ids]
+    discovery = Discovery(OfflineRouter(cs), {CONSUMER, OTHER}, MIGRATION, {},
+                          {KIND.lower(): True})
+    monkeypatch.setattr(discovery, "_org", lambda owner: (Api(cs["organizations"]), organization))
+    stub_discovery(stubs, shares=[(SOURCE, RESOURCE), (second_source, second_resource)],
+                   principals={SOURCE: [ou_arns[0]], second_source: [ou_arns[1]]})
+    org = stubs["organizations"]
+    for index, (ou, consumer) in enumerate(zip(ou_ids, (CONSUMER, OTHER))):
+        org.add_response("list_accounts_for_parent", {"Accounts": [
+            {"Id": consumer, "State": "ACTIVE"}]}, {"ParentId": ou})
+        org.add_response("list_organizational_units_for_parent", {"OrganizationalUnits": []},
+                         {"ParentId": ou})
+        if index == 0:
+            # Only one all-member lookup is permitted for the whole inspection.
+            org.add_response("list_accounts", {"Accounts": [
+                {"Id": CONSUMER, "State": "ACTIVE"}, {"Id": OTHER, "State": "ACTIVE"}]}, {})
+    result = discovery.inspect(OWNER, REGION)
+    assert not result.blocked
+    assert {(g.consumers, tuple(g.resources)) for g in result.groups} == {
+        ((CONSUMER,), (RESOURCE,)), ((OTHER,), (second_resource,))}
+
+
+def test_historical_override_is_explicit_account_inventory(clients):
+    cs, stubs = clients
+    stub_discovery(stubs)
+    result = inspect(cs, consumers={CONSUMER, DEPARTED}, overrides={
+        SOURCE: [CONSUMER, DEPARTED]})
+    assert not result.blocked
+    assert result.groups[0].consumers == (CONSUMER, DEPARTED)
+
+
+def test_historical_override_recovers_missing_live_account_inventory(clients):
+    cs, stubs = clients
+    stub_discovery(stubs, principals={SOURCE: []}, read_permissions=True)
+    result = inspect(cs, consumers={CONSUMER, DEPARTED}, overrides={SOURCE: [CONSUMER, DEPARTED]})
+    assert not result.blocked
+    assert result.groups[0].consumers == (CONSUMER, DEPARTED)
+
+
+def test_historical_ou_override_does_not_require_current_ou_membership(clients):
+    cs, stubs = clients
+    ou = f"arn:aws:organizations::{OWNER}:ou/o-offline123/ou-offline-first"
+    stub_discovery(stubs, principals={SOURCE: [ou]})
+    result = inspect(cs, consumers={CONSUMER, DEPARTED}, overrides={SOURCE: [CONSUMER, DEPARTED]})
+    assert not result.blocked
+    assert result.groups[0].consumers == (CONSUMER, DEPARTED)
+
+
+def test_migration_tags_alone_do_not_authorize_recursive_exclusion(clients):
+    cs, stubs = clients
+    forged = migration_share()
+    stubs["ram"].add_response("get_resource_shares", {"resourceShares": [forged]},
+                             {"resourceOwner": "SELF"})
+    no_stack(stubs["cloudformation"], physical=True, arn=TEMP)
+    result = inspect(cs)
+    assert not result.existing
+    assert "no proven owning migration stack" in result.blocked[0]
+
+
+def test_proven_migration_share_with_lowercase_tags_is_not_replicated(clients):
+    cs, stubs = clients
+    g = group(approved=True)
+    share = migration_share(g)
+    stubs["ram"].add_response("get_resource_shares", {"resourceShares": [share]},
+                             {"resourceOwner": "SELF"})
+    owning_stack(stubs["cloudformation"], template_for([g], MIGRATION), g.logical_id, TEMP)
+    result = inspect(cs)
+    assert not result.blocked and not result.groups
+    assert result.existing == [share]
+
+
+def test_additive_merge_is_idempotent_and_preserves_prior_entitlements_and_lineage():
+    before_group = group(approved=True)
+    after_group = group(resources={RESOURCE + "2": KIND}, sources=[SOURCE + "2"], approved=True)
+    prior = template_for([before_group], MIGRATION)
+    fresh = template_for([after_group], MIGRATION)
+    merged = additive_template(prior, fresh, MIGRATION)
+    item = merged["Resources"][before_group.logical_id]
+    assert item["Properties"]["ResourceArns"] == [RESOURCE, RESOURCE + "2"]
+    assert item["Properties"]["Principals"] == [CONSUMER]
+    assert item["Metadata"]["SourceShareArns"] == [SOURCE, SOURCE + "2"]
+    assert item["DeletionPolicy"] == item["UpdateReplacePolicy"] == "Retain"
+    assert additive_template(merged, fresh, MIGRATION) == merged
+    assert additive_template(merged, template_for([], MIGRATION), MIGRATION) == merged
+    assert prior["Resources"][before_group.logical_id]["Properties"]["ResourceArns"] == [RESOURCE]
+
+
+@pytest.mark.parametrize("mutation", ["owner", "permission", "principal", "retain", "policy"])
+def test_unsafe_template_merges_fail_closed(mutation):
+    g = group(approved=True)
+    prior = template_for([g], MIGRATION)
+    fresh = copy.deepcopy(prior)
+    item = fresh["Resources"][g.logical_id]
+    if mutation == "owner":
+        item["Properties"]["Tags"][2]["Value"] = OTHER
+    elif mutation == "permission":
+        item["Properties"]["PermissionArns"] = [PERMISSION + "Different"]
+    elif mutation == "principal":
+        item["Properties"]["Principals"].append(OTHER)
+    elif mutation == "retain":
+        item["DeletionPolicy"] = "Delete"
+    else:
+        item["Metadata"]["PermissionSnapshots"][KIND]["Policy"]["Statement"][0]["Action"].append("*")
+    with pytest.raises(MigrationError):
+        additive_template(prior, fresh, MIGRATION)
+
+
+def change(g, action="Modify", replacement="False", field="ResourceArns"):
+    return {"Type": "Resource", "ResourceChange": {
+        "Action": action, "LogicalResourceId": g.logical_id,
+        "ResourceType": "AWS::RAM::ResourceShare", "Replacement": replacement,
+        "Scope": ["Properties"], "Details": [{
+            "Target": {"Attribute": "Properties", "Name": field, "RequiresRecreation": "Never"},
+            "Evaluation": "Static"}]}}
+
+
+@pytest.mark.parametrize("action,replacement,field", [
+    ("Remove", "False", "ResourceArns"), ("Import", "False", "ResourceArns"),
+    ("Modify", "True", "ResourceArns"), ("Modify", "Conditional", "ResourceArns"),
+    ("Modify", "False", "PermissionArns"), ("Modify", "False", "Principals"),
+    ("Modify", "False", "AllowExternalPrincipals"),
+])
+def test_unsafe_change_set_rejected(action, replacement, field):
+    g = group(approved=True)
+    prior = template_for([g], MIGRATION)
+    proposed = additive_template(prior, template_for([
+        group(resources={RESOURCE + "2": KIND}, approved=True)], MIGRATION), MIGRATION)
+    with pytest.raises(MigrationError):
+        validate_changes([change(g, action, replacement, field)], proposed, prior)
+
+
+def test_only_nonreplacing_additive_change_can_execute():
+    g = group(approved=True)
+    prior = template_for([g], MIGRATION)
+    proposed = additive_template(prior, template_for([
+        group(resources={RESOURCE + "2": KIND}, approved=True)], MIGRATION), MIGRATION)
+    validate_changes([change(g)], proposed, prior)
+    removal = copy.deepcopy(proposed)
+    removal["Resources"][g.logical_id]["Properties"]["ResourceArns"] = [RESOURCE + "2"]
+    with pytest.raises(MigrationError, match="removal"):
+        validate_changes([change(g)], removal, prior)
+
+
+@pytest.mark.parametrize("mutate", ["policy_action", "dynamic", "path", "no_details", "omission"])
+def test_ambiguous_or_destructive_change_details_are_rejected(mutate):
+    g = group(approved=True)
+    prior = template_for([g], MIGRATION)
+    proposed = additive_template(prior, template_for([
+        group(resources={RESOURCE + "2": KIND}, approved=True)], MIGRATION), MIGRATION)
+    row = change(g)
+    if mutate == "policy_action":
+        row["ResourceChange"]["PolicyAction"] = "ReplaceAndRetain"
+    elif mutate == "dynamic":
+        row["ResourceChange"]["Details"][0]["Evaluation"] = "Dynamic"
+    elif mutate == "path":
+        row["ResourceChange"]["Details"][0]["Target"]["Path"] = "/Properties/PermissionArns"
+    elif mutate == "no_details":
+        row["ResourceChange"]["Details"] = []
+    else:
+        proposed["Resources"] = {}
+    with pytest.raises(MigrationError):
+        validate_changes([row], proposed, prior)
+
+
+def test_create_failed_stack_blocks_before_any_write_or_permission_lookup(clients):
+    cs, stubs = clients
+    stubs["cloudformation"].add_response("describe_stacks", {"Stacks": [stack_info("CREATE_FAILED")]},
+        {"StackName": stack_name(MIGRATION, OWNER, REGION)})
+    with pytest.raises(MigrationError, match="cannot be retried automatically"):
+        Stacks(OfflineRouter(cs), MIGRATION).apply(OWNER, REGION, [group()])
+
+
+def test_readonly_api_prevents_changeset_creation(clients):
+    cs, stubs = clients
+    no_stack(stubs["cloudformation"])
+    stubs["ram"].add_response("get_permission", {"permission": permission()},
+                             {"permissionArn": PERMISSION})
+    with pytest.raises(MigrationError, match="Read-only"):
+        Stacks(OfflineRouter(cs, readonly=True), MIGRATION).apply(OWNER, REGION, [group()])
+
+
+def test_changed_managed_policy_blocks_before_changeset_creation(clients):
+    cs, stubs = clients
+    no_stack(stubs["cloudformation"])
+    approved = group(approved=True)
+    broader = copy.deepcopy(POLICY)
+    broader["Statement"][0]["Action"] = "*"
+    stubs["ram"].add_response("get_permission", {"permission": permission("3", broader)},
+                             {"permissionArn": PERMISSION})
+    with pytest.raises(MigrationError, match="changed since plan approval"):
+        Stacks(OfflineRouter(cs), MIGRATION).apply(OWNER, REGION, [approved])
+
+
+@pytest.mark.parametrize("unsafe", [False, True])
+def test_apply_stubber_preserves_rollback_setting_and_rejects_unsafe_execution(
+        clients, monkeypatch, unsafe):
+    cs, stubs = clients
+    g = group(approved=True)
+    body = template_for([g], MIGRATION)
+    no_stack(stubs["cloudformation"])
+    stubs["ram"].add_response("get_permission", {"permission": permission()},
+                             {"permissionArn": PERMISSION})
+    monkeypatch.setattr("ram_migration_stacks.time.time_ns", lambda: 7)
+    from ram_migration_common import digest
+    name = stack_name(MIGRATION, OWNER, REGION)
+    stubs["cloudformation"].add_response("create_change_set", {"Id": CHANGE_ID}, {
+        "StackName": name, "ChangeSetName": "ram-" + digest(body) + "-7",
+        "ChangeSetType": "CREATE", "TemplateBody": json.dumps(body, sort_keys=True),
+        "Description": "Additive RAM migration shares",
+        "Tags": [{"Key": "Purpose", "Value": PURPOSE},
+                 {"Key": "MigrationId", "Value": MIGRATION},
+                 {"Key": "OwnerAccount", "Value": OWNER},
+                 {"Key": "RetirementPolicy", "Value": "VerifyReplacementAccessFirst"}]})
+    status = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "AVAILABLE"}
+    stubs["cloudformation"].add_response("describe_change_set", status,
+                                        {"ChangeSetName": CHANGE_ID, "StackName": name})
+    row = change(g, action="Remove" if unsafe else "Add")
+    stubs["cloudformation"].add_response("describe_change_set", {**status, "Changes": [row]}, {
+        "ChangeSetName": CHANGE_ID, "StackName": name, "IncludePropertyValues": True})
+    if unsafe:
+        with pytest.raises(MigrationError, match="Unsafe"):
+            Stacks(OfflineRouter(cs), MIGRATION).apply(OWNER, REGION, [g])
+    else:
+        stubs["cloudformation"].add_response("execute_change_set", {}, {
+            "ChangeSetName": CHANGE_ID, "StackName": name, "DisableRollback": True})
+        stubs["cloudformation"].add_response("describe_stacks", {"Stacks": [stack_info()]},
+                                            {"StackName": name})
+        assert Stacks(OfflineRouter(cs), MIGRATION).apply(OWNER, REGION, [g]) == name
+
+
+def test_persisted_groups_uses_template_permission_and_actual_ram_types(clients):
+    cs, stubs = clients
+    # This type cannot be inferred by splitting the ARN's service/resource name.
+    actual_kind = "ec2:IpamPool"
+    actual_arn = f"arn:aws:ec2:{REGION}:{OWNER}:ipam-pool/ipam-pool-offline"
+    actual_permission = "arn:aws:ram::aws:permission/AWSRAMDefaultPermissionIpamPool"
+    approved = {**snapshot(), "Arn": actual_permission, "ResourceType": actual_kind}
+    g = ApprovedGroup(OWNER, REGION, (CONSUMER,), {actual_kind: actual_permission},
+                      {actual_arn: actual_kind}, [SOURCE], {actual_kind: approved}, [STACK_ID])
+    body = template_for([g], MIGRATION)
+    stubs["cloudformation"].add_response("describe_stacks", {"Stacks": [stack_info()]},
+        {"StackName": stack_name(MIGRATION, OWNER, REGION)})
+    stubs["cloudformation"].add_response("get_template", {"TemplateBody": json.dumps(body)},
+                                        {"StackName": STACK_ID, "TemplateStage": "Processed"})
+    stubs["ram"].add_response("get_permission", {
+        "permission": permission(arn=actual_permission, kind=actual_kind)},
+        {"permissionArn": actual_permission, "permissionVersion": 2})
+    stubs["ram"].add_response("list_resources", {"resources": [resource(actual_arn, actual_kind)]},
+                             {"resourceOwner": "SELF", "resourceArns": [actual_arn]})
+    recovered = Stacks(OfflineRouter(cs), MIGRATION).persisted_groups(OWNER, REGION)
+    assert recovered == [g]
+    assert recovered[0].permissions == {actual_kind: actual_permission}
+    assert recovered[0].source_shares == [SOURCE]
+
+
+def test_persisted_groups_rejects_wrong_entitlement_hash_before_ram_reads(clients):
+    cs, stubs = clients
+    g = group(approved=True)
+    body = template_for([g], MIGRATION)
+    body["Resources"][g.logical_id]["Properties"]["Principals"].append(OTHER)
+    stubs["cloudformation"].add_response("describe_stacks", {"Stacks": [stack_info()]},
+        {"StackName": stack_name(MIGRATION, OWNER, REGION)})
+    stubs["cloudformation"].add_response("get_template", {"TemplateBody": json.dumps(body)},
+                                        {"StackName": STACK_ID, "TemplateStage": "Processed"})
+    with pytest.raises(MigrationError, match="identity"):
+        Stacks(OfflineRouter(cs), MIGRATION).persisted_groups(OWNER, REGION)
+
+
+def test_existing_template_without_policy_approval_is_an_explicit_blocker(clients):
+    cs, stubs = clients
+    body = template_for([group()], MIGRATION)
+    stubs["cloudformation"].add_response("describe_stacks", {"Stacks": [stack_info()]},
+        {"StackName": stack_name(MIGRATION, OWNER, REGION)})
+    stubs["cloudformation"].add_response("get_template", {"TemplateBody": json.dumps(body)},
+                                        {"StackName": STACK_ID, "TemplateStage": "Processed"})
+    with pytest.raises(MigrationError, match="permission approval missing"):
+        Stacks(OfflineRouter(cs), MIGRATION).persisted_groups(OWNER, REGION)
+
+
+def stub_verification(stub, g, extra=None):
+    permission_rows = [{"arn": PERMISSION, "version": "2", "resourceType": KIND}]
+    if extra == "permission":
+        permission_rows.append({"arn": PERMISSION + "Extra", "version": "2",
+                                "resourceType": "ec2:Subnet"})
+    stub.add_response("list_resource_share_permissions", {"permissions": permission_rows},
+                      {"resourceShareArn": TEMP})
+    stub.add_response("get_permission", {"permission": permission()},
+                      {"permissionArn": PERMISSION, "permissionVersion": 2})
+    if extra == "permission":
+        return
+    rows = [association(RESOURCE, "RESOURCE")]
+    if extra == "resource":
+        rows.append(association(RESOURCE + "Extra", "RESOURCE"))
+    stub.add_response("get_resource_share_associations", {"resourceShareAssociations": rows},
+                      {"associationType": "RESOURCE", "resourceShareArns": [TEMP]})
+    if extra == "resource":
+        return
+    stub.add_response("list_resources", {"resources": [resource()]},
+                      {"resourceOwner": "SELF", "resourceShareArns": [TEMP]})
+    rows = [association(CONSUMER, "PRINCIPAL")]
+    if extra == "principal":
+        rows.append(association(OTHER, "PRINCIPAL"))
+    stub.add_response("get_resource_share_associations", {"resourceShareAssociations": rows},
+                      {"associationType": "PRINCIPAL", "resourceShareArns": [TEMP]})
+
+
+@pytest.mark.parametrize("extra", ["permission", "resource", "principal"])
+def test_exact_verification_rejects_extra_entitlements(clients, extra):
+    cs, stubs = clients
+    g = group(approved=True)
+    stub_verification(stubs["ram"], g, extra)
+    with pytest.raises(MigrationError):
+        verify_group(OfflineRouter(cs), g, migration_share(g), MIGRATION)
+
+
+def test_complete_exact_verification_with_lowercase_ram_tags(clients):
+    cs, stubs = clients
+    g = group(approved=True)
+    stub_verification(stubs["ram"], g)
+    session = botocore.session.get_session()
+    consumer = session.create_client("ram", region_name=REGION,
+                                     config=Config(signature_version=UNSIGNED))
+    with Stubber(consumer) as stub:
+        stub.add_response("list_resources", {"resources": [resource()]},
+                          {"resourceOwner": "OTHER-ACCOUNTS", "resourceShareArns": [TEMP]})
+        verify_group(OfflineRouter(cs, consumer=consumer), g, migration_share(g), MIGRATION)
+        stub.assert_no_pending_responses()
+
+
+def test_verification_rejects_broader_attached_permission_version(clients):
+    cs, stubs = clients
+    stubs["ram"].add_response("list_resource_share_permissions", {"permissions": [{
+        "arn": PERMISSION, "version": "3", "resourceType": KIND}]}, {"resourceShareArn": TEMP})
+    broader = copy.deepcopy(POLICY)
+    broader["Statement"][0]["Action"] = "*"
+    stubs["ram"].add_response("get_permission", {"permission": permission("3", broader)},
+                             {"permissionArn": PERMISSION, "permissionVersion": 3})
+    approved = group(approved=True)
+    with pytest.raises(MigrationError, match="policy/version differs"):
+        verify_group(OfflineRouter(cs), approved, migration_share(approved), MIGRATION)
+
+
+def test_verification_rejects_extra_consumer_visible_resources(clients):
+    cs, stubs = clients
+    approved = group(approved=True)
+    stub_verification(stubs["ram"], approved)
+    consumer = botocore.session.get_session().create_client(
+        "ram", region_name=REGION, config=Config(signature_version=UNSIGNED))
+    with Stubber(consumer) as stub:
+        stub.add_response("list_resources", {"resources": [resource(), resource(RESOURCE + "Extra")]},
+                          {"resourceOwner": "OTHER-ACCOUNTS", "resourceShareArns": [TEMP]})
+        with pytest.raises(MigrationError, match="inventory differs"):
+            verify_group(OfflineRouter(cs, consumer=consumer), approved,
+                         migration_share(approved), MIGRATION)
+        stub.assert_no_pending_responses()
+
+
+@pytest.mark.parametrize("version", ["0", "01", "-1", "latest", 2, True])
+def test_permission_versions_are_validated_before_sdk_reads(clients, version):
+    cs, _ = clients
+    with pytest.raises(MigrationError, match="invalid managed permission version"):
+        permission_snapshot(Api(cs["ram"]), PERMISSION, version)
+
+
+def invitation(share=TEMP, sender=OWNER, status="PENDING"):
+    return {"resourceShareArn": share, "resourceShareInvitationArn": share + "/invitation",
+            "senderAccountId": sender, "receiverAccountId": CONSUMER, "status": status}
+
+
+def test_unrelated_invitations_are_excluded_and_accepted_invitations_are_reused(clients):
+    cs, stubs = clients
+    stubs["ram"].add_response("get_resource_share_invitations", {
+        "resourceShareInvitations": [invitation(SOURCE), invitation(status="ACCEPTED"),
+                                    invitation(TEMP + "Other", sender=OTHER)]}, {})
+    accept(OfflineRouter(cs, consumer=cs["ram"]), CONSUMER, REGION, {TEMP: OWNER})
+
+
+def test_invitation_wrong_expected_sender_is_rejected_before_acceptance(clients):
+    cs, stubs = clients
+    stubs["ram"].add_response("get_resource_share_invitations", {
+        "resourceShareInvitations": [invitation(sender=OTHER)]}, {})
+    with pytest.raises(MigrationError, match="owner/receiver mismatch"):
+        accept(OfflineRouter(cs, consumer=cs["ram"]), CONSUMER, REGION, {TEMP: OWNER})
+
+
+def test_only_approved_pending_invitation_is_accepted(clients):
+    cs, stubs = clients
+    stubs["ram"].add_response("get_resource_share_invitations", {
+        "resourceShareInvitations": [invitation(SOURCE), invitation()]}, {})
+    stubs["ram"].add_response("accept_resource_share_invitation", {}, {
+        "resourceShareInvitationArn": TEMP + "/invitation"})
+    accept(OfflineRouter(cs, consumer=cs["ram"]), CONSUMER, REGION, {TEMP: OWNER})
+
+
+def test_expired_invitation_blocks_without_revoking_principal(clients):
+    cs, stubs = clients
+    stubs["ram"].add_response("get_resource_share_invitations", {
+        "resourceShareInvitations": [invitation(status="EXPIRED")]}, {})
+    with pytest.raises(MigrationError, match="reissue"):
+        accept(OfflineRouter(cs, consumer=cs["ram"]), CONSUMER, REGION, {TEMP: OWNER})
