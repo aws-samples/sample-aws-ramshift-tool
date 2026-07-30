@@ -2,6 +2,7 @@
 import copy
 import json
 from contextlib import ExitStack
+from pathlib import Path
 
 import botocore.session
 import pytest
@@ -999,3 +1000,267 @@ def test_expired_invitation_blocks_without_revoking_principal(clients):
         "resourceShareInvitations": [invitation(status="EXPIRED")]}, {})
     with pytest.raises(MigrationError, match="reissue"):
         accept(OfflineRouter(cs, consumer=cs["ram"]), CONSUMER, REGION, {TEMP: OWNER})
+
+
+# Regression tests for response shapes observed read-only against live AWS on
+# 2026-10-14 (sandbox owners); account IDs are replaced by the offline test IDs.
+TGW = "ec2:TransitGateway"
+TGW_RESOURCE = f"arn:aws:ec2:{REGION}:{OWNER}:transit-gateway/tgw-079bc008585f3d5de"
+# GetPermission's "permission" text for AWS managed permissions: one bare statement.
+LIVE_PERMISSIONS = {
+    KIND: ("arn:aws:ram::aws:permission/AWSRAMDefaultPermissionResolverRule", "1",
+           '{"Effect":"Allow","Action":["route53resolver:GetResolverRule",'
+           '"route53resolver:AssociateResolverRule","route53resolver:DisassociateResolverRule",'
+           '"route53resolver:ListResolverRules","route53resolver:ListResolverRuleAssociations"]}'),
+    TGW: ("arn:aws:ram::aws:permission/AWSRAMDefaultPermissionTransitGateway", "3",
+          '{"Effect":"Allow","Action":["ec2:DescribeTransitGateways",'
+          '"ec2:CreateTransitGatewayVpcAttachment","ec2:ModifyTransitGatewayVpcAttachment",'
+          '"ec2:DeleteTransitGatewayVpcAttachment","network-firewall:CreateFirewall",'
+          '"ec2:CreateClientVpnEndpoint"]}'),
+}
+LIVE_STATEMENT = json.loads(LIVE_PERMISSIONS[KIND][2])
+LIVE_CATALOGUE = Path(__file__).parent / "fixtures" / "ram-shareable-20261014.md"
+YES_ICON = "![](https://docs.aws.amazon.com/ram/latest/userguide/images/icon-yes.png)"
+NO_ICON = "![](https://docs.aws.amazon.com/ram/latest/userguide/images/icon-no.png)"
+# Live shareable.md rows, verbatim except for the abbreviated (unparsed) use-case column.
+LIVE_ROWS = "\n".join([
+    f"| Resolver\xa0rules<br />`route53resolver:ResolverRule` | Share Resolver rules. "
+    f"|  {NO_ICON} No  |  {YES_ICON} Yes <br />Can share with **any** AWS account. "
+    f"|  {NO_ICON} No  |  {NO_ICON} No  | ",
+    f"| Transit gateways<br />`ec2:TransitGateway` | Share transit gateways. "
+    f"|  {NO_ICON} No  |  {YES_ICON} Yes <br />Can share with **any** AWS account. "
+    f"|  {NO_ICON} No  |  {NO_ICON} No  | ",
+    f"| Bedrock Custom Model<br />`bedrock:CustomModel` | Share custom models. "
+    f"|  {YES_ICON} Yes  |  {NO_ICON} No <br />Can share with **only** AWS accounts in its own "
+    f"organization. |  {YES_ICON} Yes  |  {NO_ICON} No  | ",
+    f"| Capacity\xa0reservations<br />`ec2:CapacityReservation` | Share reservations and blocks. "
+    f"|  {NO_ICON} No  | Yes for Capacity Reservations (Can share with **any** AWS account).<br />"
+    f"No for Capacity Blocks (Can share with **only** AWS accounts in its own organization). "
+    f"|  {NO_ICON} No  |  {NO_ICON} No  | ",
+])
+
+
+def live_permission(kind=KIND):
+    arn, version, text = LIVE_PERMISSIONS[kind]
+    return {"arn": arn, "version": version, "defaultVersion": True,
+            "name": arn.rsplit("/", 1)[1], "resourceType": kind, "permission": text,
+            "creationTime": "2022-06-30T20:04:14.774000Z",
+            "lastUpdatedTime": "2022-06-30T20:04:14.774000Z", "isResourceTypeDefault": True,
+            "permissionType": "AWS_MANAGED", "featureSet": "STANDARD", "status": "ATTACHABLE"}
+
+
+def live_share(arn, status="ACTIVE"):
+    """GetResourceShares(resourceOwner=SELF) row, including a DELETED share's shape."""
+    return {"resourceShareArn": arn, "name": "tf-logs-us-east-1-sim-resolver-rule-share",
+            "owningAccountId": OWNER, "allowExternalPrincipals": True, "status": status,
+            "tags": [{"key": "resource-managed-by", "value": "iac"},
+                     {"key": "environment", "value": "sandbox"},
+                     {"key": "Purpose", "value": "example"},
+                     {"key": "CreatedVia", "value": "CloudFormation"}],
+            "creationTime": "2026-10-14T04:42:04.556000Z",
+            "lastUpdatedTime": "2026-10-14T05:04:32.995000Z", "featureSet": "STANDARD",
+            "resourceShareConfiguration": {"retainSharingOnAccountLeaveOrganization": False}}
+
+
+def live_resource(arn=RESOURCE, share=SOURCE, kind=KIND, **extra):
+    """ListResources(resourceOwner=SELF) row: the owner's view carries no status field."""
+    return {"arn": arn, "type": kind, "resourceShareArn": share,
+            "creationTime": "2026-10-14T05:02:25.452000Z",
+            "lastUpdatedTime": "2026-10-14T05:02:26.097000Z", "resourceRegionScope": "REGIONAL",
+            **extra}
+
+
+def live_group():
+    arn, version, text = LIVE_PERMISSIONS[KIND]
+    approved = {"Arn": arn, "Version": version, "ResourceType": KIND,
+                "Policy": policy_semantics(text), "DefaultVersion": True}
+    return ApprovedGroup(OWNER, REGION, (CONSUMER,), {KIND: arn}, {RESOURCE: KIND}, [SOURCE],
+                         {KIND: approved}, [STACK_ID])
+
+
+def stub_live_source(stubs, share, rows, kind=KIND):
+    """Owner-side reads for one ACTIVE source share, in Discovery.inspect order."""
+    arn, version, _ = LIVE_PERMISSIONS[kind]
+    ram = stubs["ram"]
+    ram.add_response("list_resources", {"resources": rows},
+                     {"resourceOwner": "SELF", "resourceShareArns": [share]})
+    ram.add_response("get_resource_share_associations", {"resourceShareAssociations": [
+        association(CONSUMER, "PRINCIPAL", share=share)]},
+        {"associationType": "PRINCIPAL", "resourceShareArns": [share]})
+    no_stack(stubs["cloudformation"], physical=True, arn=share)
+    ram.add_response("list_resource_share_permissions", {"permissions": [{
+        "arn": arn, "version": version, "resourceType": kind, "defaultVersion": True}]},
+        {"resourceShareArn": share})
+    ram.add_response("get_permission", {"permission": live_permission(kind)}, {"permissionArn": arn})
+
+
+def test_policy_semantics_accepts_live_bare_statement_and_statement_lists():
+    normalized = policy_semantics(LIVE_PERMISSIONS[KIND][2])
+    assert normalized == {"Statement": [{"Action": sorted(LIVE_STATEMENT["Action"]),
+                                         "Effect": "Allow"}]}
+    assert policy_semantics(LIVE_STATEMENT) == policy_semantics([LIVE_STATEMENT]) == normalized
+    assert policy_semantics({"Statement": LIVE_STATEMENT}) == normalized
+    assert policy_semantics(normalized) == normalized
+    # Wrapping never relaxes comparison: any action/effect/scope change still differs.
+    for different in ({**LIVE_STATEMENT, "Action": LIVE_STATEMENT["Action"][:-1]},
+                      {**LIVE_STATEMENT, "Action": LIVE_STATEMENT["Action"] + ["route53resolver:*"]},
+                      {**LIVE_STATEMENT, "Effect": "Deny"},
+                      {**LIVE_STATEMENT, "Resource": "arn:aws:route53resolver:*:*:resolver-rule/*"},
+                      [LIVE_STATEMENT, {"Effect": "Allow", "Action": "ec2:*"}]):
+        assert policy_semantics(different) != normalized
+
+
+@pytest.mark.parametrize("document", [
+    {}, {"Version": "2012-10-17"}, {"Effect": "Allow"}, [], [{"Effect": "Allow"}],
+    [LIVE_STATEMENT, "Allow"], "[]", '"Allow"',
+])
+def test_policy_semantics_still_rejects_documents_without_statements(document):
+    with pytest.raises(MigrationError, match="no Statement"):
+        policy_semantics(document)
+
+
+@pytest.mark.parametrize("kind", [KIND, TGW])
+def test_permission_snapshot_accepts_live_get_permission_response(clients, kind):
+    cs, stubs = clients
+    arn, version, text = LIVE_PERMISSIONS[kind]
+    stubs["ram"].add_response("get_permission", {"permission": live_permission(kind)},
+                             {"permissionArn": arn})
+    assert permission_snapshot(Api(cs["ram"]), arn) == {
+        "Arn": arn, "Version": version, "ResourceType": kind,
+        "Policy": {"Statement": [{"Action": sorted(json.loads(text)["Action"]), "Effect": "Allow"}]},
+        "DefaultVersion": True}
+
+
+def test_live_catalogue_rows_parse_standard_qualifiers_and_keep_conditional_rows_unknown():
+    assert external_catalog(LIVE_ROWS) == {
+        KIND.lower(): True, TGW.lower(): True, "bedrock:custommodel": False}
+
+
+@pytest.mark.parametrize("cell", [
+    f"{YES_ICON} Yes <br />Can share with **only** AWS accounts in its own organization.",
+    f"{NO_ICON} No <br />Can share with **any** AWS account.",
+    f"{YES_ICON} Yes <br />Can share with **any** AWS account, except Capacity Blocks.",
+    f"{YES_ICON} Yes <br />Can share with **any** AWS account.<br />No for Capacity Blocks.",
+    "Yes <br />Can share with **any** AWS account.",
+])
+def test_catalogue_qualifier_must_restate_the_icon_answer(cell):
+    rows = f"| `{KIND}` | a | b | {cell} | d | e |\n| `ec2:Subnet` | a | b | {NO_ICON} No | d | e |"
+    assert external_catalog(rows) == {"ec2:subnet": False}
+
+
+@pytest.mark.skipif(not LIVE_CATALOGUE.exists(), reason="needs a saved copy of the AWS RAM "
+                    "shareable-resources page as tests/fixtures/ram-shareable-20261014.md")
+def test_live_catalogue_fixture_keeps_every_unconditional_row():
+    values = external_catalog(LIVE_CATALOGUE.read_text(encoding="utf-8"))
+    # 86 rows name 87 types; only the Capacity Reservations/Blocks row is conditional.
+    assert len(values) == 86 and sum(values.values()) == 72
+    assert values[KIND.lower()] is True and values[TGW.lower()] is True
+    assert values["ec2:subnet"] is False and values["bedrock:custommodel"] is False
+    assert "ec2:capacityreservation" not in values
+
+
+def test_live_owner_shapes_plan_and_deleted_share_is_an_exclusion(clients):
+    cs, stubs = clients
+    deleted, tgw_share = SOURCE + "-deleted", SOURCE + "-tgw"
+    stubs["ram"].add_response("get_resource_shares", {"resourceShares": [
+        live_share(deleted, "DELETED"), live_share(SOURCE), live_share(tgw_share)]},
+        {"resourceOwner": "SELF"})
+    # The DELETED share needs no further reads; strict stubs reject any extra call.
+    stub_live_source(stubs, SOURCE, [live_resource()])
+    stub_live_source(stubs, tgw_share, [live_resource(TGW_RESOURCE, tgw_share, TGW)], TGW)
+    result = inspect(cs, capabilities=external_catalog(LIVE_ROWS))
+    assert not result.blocked and not result.existing
+    assert result.excluded == [f"{deleted}: deleted share (status DELETED)"]
+    assert {kind: (g.resources, g.source_shares, g.consumers)
+            for g in result.groups for kind in g.permissions} == {
+        KIND: ({RESOURCE: KIND}, [SOURCE], (CONSUMER,)),
+        TGW: ({TGW_RESOURCE: TGW}, [tgw_share], (CONSUMER,))}
+    for g in result.groups:
+        kind, = g.permissions
+        assert g.permission_snapshots[kind]["Policy"] == policy_semantics(LIVE_PERMISSIONS[kind][2])
+
+
+def test_deleted_migration_tagged_share_is_excluded_without_provenance_reads(clients):
+    cs, stubs = clients
+    stubs["ram"].add_response("get_resource_shares", {"resourceShares": [
+        {**migration_share(), "status": "DELETED"}]}, {"resourceOwner": "SELF"})
+    result = inspect(cs)
+    assert not result.blocked and not result.groups and not result.existing
+    assert result.excluded == [f"{TEMP}: deleted share (status DELETED)"]
+
+
+@pytest.mark.parametrize("status", ["DELETING", "PENDING", "FAILED"])
+def test_unsettled_or_failed_source_shares_still_block(clients, status):
+    cs, stubs = clients
+    stubs["ram"].add_response("get_resource_shares", {"resourceShares": [
+        live_share(SOURCE, status)]}, {"resourceOwner": "SELF"})
+    result = inspect(cs)
+    assert not result.groups and not result.excluded
+    assert result.blocked == [f"{SOURCE}: source status {status}"]
+
+
+@pytest.mark.parametrize("status", [
+    "UNAVAILABLE", "PENDING", "ZONAL_RESOURCE_INACCESSIBLE", "LIMIT_EXCEEDED"])
+def test_explicit_owner_side_resource_status_still_blocks(clients, status):
+    cs, stubs = clients
+    stubs["ram"].add_response("get_resource_shares", {"resourceShares": [live_share(SOURCE)]},
+                             {"resourceOwner": "SELF"})
+    stub_live_source(stubs, SOURCE, [live_resource(status=status)])
+    result = inspect(cs)
+    assert not result.groups
+    assert result.blocked == [f"{SOURCE}: {RESOURCE}: resource status {status}"]
+
+
+@pytest.mark.parametrize("status", [None, "UNAVAILABLE"])
+def test_persisted_groups_accept_live_owner_rows_but_not_explicit_unavailability(clients, status):
+    cs, stubs = clients
+    g = live_group()
+    arn, version, _ = LIVE_PERMISSIONS[KIND]
+    stubs["cloudformation"].add_response("describe_stacks", {"Stacks": [stack_info()]},
+        {"StackName": stack_name(MIGRATION, OWNER, REGION)})
+    stubs["cloudformation"].add_response("get_template", {
+        "TemplateBody": json.dumps(template_for([g], MIGRATION))},
+        {"StackName": STACK_ID, "TemplateStage": "Processed"})
+    stubs["ram"].add_response("get_permission", {"permission": live_permission()},
+                             {"permissionArn": arn, "permissionVersion": int(version)})
+    row = live_resource(share=TEMP, **({"status": status} if status else {}))
+    stubs["ram"].add_response("list_resources", {"resources": [row]},
+                             {"resourceOwner": "SELF", "resourceArns": [RESOURCE]})
+    stacks = Stacks(OfflineRouter(cs), MIGRATION)
+    if status is None:
+        assert stacks.persisted_groups(OWNER, REGION) == [g]
+    else:
+        with pytest.raises(MigrationError, match="approved available resources"):
+            stacks.persisted_groups(OWNER, REGION)
+
+
+@pytest.mark.parametrize("consumer_status", ["AVAILABLE", None, "PENDING"])
+def test_verification_accepts_live_owner_rows_but_consumer_view_must_be_available(
+        clients, consumer_status):
+    cs, stubs = clients
+    g = live_group()
+    arn, version, _ = LIVE_PERMISSIONS[KIND]
+    ram = stubs["ram"]
+    ram.add_response("list_resource_share_permissions", {"permissions": [{
+        "arn": arn, "version": version, "resourceType": KIND}]}, {"resourceShareArn": TEMP})
+    ram.add_response("get_permission", {"permission": live_permission()},
+                     {"permissionArn": arn, "permissionVersion": int(version)})
+    ram.add_response("get_resource_share_associations", {"resourceShareAssociations": [
+        association(RESOURCE, "RESOURCE")]}, {"associationType": "RESOURCE", "resourceShareArns": [TEMP]})
+    ram.add_response("list_resources", {"resources": [live_resource(share=TEMP)]},
+                     {"resourceOwner": "SELF", "resourceShareArns": [TEMP]})
+    ram.add_response("get_resource_share_associations", {"resourceShareAssociations": [
+        association(CONSUMER, "PRINCIPAL")]}, {"associationType": "PRINCIPAL", "resourceShareArns": [TEMP]})
+    consumer = botocore.session.get_session().create_client(
+        "ram", region_name=REGION, config=Config(signature_version=UNSIGNED))
+    visible = live_resource(share=TEMP, **({"status": consumer_status} if consumer_status else {}))
+    with Stubber(consumer) as stub:
+        stub.add_response("list_resources", {"resources": [visible]},
+                          {"resourceOwner": "OTHER-ACCOUNTS", "resourceShareArns": [TEMP]})
+        router = OfflineRouter(cs, consumer=consumer)
+        if consumer_status == "AVAILABLE":
+            verify_group(router, g, migration_share(g), MIGRATION)
+        else:
+            with pytest.raises(MigrationError, match="approved available resources"):
+                verify_group(router, g, migration_share(g), MIGRATION)
+        stub.assert_no_pending_responses()

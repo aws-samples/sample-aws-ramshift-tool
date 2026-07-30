@@ -18,6 +18,11 @@ from ram_migration_common import (
 CATALOG = "https://docs.aws.amazon.com/ram/latest/userguide/shareable.md"
 ACCOUNT_ROOT = re.compile(r"^arn:([a-z0-9-]+):iam::([0-9]{12}):root$")
 SERVICE_PRINCIPAL = re.compile(r"^[a-z0-9][a-z0-9.-]*\.amazonaws\.com(?:\.cn)?$")
+# The catalogue restates each icon with a standard scope sentence, e.g.
+# "Yes <br />Can share with **any** AWS account." Only the sentence matching the
+# icon's own answer is unconditional; any other qualifier stays ambiguous.
+STANDARD_SCOPE = {True: r"can share with any (?:aws )?accounts?",
+                  False: r"can share with only (?:aws )?accounts in its (?:own )?organization"}
 
 
 def direct_account_principal(principal: str, partition: str | None = None) -> str | None:
@@ -64,8 +69,10 @@ def external_catalog(text: str | None = None) -> dict[str, bool]:
         yes, no = "icon-yes.png" in cell, "icon-no.png" in cell
         # A row can describe several types. Qualified/mixed support needs a
         # resource-specific decision; never turn it into unconditional support.
-        remainder = re.sub(r"!\[[^\n]*?\]\([^)]*\)", "", cell).strip().lower()
-        if codes and (yes == no or remainder not in ("", "yes" if yes else "no")):
+        remainder = re.sub(r"!\[[^\n]*?\]\([^)]*\)", "", cell)
+        remainder = " ".join(re.sub(r"<[^>]*>|[*_]", " ", remainder).split()).lower()
+        unconditional = rf"(?:{'yes' if yes else 'no'})?(?: ?{STANDARD_SCOPE[yes]}\.?)?"
+        if codes and (yes == no or not re.fullmatch(unconditional, remainder)):
             ambiguous.update(code.lower() for code in codes)
         elif codes:
             for code in codes:
@@ -107,6 +114,15 @@ class ApprovedGroup(Group):
 def policy_semantics(policy: str | dict) -> Any:
     """Canonicalize IAM set-valued fields without relaxing policy constraints."""
     document = json.loads(policy) if isinstance(policy, str) else policy
+    # GetPermission returns AWS managed permissions as one bare statement,
+    # {"Effect": ..., "Action": [...]}; a list of statements is accepted too.
+    def statement(value):
+        return isinstance(value, dict) and "Effect" in value and \
+            ("Action" in value or "NotAction" in value)
+    if isinstance(document, dict) and "Statement" not in document and statement(document):
+        document = {"Statement": [document]}
+    elif isinstance(document, list) and document and all(statement(v) for v in document):
+        document = {"Statement": document}
     if not isinstance(document, dict) or "Statement" not in document:
         raise MigrationError("Managed permission policy has no Statement")
 
@@ -361,6 +377,11 @@ class Discovery:
             try:
                 if share.get("owningAccountId") != owner:
                     raise MigrationError("Source share owner does not match the inspected account")
+                # RAM keeps listing deleted shares for a while; DELETED is terminal and
+                # grants nothing to replicate. DELETING/PENDING/FAILED still block below.
+                if share.get("status") == "DELETED":
+                    plan.excluded.append(f"{arn}: deleted share (status DELETED)")
+                    continue
                 if self._migration_owned(owner, region, share):
                     plan.existing.append(share)
                     continue
@@ -466,7 +487,9 @@ class Discovery:
                 available: dict[str, str] = {}
                 for resource in resources:
                     resource_arn, kind = resource["arn"], resource["type"]
-                    if resource.get("status") != "AVAILABLE":
+                    # Owner-side (SELF) listings omit status; an explicit non-AVAILABLE
+                    # status still blocks.
+                    if resource.get("status", "AVAILABLE") != "AVAILABLE":
                         raise MigrationError(f"{resource_arn}: resource status {resource.get('status')}")
                     if resource_arn.split(":")[4] != owner:
                         raise MigrationError(f"Cannot re-share resource owned by another account: {resource_arn}")

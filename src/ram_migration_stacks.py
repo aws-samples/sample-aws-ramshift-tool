@@ -337,7 +337,8 @@ class Stacks:
                 raise MigrationError(f"{logical}: extra permission approvals in owning template")
             rows = pages(ram, "list_resources", "resources", resourceOwner="SELF",
                          resourceArns=properties["ResourceArns"])
-            resources = _resource_inventory(rows, set(properties["ResourceArns"]), owner, region)
+            resources = _resource_inventory(rows, set(properties["ResourceArns"]), owner, region,
+                                            owner_side=True)
             recorded_types = metadata.get("ResourceTypes")
             if recorded_types is not None and recorded_types != resources:
                 raise MigrationError(f"{logical}: resource types differ from owning template")
@@ -467,12 +468,14 @@ def accept(router: Router, consumer: str, region: str, allowed: dict[str, str]) 
 
 
 def _resource_inventory(rows: list[dict], expected: set[str], owner: str,
-                        region: str) -> dict[str, str]:
+                        region: str, *, owner_side: bool = False) -> dict[str, str]:
     resources = {}
     for row in rows:
         arn, kind = row.get("arn"), row.get("type")
+        # ListResources(resourceOwner=SELF) omits status; consumer rows must say AVAILABLE.
+        status = row.get("status", "AVAILABLE" if owner_side else None)
         if arn not in expected or not isinstance(kind, str) or not kind or \
-                row.get("status") != "AVAILABLE":
+                status != "AVAILABLE":
             raise MigrationError("RAM resource inventory differs from the approved available resources")
         _owner_arn(arn, owner)
         arn_region = arn.split(":")[3]
@@ -545,7 +548,8 @@ def verify_group(router: Router, group: Group, share: dict, migration: str) -> N
     _exact_associations(resources, set(group.resources), arn, "RESOURCE")
     owner_rows = pages(ram, "list_resources", "resources", resourceOwner="SELF",
                        resourceShareArns=[arn])
-    if _resource_inventory(owner_rows, set(group.resources), group.owner, group.region) != group.resources:
+    if _resource_inventory(owner_rows, set(group.resources), group.owner, group.region,
+                           owner_side=True) != group.resources:
         raise MigrationError(f"{arn}: actual resource types differ from approved entitlements")
     principals = pages(ram, "get_resource_share_associations", "resourceShareAssociations",
                        associationType="PRINCIPAL", resourceShareArns=[arn])
