@@ -1,6 +1,7 @@
 """Read-only inventory and conservative entitlement planning."""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import urllib.request
@@ -14,6 +15,7 @@ from ram_migration_common import (
     ACCOUNT, Group, MigrationError, Plan, Router, account_id, error_text,
     managed, pages, tags,
 )
+from ram_migration_record import approval_for
 
 CATALOG = "https://docs.aws.amazon.com/ram/latest/userguide/shareable.md"
 ACCOUNT_ROOT = re.compile(r"^arn:([a-z0-9-]+):iam::([0-9]{12}):root$")
@@ -109,6 +111,8 @@ class ApprovedGroup(Group):
     """Compatible Group carrying the policy and source-stack approval evidence."""
     permission_snapshots: dict[str, dict] = field(default_factory=dict)
     source_stacks: list[str] = field(default_factory=list)
+    # Approved original-version -> current-default changes, one per source share.
+    permission_changes: list[dict] = field(default_factory=list)
 
 
 def policy_semantics(policy: str | dict) -> Any:
@@ -156,6 +160,87 @@ def policy_semantics(policy: str | dict) -> Any:
     return normalize(document)
 
 
+def policy_sha256(policy: Any) -> str:
+    """Hash of the canonical policy semantics, stable across key order/scalars."""
+    return hashlib.sha256(json.dumps(policy_semantics(policy), sort_keys=True,
+                                     separators=(",", ":")).encode()).hexdigest()
+
+
+def _facets(policy: dict) -> dict[str, set[str]]:
+    facets: dict[str, set[str]] = {
+        "actions": set(), "not_actions": set(), "resources": set(),
+        "not_resources": set(), "conditions": set(), "principals": set()}
+    for statement in policy.get("Statement", []):
+        effect = statement.get("Effect", "?")
+        for key, facet in (("Action", "actions"), ("NotAction", "not_actions"),
+                           ("Resource", "resources"), ("NotResource", "not_resources")):
+            for value in statement.get(key, []):
+                facets[facet].add(f"{effect} {value}")
+        if "Condition" in statement:
+            facets["conditions"].add(f"{effect} " + json.dumps(statement["Condition"], sort_keys=True))
+        for key in ("Principal", "NotPrincipal"):
+            if key in statement:
+                facets["principals"].add(
+                    f"{effect} {key} " + json.dumps(statement[key], sort_keys=True))
+    return facets
+
+
+def policy_difference(before: Any, after: Any) -> dict:
+    """What a managed-permission version change grants or withdraws.
+
+    Facets are per effect so an added Deny is never shown as an added grant;
+    the exact added/removed statements are kept for statement-level review.
+    """
+    old, new = policy_semantics(before), policy_semantics(after)
+    old_facets, new_facets = _facets(old), _facets(new)
+    result: dict[str, Any] = {}
+    for facet in old_facets:
+        result[f"{facet}_added"] = sorted(new_facets[facet] - old_facets[facet])
+        result[f"{facet}_removed"] = sorted(old_facets[facet] - new_facets[facet])
+
+    def statements(policy: dict) -> dict[str, dict]:
+        return {json.dumps(s, sort_keys=True): s for s in policy.get("Statement", [])}
+    old_s, new_s = statements(old), statements(new)
+    result["statements_added"] = [new_s[k] for k in sorted(set(new_s) - set(old_s))]
+    result["statements_removed"] = [old_s[k] for k in sorted(set(old_s) - set(new_s))]
+    return result
+
+
+def permission_change(owner: str, region: str, share: str, prior: dict, default: dict) -> dict:
+    """One original share's attached version -> the current default AWS attaches."""
+    return {
+        "owner": owner, "region": region, "share": share,
+        "permission_arn": default["Arn"], "resource_type": default["ResourceType"],
+        "from_version": prior["Version"], "to_version": default["Version"],
+        "from_policy_sha256": policy_sha256(prior["Policy"]),
+        "to_policy_sha256": policy_sha256(default["Policy"]),
+        "from_policy": prior["Policy"], "to_policy": default["Policy"],
+        "difference": policy_difference(prior["Policy"], default["Policy"]),
+    }
+
+
+APPROVED_CHANGE_FIELDS = ("share", "permission_arn", "resource_type", "from_version",
+                          "to_version", "from_policy_sha256", "to_policy_sha256", "approval_id")
+
+
+def approved_change(change: dict) -> dict:
+    """Compact, template-safe evidence of an approved change."""
+    if change.get("status") != "APPROVED" or not change.get("approval_id"):
+        raise MigrationError("Only approved permission changes can join an entitlement group")
+    return {key: change[key] for key in APPROVED_CHANGE_FIELDS}
+
+
+def describe_difference(difference: dict) -> list[str]:
+    """Operator-facing lines for a permission comparison; empty facets omitted."""
+    lines = []
+    for facet in ("actions", "not_actions", "resources", "not_resources",
+                  "conditions", "principals"):
+        for verb in ("added", "removed"):
+            for value in difference.get(f"{facet}_{verb}", []):
+                lines.append(f"{facet.replace('_', '-')} {verb}: {value}")
+    return lines or ["no facet-level difference; statements differ only in structure"]
+
+
 def permission_snapshot(ram: Any, arn: str, version: str | None = None) -> dict:
     kwargs = {"permissionArn": arn}
     if version is not None:
@@ -178,6 +263,28 @@ def permission_snapshot(ram: Any, arn: str, version: str | None = None) -> dict:
     return {"Arn": arn, "Version": permission["version"], "ResourceType": kind,
             "Policy": policy_semantics(permission["permission"]),
             "DefaultVersion": permission.get("defaultVersion") is True}
+
+
+def revalidate_change(ram: Any, change: dict) -> None:
+    """Re-read both sides of an approved change just before any write.
+
+    The original share must still attach the approved version, and the current
+    default must still be the approved version with the approved policy. Any
+    drift voids the approval; a renewed approval is required.
+    """
+    attached = [p for p in pages(ram, "list_resource_share_permissions", "permissions",
+                                 resourceShareArn=change["share"])
+                if p.get("arn") == change["permission_arn"]]
+    if len(attached) != 1 or attached[0].get("version") != change["from_version"]:
+        raise MigrationError(f"{change['share']}: attached permission version changed since "
+                             f"approval {change['approval_id']}; re-run plan and approve again")
+    prior = permission_snapshot(ram, change["permission_arn"], change["from_version"])
+    default = permission_snapshot(ram, change["permission_arn"])
+    if not default["DefaultVersion"] or default["Version"] != change["to_version"] or \
+            policy_sha256(prior["Policy"]) != change["from_policy_sha256"] or \
+            policy_sha256(default["Policy"]) != change["to_policy_sha256"]:
+        raise MigrationError(f"{change['permission_arn']}: permission changed since approval "
+                             f"{change['approval_id']}; re-run plan and approve again")
 
 
 def resolve(value: Any, parameters: dict, template: dict, pseudo: dict) -> Any:
@@ -256,11 +363,16 @@ def flatten(value: Any) -> list[str]:
 
 class Discovery:
     def __init__(self, router: Router, consumers: set[str], migration: str,
-                 overrides: dict, capabilities: dict[str, bool]):
+                 overrides: dict, capabilities: dict[str, bool],
+                 approved_changes: list[dict] | None = None,
+                 migrating_owners: set[str] | None = None):
         for consumer in consumers:
             account_id(consumer)
         self.router, self.consumers, self.migration = router, consumers, migration
         self.overrides, self.capabilities = overrides, capabilities
+        # Approvals come only from this migration's record; see ram_migration_record.
+        self.approved_changes = list(approved_changes or [])
+        self.migrating_owners = set(migrating_owners or ())
 
     def _org(self, owner: str):
         member = self.router.client(owner, "organizations", "us-east-1")
@@ -468,6 +580,7 @@ class Discovery:
                     continue
                 permission_map: dict[str, str] = {}
                 snapshots: dict[str, dict] = {}
+                changes: list[dict] = []
                 for permission in pages(ram, "list_resource_share_permissions", "permissions",
                                         resourceShareArn=arn):
                     default = permission_snapshot(ram, permission["arn"])
@@ -480,10 +593,29 @@ class Discovery:
                         raise MigrationError(f"{kind}: attached managed permission version missing")
                     if default["Version"] != permission["version"]:
                         prior = permission_snapshot(ram, permission["arn"], permission["version"])
-                        if prior["ResourceType"] != kind or prior["Policy"] != default["Policy"]:
-                            raise MigrationError(f"Non-default permission differs: {permission['arn']}")
+                        if prior["ResourceType"] != kind:
+                            raise MigrationError(f"Non-default permission type differs: {permission['arn']}")
+                        if prior["Policy"] != default["Policy"]:
+                            # AWS attaches only the current default version, so the temporary
+                            # share cannot reproduce the original grant. Never pin or bypass:
+                            # the difference needs an approval bound to this exact change.
+                            change = permission_change(owner, region, arn, prior, default)
+                            approval = approval_for(self.approved_changes, self.migration, change)
+                            change["status"] = "APPROVED" if approval else "APPROVAL_REQUIRED"
+                            if approval:
+                                change["approval_id"] = approval["approval_id"]
+                            changes.append(change)
                     permission_map[kind] = permission["arn"]
                     snapshots[kind] = default
+                plan.permission_changes.extend(changes)
+                pending = [c for c in changes if c["status"] == "APPROVAL_REQUIRED"]
+                if pending:
+                    raise MigrationError(
+                        "Non-default permission differs from the current default and requires "
+                        "approval: " + "; ".join(
+                            f"{c['permission_arn']} v{c['from_version']}->v{c['to_version']} "
+                            f"({', '.join(describe_difference(c['difference']))})" for c in pending)
+                        + ". Record this plan with --record, review it, then run approve")
                 available: dict[str, str] = {}
                 for resource in resources:
                     resource_arn, kind = resource["arn"], resource["type"]
@@ -502,7 +634,8 @@ class Discovery:
                 if set(permission_map) != kinds:
                     raise MigrationError("Source permissions do not exactly match its resource types")
                 group = ApprovedGroup(owner, region, tuple(sorted(consumers)),
-                                      permission_map, available, [arn], snapshots, source_stacks)
+                                      permission_map, available, [arn], snapshots, source_stacks,
+                                      permission_changes=[approved_change(c) for c in changes])
                 prior_group = next((g for g in plan.groups if g.key == group.key), None)
                 if prior_group is not None:
                     if prior_group.permission_snapshots != snapshots:

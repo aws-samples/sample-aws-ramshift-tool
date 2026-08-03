@@ -1264,3 +1264,214 @@ def test_verification_accepts_live_owner_rows_but_consumer_view_must_be_availabl
             with pytest.raises(MigrationError, match="approved available resources"):
                 verify_group(router, g, migration_share(g), MIGRATION)
         stub.assert_no_pending_responses()
+
+
+# ---------------------------------------------------------------------------
+# Permission-change approvals (v0.2.0)
+# ---------------------------------------------------------------------------
+from ram_migration_discovery import (  # noqa: E402
+    describe_difference, permission_change, policy_difference, policy_sha256, revalidate_change,
+)
+from ram_migration_record import approve_permission_change, permission_requests  # noqa: E402
+from ram_migration_stacks import _validate_template  # noqa: E402
+
+TGW_ACTIONS = ["ec2:CreateTransitGatewayVpcAttachment", "ec2:DeleteTransitGatewayVpcAttachment",
+               "ec2:DescribeTransitGateways", "ec2:ModifyTransitGatewayVpcAttachment",
+               "network-firewall:CreateFirewall"]
+TGW_V2 = {"Effect": "Allow", "Action": TGW_ACTIONS}            # GetPermission's bare shape
+TGW_V3 = {"Effect": "Allow", "Action": TGW_ACTIONS + ["ec2:CreateClientVpnEndpoint"]}
+NARROWER = {"Version": "2012-10-17", "Statement": [{
+    "Effect": "Allow", "Action": ["route53resolver:GetResolverRule"], "Resource": "*"}]}
+
+
+def test_tgw_v2_to_v3_comparison_shows_only_client_vpn_endpoint():
+    difference = policy_difference(TGW_V2, TGW_V3)
+    assert difference["actions_added"] == ["Allow ec2:CreateClientVpnEndpoint"]
+    assert describe_difference(difference) == ["actions added: Allow ec2:CreateClientVpnEndpoint"]
+    assert policy_sha256(TGW_V2) != policy_sha256(TGW_V3)
+    assert policy_sha256(TGW_V3) == policy_sha256({"Statement": [TGW_V3]})  # shape-independent
+
+
+def test_comparison_reports_removed_actions_resources_and_conditions_per_effect():
+    before = {"Statement": [{"Effect": "Allow", "Action": ["a:One", "a:Two"], "Resource": "*",
+                             "Condition": {"StringEquals": {"aws:PrincipalOrgID": "o-first"}}}]}
+    after = {"Statement": [{"Effect": "Allow", "Action": ["a:One"], "Resource": "arn:x",
+                            "Condition": {"StringEquals": {"aws:PrincipalOrgID": "o-other"}}},
+                           {"Effect": "Deny", "Action": ["a:Two"], "Resource": "*"}]}
+    difference = policy_difference(before, after)
+    assert difference["actions_removed"] == ["Allow a:Two"]
+    assert difference["actions_added"] == ["Deny a:Two"]          # a deny is never shown as a grant
+    assert difference["resources_added"] == ["Allow arn:x", "Deny *"]
+    assert "Allow *" in difference["resources_removed"]
+    assert any("o-other" in c for c in difference["conditions_added"])
+    assert any("o-first" in c for c in difference["conditions_removed"])
+
+
+def stub_changed_share(stubs):
+    stub_discovery(stubs, attached_version="1", attached_policy=NARROWER)
+
+
+def expected_change():
+    prior = {"Arn": PERMISSION, "Version": "1", "ResourceType": KIND,
+             "Policy": policy_semantics(NARROWER), "DefaultVersion": False}
+    default = {"Arn": PERMISSION, "Version": "2", "ResourceType": KIND,
+               "Policy": policy_semantics(POLICY), "DefaultVersion": True}
+    return permission_change(OWNER, REGION, SOURCE, prior, default)
+
+
+def approval(migration=MIGRATION, changes=None):
+    record = {"migration_id": migration, "revision": 0, "approvals": {"permission_changes": []}}
+    request, = permission_requests(migration, changes or [expected_change()])
+    return approve_permission_change(record, request)
+
+
+def inspect_with(clients, approvals):
+    return Discovery(OfflineRouter(clients), {CONSUMER}, MIGRATION, {}, {KIND.lower(): True},
+                     approved_changes=approvals).inspect(OWNER, REGION)
+
+
+def test_permission_change_blocks_with_comparison_until_approved(clients):
+    cs, stubs = clients
+    stub_changed_share(stubs)
+    result = inspect_with(cs, [])
+    assert not result.groups
+    assert "requires approval" in result.blocked[0]
+    assert "actions added: Allow route53resolver:AssociateResolverRule" in result.blocked[0]
+    change, = result.permission_changes
+    assert change["status"] == "APPROVAL_REQUIRED"
+    assert (change["share"], change["from_version"], change["to_version"]) == (SOURCE, "1", "2")
+
+
+def test_bound_approval_admits_the_change_onto_the_temporary_share_only(clients):
+    cs, stubs = clients
+    stub_changed_share(stubs)
+    granted = approval()
+    result = inspect_with(cs, [granted])
+    assert not result.blocked
+    g, = result.groups
+    assert g.permission_snapshots[KIND]["Version"] == "2"      # temporary share gets the default
+    evidence, = g.permission_changes
+    assert evidence["approval_id"] == granted["approval_id"] and evidence["share"] == SOURCE
+    assert result.permission_changes[0]["status"] == "APPROVED"
+
+
+@pytest.mark.parametrize("mutation", [
+    {"migration": "earlier-openfinance-migration"},
+    {"field": ("to_version", "3")},
+    {"field": ("from_policy_sha256", "0" * 64)},
+    {"share": SOURCE + "-other"},
+])
+def test_approvals_for_other_scopes_never_authorize_this_change(clients, mutation):
+    cs, stubs = clients
+    stub_changed_share(stubs)
+    change = expected_change()
+    if "field" in mutation:
+        change[mutation["field"][0]] = mutation["field"][1]
+    if "share" in mutation:
+        change["share"] = mutation["share"]
+    granted = approval(mutation.get("migration", MIGRATION), [change])
+    result = inspect_with(cs, [granted])
+    assert not result.groups and "requires approval" in result.blocked[0]
+
+
+def test_permission_type_mismatch_is_never_approvable(clients):
+    cs, stubs = clients
+    stubs["ram"].add_response("get_resource_shares", {"resourceShares": [
+        {"resourceShareArn": SOURCE, "owningAccountId": OWNER, "status": "ACTIVE", "tags": []}]},
+        {"resourceOwner": "SELF"})
+    stubs["ram"].add_response("list_resources", {"resources": [resource()]},
+                              {"resourceOwner": "SELF", "resourceShareArns": [SOURCE]})
+    stubs["ram"].add_response("get_resource_share_associations", {"resourceShareAssociations": [
+        association(CONSUMER, "PRINCIPAL", share=SOURCE)]},
+        {"associationType": "PRINCIPAL", "resourceShareArns": [SOURCE]})
+    no_stack(stubs["cloudformation"], physical=True)
+    stubs["ram"].add_response("list_resource_share_permissions", {"permissions": [{
+        "arn": PERMISSION, "version": "1", "resourceType": KIND, "defaultVersion": False}]},
+        {"resourceShareArn": SOURCE})
+    stubs["ram"].add_response("get_permission", {"permission": permission()}, {"permissionArn": PERMISSION})
+    stubs["ram"].add_response("get_permission", {"permission": permission(
+        "1", NARROWER, default=False, kind="ec2:TransitGateway")},
+        {"permissionArn": PERMISSION, "permissionVersion": 1})
+    result = inspect_with(cs, [approval()])
+    assert not result.groups and "type differs" in result.blocked[0]
+
+
+def compact(granted):
+    change = expected_change()
+    return {k: (granted["approval_id"] if k == "approval_id" else change[k]) for k in (
+        "share", "permission_arn", "resource_type", "from_version", "to_version",
+        "from_policy_sha256", "to_policy_sha256", "approval_id")}
+
+
+def stub_revalidation(stubs, attached="1", default_version="2", default_policy=None):
+    stubs["ram"].add_response("list_resource_share_permissions", {"permissions": [{
+        "arn": PERMISSION, "version": attached, "resourceType": KIND,
+        "defaultVersion": attached == default_version}]}, {"resourceShareArn": SOURCE})
+    if attached != "1":
+        return
+    stubs["ram"].add_response("get_permission", {"permission": permission("1", NARROWER, default=False)},
+                              {"permissionArn": PERMISSION, "permissionVersion": 1})
+    stubs["ram"].add_response("get_permission", {"permission": permission(
+        default_version, default_policy)}, {"permissionArn": PERMISSION})
+
+
+def test_revalidation_accepts_unchanged_approved_change(clients):
+    cs, stubs = clients
+    stub_revalidation(stubs)
+    revalidate_change(Api(cs["ram"]), compact(approval()))
+
+
+@pytest.mark.parametrize("kwargs,message", [
+    ({"attached": "2"}, "attached permission version changed"),
+    ({"default_version": "3"}, "permission changed since approval"),
+    ({"default_policy": TGW_V3}, "permission changed since approval"),
+])
+def test_revalidation_voids_approval_on_any_drift(clients, kwargs, message):
+    cs, stubs = clients
+    stub_revalidation(stubs, **kwargs)
+    with pytest.raises(MigrationError, match=message):
+        revalidate_change(Api(cs["ram"]), compact(approval()))
+
+
+def approved_group(granted):
+    g = group(approved=True)
+    g.permission_changes = [compact(granted)]
+    return g
+
+
+def test_template_records_approved_change_and_rejects_tampered_evidence():
+    granted = approval()
+    g = approved_group(granted)
+    template = template_for([g], MIGRATION)
+    metadata = template["Resources"][g.logical_id]["Metadata"]
+    row, = metadata["PermissionChanges"]
+    assert (row["SourceShareArn"], row["FromVersion"], row["ToVersion"], row["ApprovalId"]) == \
+        (SOURCE, "1", "2", granted["approval_id"])
+    _validate_template(template, MIGRATION)
+    for key, value in (("ToVersion", "3"), ("SourceShareArn", SOURCE + "-unlisted"),
+                       ("PermissionArn", "arn:aws:ram::aws:permission/Other")):
+        tampered = copy.deepcopy(template)
+        tampered["Resources"][g.logical_id]["Metadata"]["PermissionChanges"][0][key] = value
+        with pytest.raises(MigrationError, match="permission-change approval metadata"):
+            _validate_template(tampered, MIGRATION)
+
+
+def test_unapproved_change_cannot_enter_a_template():
+    g = group(approved=True)
+    g.permission_changes = [dict(compact(approval()), share=SOURCE + "-elsewhere")]
+    with pytest.raises(MigrationError, match="does not belong"):
+        template_for([g], MIGRATION)
+
+
+def test_additive_template_merges_change_evidence_and_rejects_conflicts():
+    granted = approval()
+    plain = group(approved=True)
+    old = template_for([plain], MIGRATION)
+    new = template_for([approved_group(granted)], MIGRATION)
+    merged = additive_template(old, new, MIGRATION)
+    assert merged["Resources"][plain.logical_id]["Metadata"]["PermissionChanges"] == \
+        new["Resources"][plain.logical_id]["Metadata"]["PermissionChanges"]
+    conflicting = copy.deepcopy(new)
+    conflicting["Resources"][plain.logical_id]["Metadata"]["PermissionChanges"][0]["ApprovalId"] = "pc-other"
+    with pytest.raises(MigrationError, match="approval differs"):
+        additive_template(merged, conflicting, MIGRATION)

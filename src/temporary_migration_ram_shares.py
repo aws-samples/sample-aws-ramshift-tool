@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Interactive orchestration for additive RAM migration shares (Python 3.11+).
 
-Plan is the default and cannot request writable clients. Apply opens its write
-gate only after complete preflight and the exact ``APPLY <migration-id>`` reply.
+Plan is the default and cannot request writable clients. With ``--record`` it
+writes a versioned migration record that ``approve``, ``apply`` and ``verify``
+consume. Approve binds explicit approvals to exact permission changes and owner
+scope. Apply requires a PLANNED record revision whose entitlements still match
+live discovery, then opens its write gate only after complete preflight and
+the exact ``APPLY <migration-id>`` reply.
 This tool neither moves accounts nor cleans up shares or Resolver associations.
 """
 from __future__ import annotations
@@ -30,7 +34,15 @@ from ram_migration_common import (
     Api, Group, MigrationError, Plan, Router, account_id, check_sdk, digest,
     error_text, pages, timestamp,
 )
-from ram_migration_discovery import Discovery, external_catalog
+from ram_migration_discovery import (
+    Discovery, describe_difference, external_catalog, revalidate_change,
+)
+from ram_migration_record import (
+    APPLICABLE, approval_for, approve_permission_change, latest, new_record,
+    pending_requests, permission_requests, plan_digest, tool_identity,
+)
+from ram_migration_record import load as load_record
+from ram_migration_record import update as update_record
 from ram_migration_stacks import Stacks, accept, stack_name, verify_group
 
 RAM_HOME_REGION = "us-east-1"
@@ -71,9 +83,13 @@ def build_parser() -> argparse.ArgumentParser:
             "first. Profiles are never selected automatically."
         ),
     )
-    parser.add_argument("mode", nargs="?", choices=("plan", "apply", "verify", "monitor"),
+    parser.add_argument("mode", nargs="?",
+                        choices=("plan", "approve", "apply", "verify", "monitor"),
                         default="plan")
     parser.add_argument("--migration-id", help="stable identifier for this migration")
+    parser.add_argument("--record", type=Path,
+                        help="versioned migration record: written by plan and approve, "
+                             "required by apply and verify")
     parser.add_argument("--owners", "--accounts", dest="owners", nargs="+", action="append",
                         default=[], help="explicit owner/inspection account IDs; spaces or commas")
     parser.add_argument("--consumers", nargs="+", action="append", default=[],
@@ -150,7 +166,20 @@ class Options:
     known_enabled_regions: dict[str, set[str]] = field(default_factory=dict)
 
 
+MIGRATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+
+
 def options(args: argparse.Namespace, ask: Callable[[str], str]) -> Options:
+    if args.mode == "approve":
+        # Approval is an offline review of the record; it needs no AWS access.
+        if not args.record:
+            raise MigrationError("approve requires --record")
+        if args.migration_id and not MIGRATION_ID.fullmatch(args.migration_id):
+            raise MigrationError("Supply a valid --migration-id or omit it to use the record's")
+        return Options(args, [], [], [], [], {}, {}, None, {})
+    if args.mode in ("apply", "verify") and not args.record:
+        raise MigrationError(f"{args.mode} requires --record: the reviewed migration record "
+                             "written by plan")
     interactive = args.interactive or sys.stdin.isatty()
     if args.mode != "monitor" and interactive:
         if not args.migration_id:
@@ -568,6 +597,7 @@ def merge_plan(plan: Plan, addition: Plan) -> None:
     plan.blocked.extend(addition.blocked)
     plan.excluded.extend(addition.excluded)
     plan.existing.extend(addition.existing)
+    plan.permission_changes.extend(addition.permission_changes)
 
 
 def capabilities_for(opts: Options) -> tuple[dict[str, bool], dict]:
@@ -827,6 +857,164 @@ def print_plan(plan: Plan, prepared: dict, report: Reporter) -> None:
         report.emit(f"phase=preflight status=BLOCKED {reason}")
 
 
+def account_scope(opts: Options) -> dict:
+    """Explicit account roles; a stationary owner's own dependencies are not at risk."""
+    owners, consumers = set(opts.owners), set(opts.consumers)
+    return {
+        "migrating_consumers": sorted(consumers - owners),
+        "migrating_owners": sorted(owners & consumers),
+        "stationary_owners": sorted(owners - consumers),
+        "regions": sorted(opts.regions),
+        "scan_enabled_regions": bool(opts.args.scan_enabled_regions),
+    }
+
+
+def group_record(group: Group, migration: str) -> dict:
+    return {
+        "key": group.key, "logical_id": group.logical_id,
+        "stack": stack_name(migration, group.owner, group.region),
+        "owner": group.owner, "region": group.region,
+        "consumers": list(group.consumers),
+        "permissions": dict(sorted(group.permissions.items())),
+        "resources": dict(sorted(group.resources.items())),
+        "source_shares": sorted(set(group.source_shares)),
+        "source_stacks": sorted(set(getattr(group, "source_stacks", []))),
+        "permission_changes": list(getattr(group, "permission_changes", [])),
+    }
+
+
+def print_permission_changes(plan: Plan, approvals: list[dict], report: Reporter) -> list[dict]:
+    """Every change is shown with its comparison, approved or not."""
+    requests = permission_requests(plan.migration, plan.permission_changes)
+    for request in requests:
+        covered = all(approval_for(approvals, plan.migration, {**request, "share": share})
+                      for share in request["shares"])
+        report.emit(f"phase=permission-change change={request['id']} "
+                    f"status={'APPROVED' if covered else 'APPROVAL_REQUIRED'} "
+                    f"permission={request['permission_arn']} resource_type={request['resource_type']} "
+                    f"version={request['from_version']}->{request['to_version']} "
+                    f"shares={len(request['shares'])}")
+        for line in describe_difference(request["difference"]):
+            report.emit(f"  {line}")
+        for share in request["shares"]:
+            report.emit(f"  share={share}")
+    return requests
+
+
+def reviewed_plan_problem(record: dict, plan: Plan, scope: dict) -> str | None:
+    """Apply consumes the reviewed scope; it never adopts a newly discovered one."""
+    entry = latest(record, "plan")
+    if entry is None or not record.get("plan"):
+        return "the migration record has no reviewed plan; run plan --record first"
+    if entry["status"] != APPLICABLE or record["plan"].get("status") != APPLICABLE:
+        return (f"the reviewed plan (revision {entry['revision']}) is {entry['status']}; resolve "
+                "its blockers, re-run plan --record and review it before apply")
+    if entry.get("tool_sources_digest") != tool_identity()["sources_digest"]:
+        return ("tool sources changed since the reviewed plan; re-run plan --record with this "
+                "tool version and review it")
+    if record["plan"].get("digest") != plan_digest(plan.groups, scope):
+        return (f"live entitlements or account roles differ from reviewed plan revision "
+                f"{entry['revision']}; re-run plan --record and review the changes")
+    return None
+
+
+def record_plan(record: dict, plan: Plan, scope: dict, prepared: dict, received: Any,
+                capability_provenance: dict, status: str) -> dict:
+    record = dict(record)
+    record["scope"] = scope
+    record["plan"] = {
+        "status": status,
+        "digest": plan_digest(plan.groups, scope),
+        "groups": [group_record(g, plan.migration) for g in
+                   sorted(plan.groups, key=lambda g: (g.owner, g.region, g.key))],
+        "blocked": list(plan.blocked),
+        "excluded": list(plan.excluded),
+        "existing_shares": sorted({s.get("resourceShareArn", "unknown") for s in plan.existing}),
+        "capability_provenance": capability_provenance,
+        "received_entitlements": received.to_dict() if received is not None else None,
+        "migration_stacks": [
+            {"owner": owner, "region": region, "template": body,
+             "existing_stack": old.get("StackId") if old else None}
+            for (owner, region), (body, old) in sorted(prepared.items())],
+    }
+    record["permission_change_requests"] = permission_requests(plan.migration,
+                                                               plan.permission_changes)
+    return record
+
+
+def share_records(previous: list[dict], groups: list[Group], shares: dict,
+                  migration: str) -> list[dict]:
+    """Created-share identifiers accumulate; a recorded share is never forgotten."""
+    known = {(r["owner"], r["region"], r["logical_id"]): dict(r) for r in previous}
+    for group in groups:
+        share = shares.get((group.owner, group.region), {}).get(group.logical_id)
+        if not share:
+            continue
+        key = (group.owner, group.region, group.logical_id)
+        entry = known.setdefault(key, {
+            "owner": group.owner, "region": group.region, "logical_id": group.logical_id,
+            "entitlement_hash": group.key, "stack": stack_name(migration, group.owner, group.region),
+            "first_recorded_at": timestamp()})
+        if entry.get("share_arn") not in (None, share["resourceShareArn"]):
+            raise MigrationError(f"{group.owner}/{group.region}/{group.logical_id}: recorded share "
+                                 f"{entry['share_arn']} differs from {share['resourceShareArn']}")
+        entry["share_arn"] = share["resourceShareArn"]
+        entry["consumers"] = sorted(set(entry.get("consumers", [])) | set(group.consumers))
+        entry["last_verified_at"] = timestamp()
+    return [known[k] for k in sorted(known)]
+
+
+def run_approve(opts: Options, ask: Callable[[str], str], report: Reporter) -> int:
+    path = opts.args.record
+    record = load_record(path, opts.args.migration_id)
+    migration = record["migration_id"]
+    if latest(record, "plan") is None:
+        raise MigrationError("approve requires a recorded plan; run plan --record first")
+    pending = pending_requests(record)
+    if not pending:
+        report.emit(f"migration={migration} phase=approve status=NOTHING_PENDING")
+        return 0
+    approved = []
+    for request in pending:
+        report.emit(f"migration={migration} phase=approve change={request['id']} "
+                    f"permission={request['permission_arn']} resource_type={request['resource_type']} "
+                    f"version={request['from_version']}->{request['to_version']}")
+        report.emit(f"  from_policy_sha256={request['from_policy_sha256']}")
+        report.emit(f"  to_policy_sha256={request['to_policy_sha256']}")
+        for line in describe_difference(request["difference"]):
+            report.emit(f"  {line}")
+        for share in request["shares"]:
+            report.emit(f"  share={share}")
+        report.emit("  The approval covers only temporary migration shares for these source shares "
+                    "in this migration. Original shares are not modified, and AWS attaches only "
+                    "the current default version.")
+        token = f"APPROVE {migration} {request['id']}"
+        try:
+            reply = ask(f"Type {token} to approve this permission change: ")
+        except EOFError:
+            reply = ""
+        if reply != token:
+            report.emit(f"change={request['id']} phase=approve status=NOT_APPROVED "
+                        "confirmation did not match")
+            continue
+        approved.append(request)
+        report.emit(f"change={request['id']} phase=approve status=CONFIRMED")
+    if approved:
+        def add_approvals(current: dict) -> None:
+            reviewed = {r["id"]: r for r in current.get("permission_change_requests", [])}
+            for request in approved:
+                if reviewed.get(request["id"]) != request:
+                    raise MigrationError(f"{request['id']}: the record changed during review; "
+                                         "re-run approve against the latest plan revision")
+                approve_permission_change(current, request)
+        update_record(path, migration, add_approvals, mode="approve", status="APPROVED",
+                      approved=[request["id"] for request in approved])
+        for request in approved:
+            report.emit(f"change={request['id']} phase=approve status=APPROVED")
+        report.emit("Re-run plan with --record to produce a PLANNED revision for review before apply.")
+    return 0 if len(approved) == len(pending) else 2
+
+
 def summary(plan: Plan, report: Reporter, status: str, *, created: int = 0, reused: int = 0,
             accepted: int = 0, reused_invitations: int = 0, failures: int = 0,
             missing_baseline: int = 0) -> None:
@@ -851,6 +1039,22 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
     gate = WriteGate(router)
     args = opts.args
     plan = Plan(args.migration_id)
+    record = None
+    if args.record is not None:
+        if args.mode == "plan" and not args.record.exists():
+            record = new_record(args.migration_id)
+        else:
+            record = load_record(args.record, args.migration_id)
+    scope = account_scope(opts)
+    approvals = record["approvals"]["permission_changes"] if record else []
+
+    def note(status: str, mutate: Callable[[dict], Any] = lambda _record: None,
+             **details: Any) -> None:
+        """Apply/verify outcomes, including blocked and failed runs, are history."""
+        nonlocal record
+        if record is not None and args.mode in ("apply", "verify"):
+            record = update_record(args.record, plan.migration, mutate, mode=args.mode,
+                                   status=status, **details)
     plan.blocked.extend(authenticate(router, set(opts.owners + opts.consumers), opts, report))
     if plan.blocked:
         if not args.sso_role and not args.role_name:
@@ -858,6 +1062,13 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                         "--account-map/--profile-map/--role-map.")
         print_plan(plan, {}, report)
         summary(plan, report, "BLOCKED")
+        if args.mode == "plan" and record is not None:
+            update_record(args.record, plan.migration,
+                          lambda current: current.update(record_plan(
+                              current, plan, scope, {}, None, {}, "BLOCKED")),
+                          mode="plan", status="BLOCKED", create=True,
+                          blockers=len(plan.blocked), phase="authentication")
+        note("BLOCKED", blockers=list(plan.blocked), phase="authentication")
         return 1
     scopes, failures = region_scopes(gate, opts, report)
     plan.blocked.extend(failures)
@@ -886,7 +1097,9 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
     if args.mode != "verify":
         capabilities, capability_provenance = capabilities_for(opts)
         report.emit(f"phase=plan capability_provenance={json.dumps(capability_provenance, sort_keys=True)}")
-        discovery = Discovery(gate, set(opts.consumers), plan.migration, opts.principals, capabilities)
+        discovery = Discovery(gate, set(opts.consumers), plan.migration, opts.principals, capabilities,
+                              approved_changes=approvals,
+                              migrating_owners=set(scope["migrating_owners"]))
         def inspect(owner, region):
             report.emit(f"owner={owner} region={region} phase=discovery status=STARTED")
             result = discovery.inspect(owner, region)
@@ -919,6 +1132,10 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                     plan.blocked.append(f"{row.account}/{row.region}: migration template exceeds inline CFN limit")
                 prepared[row.account, row.region] = body, old
 
+    if args.mode == "apply" and record is not None:
+        problem = reviewed_plan_problem(record, plan, scope)
+        if problem:
+            plan.blocked.append(f"phase=reviewed-record {problem}")
     baseline = ResolverSnapshot()
     if args.mode == "apply" and not plan.blocked:
         baseline, failures = resolver_snapshot(gate, plan.groups, opts, report, "resolver-before")
@@ -926,6 +1143,20 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
     missing_baseline = sum(not records for records in baseline.records.values())
     if args.mode != "verify":
         print_plan(plan, prepared, report)
+        requests = print_permission_changes(plan, approvals, report)
+        if args.mode == "plan" and record is not None:
+            status = "BLOCKED" if plan.blocked else APPLICABLE
+            pending = sum(not all(approval_for(approvals, plan.migration, {**r, "share": s})
+                                  for s in r["shares"]) for r in requests)
+            record = update_record(
+                args.record, plan.migration,
+                lambda current: current.update(record_plan(
+                    current, plan, scope, prepared, received, capability_provenance, status)),
+                mode="plan", status=status, create=True,
+                plan_digest=plan_digest(plan.groups, scope), blockers=len(plan.blocked),
+                permission_changes_pending=pending)
+            report.emit(f"phase=plan record={args.record} revision={record['revision']} "
+                        f"status={status} digest={record['plan']['digest']}")
         if args.export_plan:
             exported = plan.to_dict()
             exported["capability_provenance"] = capability_provenance
@@ -943,6 +1174,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
             for reason in plan.blocked:
                 report.emit(f"phase=verification status=BLOCKED {reason}")
         summary(plan, report, "BLOCKED", missing_baseline=missing_baseline)
+        note("BLOCKED", blockers=list(plan.blocked))
         return 1
     if args.mode == "plan":
         summary(plan, report, "PLANNED")
@@ -972,10 +1204,26 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                 plan.blocked.append(f"{row.account}/{row.region}: post-confirmation preflight {row.error}")
             elif digest(row.value[0]) != digest(prepared[row.account, row.region][0]):
                 plan.blocked.append(f"{row.account}/{row.region}: plan changed; run plan/apply again")
+        # An approved permission change is re-read on both sides immediately before
+        # the gate opens; any drift requires a renewed approval.
+        for group in plan.groups:
+            for change in getattr(group, "permission_changes", []):
+                try:
+                    if approval_for(approvals, plan.migration, change) is None:
+                        raise MigrationError(f"approval {change['approval_id']} no longer covers "
+                                             f"{change['share']}")
+                    revalidate_change(gate.client(group.owner, "ram", group.region), change)
+                    report.emit(f"owner={group.owner} region={group.region} share={change['share']} "
+                                f"phase=permission-revalidation status=VERIFIED "
+                                f"approval={change['approval_id']}")
+                except Exception as exc:
+                    plan.blocked.append(f"{group.owner}/{group.region}: post-confirmation "
+                                        f"permission revalidation {failure_text(exc)}")
         if plan.blocked:
             for reason in plan.blocked:
                 report.emit(f"phase=preflight status=BLOCKED {reason}")
             summary(plan, report, "BLOCKED", missing_baseline=missing_baseline)
+            note("BLOCKED", blockers=list(plan.blocked), phase="post-confirmation")
             return 1
         gate.open = True
         for row in scoped_fanout(group_scopes,
@@ -1058,9 +1306,16 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         report.emit(f"status=INCOMPLETE {reason}")
     if args.mode == "apply" and failures:
         report.emit("Successful temporary shares are retained. Resume this migration ID after resolving failures.")
-    summary(plan, report, "INCOMPLETE" if failures else "READY", created=created, reused=reused,
+    status = "INCOMPLETE" if failures else "READY"
+    summary(plan, report, status, created=created, reused=reused,
             accepted=accepted_count, reused_invitations=reused_invitations, failures=len(failures),
             missing_baseline=missing_baseline)
+    def record_shares(current: dict) -> None:
+        if args.mode == "apply":
+            current["shares"] = share_records(current.get("shares", []), plan.groups, shares,
+                                              plan.migration)
+    note(status, record_shares, failures=failures, created=created, reused=reused,
+         accepted=accepted_count)
     return 1 if failures else 0
 
 
@@ -1070,6 +1325,8 @@ def main(argv: list[str] | None = None, *, input_fn: Callable[[str], str] | None
         args = build_parser().parse_args(argv)
         ask = input_fn if input_fn is not None else input
         opts = options(args, ask)
+        if args.mode == "approve":
+            return run_approve(opts, ask, report)
         if args.mode != "monitor":
             check_sdk()  # Offline service-model preflight, before authenticating.
         router = Router(opts.profiles, opts.mappings, role_name=args.role_name,

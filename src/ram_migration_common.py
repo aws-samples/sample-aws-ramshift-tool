@@ -17,6 +17,7 @@ from botocore.exceptions import ClientError, InvalidConfigError, ProfileNotFound
 from botocore.tokens import SSOTokenProvider
 
 PURPOSE = "TemporaryMigrationRAMShares"
+TOOL_VERSION = "0.2.0"
 CONFIG = Config(retries={"mode": "adaptive", "max_attempts": 8},
                 connect_timeout=10, read_timeout=30)
 ACCOUNT = re.compile(r"^\d{12}$")
@@ -104,6 +105,9 @@ class Plan:
     blocked: list[str] = field(default_factory=list)
     excluded: list[str] = field(default_factory=list)
     existing: list[dict] = field(default_factory=list)
+    # Per-share managed-permission differences (original attached version ->
+    # current default), whether or not an approval covers them.
+    permission_changes: list[dict] = field(default_factory=list)
 
     def merge(self, other: "Plan") -> None:
         grouped = {g.key: g for g in self.groups}
@@ -112,12 +116,18 @@ class Plan:
                 prior = grouped[group.key]
                 prior.resources.update(group.resources)
                 prior.source_shares = sorted(set(prior.source_shares + group.source_shares))
+                if hasattr(prior, "permission_changes") or hasattr(group, "permission_changes"):
+                    merged = {c["share"] + c["permission_arn"]: c for c in
+                              getattr(prior, "permission_changes", [])
+                              + getattr(group, "permission_changes", [])}
+                    prior.permission_changes = [merged[k] for k in sorted(merged)]
             else:
                 self.groups.append(group)
                 grouped[group.key] = group
         self.blocked += other.blocked
         self.excluded += other.excluded
         self.existing += other.existing
+        self.permission_changes += other.permission_changes
 
     def to_dict(self) -> dict:
         return asdict(self)

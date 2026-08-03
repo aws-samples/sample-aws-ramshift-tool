@@ -36,6 +36,7 @@ def template_for(groups: list[Group], migration: str) -> dict:
             raise MigrationError("Migration group has no source lineage")
         if group.logical_id in resources:
             raise MigrationError("Duplicate group identity; merge compatible groups before templating")
+        changes = _changes_metadata(group)
         resources[group.logical_id] = {
             "Type": "AWS::RAM::ResourceShare",
             "DeletionPolicy": "Retain",
@@ -64,9 +65,34 @@ def template_for(groups: list[Group], migration: str) -> dict:
                 "PermissionSnapshots": copy.deepcopy(getattr(group, "permission_snapshots", {})),
             },
         }
+        if changes:
+            resources[group.logical_id]["Metadata"]["PermissionChanges"] = changes
     return {"AWSTemplateFormatVersion": "2010-09-09",
             "Description": "Additive RAM migration sharing; underlying resources are never created here.",
             "Resources": resources}
+
+
+CHANGE_KEYS = ("SourceShareArn", "PermissionArn", "ResourceType", "FromVersion",
+               "ToVersion", "FromPolicySha256", "ToPolicySha256", "ApprovalId")
+_CHANGE_FIELDS = ("share", "permission_arn", "resource_type", "from_version",
+                  "to_version", "from_policy_sha256", "to_policy_sha256", "approval_id")
+
+
+def _changes_metadata(group: Group) -> list[dict]:
+    """Owner-side, durable evidence of each approved permission change."""
+    rows = []
+    for change in getattr(group, "permission_changes", []):
+        row = dict(zip(CHANGE_KEYS, (change[f] for f in _CHANGE_FIELDS)))
+        if row["SourceShareArn"] not in group.source_shares or \
+                group.permissions.get(row["ResourceType"]) != row["PermissionArn"]:
+            raise MigrationError("Approved permission change does not belong to its entitlement group")
+        rows.append(row)
+    return sorted(rows, key=lambda r: (r["SourceShareArn"], r["PermissionArn"]))
+
+
+def changes_from_metadata(metadata: dict) -> list[dict]:
+    return [dict(zip(_CHANGE_FIELDS, (row[k] for k in CHANGE_KEYS)))
+            for row in metadata.get("PermissionChanges", [])]
 
 
 def _owner_arn(arn: str, owner: str) -> None:
@@ -142,6 +168,17 @@ def _validate_resource(logical: str, item: dict, migration: str,
             raise MigrationError(f"{logical}: permission approval does not match its approved scope")
         for snapshot in snapshots.values():
             policy_semantics(snapshot["Policy"])
+    changes = metadata.get("PermissionChanges", [])
+    if not isinstance(changes, list) or any(
+            not isinstance(row, dict) or set(row) != set(CHANGE_KEYS) or
+            any(not isinstance(row[key], str) or not row[key] for key in CHANGE_KEYS) or
+            row["SourceShareArn"] not in lineage or
+            permissions.get(row["ResourceType"]) != row["PermissionArn"] or
+            (snapshots and snapshots.get(row["ResourceType"], {}).get("Version") != row["ToVersion"])
+            for row in changes):
+        raise MigrationError(f"{logical}: permission-change approval metadata does not match its scope")
+    if len({(row["SourceShareArn"], row["PermissionArn"]) for row in changes}) != len(changes):
+        raise MigrationError(f"{logical}: duplicate permission-change approval metadata")
 
 
 def _validate_template(template: dict, migration: str, owner: str | None = None) -> None:
@@ -190,6 +227,15 @@ def additive_template(old: dict, new: dict, migration: str) -> dict:
                 raise MigrationError(f"{logical}: approved managed permission policy changed")
         if not before and after:
             raise MigrationError(f"{logical}: existing permission approval missing; reconcile explicitly")
+        recorded = {(row["SourceShareArn"], row["PermissionArn"]): row
+                    for row in prior_metadata.get("PermissionChanges", [])}
+        for row in fresh_metadata.get("PermissionChanges", []):
+            key = (row["SourceShareArn"], row["PermissionArn"])
+            if key in recorded and recorded[key] != row:
+                raise MigrationError(f"{logical}: recorded permission-change approval differs")
+            recorded[key] = row
+        if recorded:
+            prior_metadata["PermissionChanges"] = [recorded[k] for k in sorted(recorded)]
     return result
 
 
@@ -348,7 +394,8 @@ class Stacks:
                 raise MigrationError(f"{logical}: permission type metadata differs from RAM permissions")
             group = ApprovedGroup(owner, region, tuple(sorted(properties["Principals"])),
                                   permissions, resources, metadata["SourceShareArns"], snapshots,
-                                  metadata.get("SourceStackIds", []))
+                                  metadata.get("SourceStackIds", []),
+                                  permission_changes=changes_from_metadata(metadata))
             if group.logical_id != logical:
                 raise MigrationError(f"{logical}: template entitlement identity does not match approved grants")
             groups.append(group)
