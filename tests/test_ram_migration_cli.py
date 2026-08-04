@@ -412,17 +412,17 @@ def test_default_plan_is_readonly_including_global_home(harness, capsys, tmp_pat
 
 
 @pytest.mark.parametrize("mode", ["plan", "apply"])
-@pytest.mark.parametrize("receiver", [OWNER, CONSUMER])
-def test_received_unselected_owner_blocks_without_authenticating_foreign_account(
-        harness, capsys, mode, receiver):
-    share = harness.receive(receiver=receiver, owner=OTHER_OWNER)
+def test_received_unselected_owner_is_proposed_without_authenticating_foreign_account(
+        harness, capsys, mode):
+    share = harness.receive(receiver=CONSUMER, owner=OTHER_OWNER)
     argv = args(mode) + ["--role-map", json.dumps({
         OTHER_OWNER: f"arn:aws:iam::{OTHER_OWNER}:role/UnselectedRole"})]
     assert main(argv, input_fn=lambda _: pytest.fail("Audit blocker must precede confirmation")) == 1
     output = capsys.readouterr().out
-    assert f"include owner {OTHER_OWNER} in --owners" in output
+    assert f"owner {OTHER_OWNER} is outside the approved owner scope" in output
+    assert "status=OUTSIDE_OWNER_SCOPE" in output
     assert share["resourceShareArn"] in output and "ipam-pool/test" in output
-    assert f"account={receiver} owner={OTHER_OWNER} region={REGION}" in output
+    assert f"account={CONSUMER} owner={OTHER_OWNER} region={REGION}" in output
     assert "received_owners=1" in output and "received_shares=1" in output
     assert "received_resources=1" in output and "status=BLOCKED" in output
     assert not harness.writes() and not any(call[0] == "apply" for call in harness.calls)
@@ -458,10 +458,21 @@ def test_adding_received_resource_owner_explicitly_allows_scoped_owner_discovery
         assert not harness.writes()
 
 
-def test_received_audit_reads_every_selected_account_and_global_home(harness):
+@pytest.mark.parametrize("mode", ["plan", "apply"])
+def test_stationary_owner_received_dependencies_are_not_migration_blockers(harness, capsys, mode):
+    # The owner is not migrating, so what it receives from others is not at risk.
+    harness.receive(receiver=OWNER, owner=OTHER_OWNER)
+    assert main(args(mode), input_fn=harness.confirm) == 0
+    output = capsys.readouterr().out
+    assert "outside the approved owner scope" not in output
+    assert not any(call[0] == "received-shares" and call[1] == OWNER for call in harness.calls)
+
+
+def test_received_audit_reads_only_migrating_accounts_and_global_home(harness):
     assert main(args()) == 0
     pairs = {(call[1], call[2]) for call in harness.calls if call[0] == "received-shares"}
-    assert pairs == {(OWNER, REGION), (OWNER, HOME), (CONSUMER, REGION), (CONSUMER, HOME)}
+    assert pairs == {(CONSUMER, REGION), (CONSUMER, HOME)}
+    assert ("regions", CONSUMER, {"AllRegions": True}) in harness.calls
     assert all(call[3]["resourceOwner"] == "OTHER-ACCOUNTS"
                for call in harness.calls if call[0] == "received-shares")
     assert not harness.writes()
@@ -484,6 +495,7 @@ def test_received_audit_paginates_shares_and_resources(harness, capsys):
     resource = harness.received_resources[CONSUMER, REGION, first["resourceShareArn"]][0]
     another = dict(resource, arn=resource["arn"] + "-second")
     harness.received_resource_pages[CONSUMER, REGION, first["resourceShareArn"]] = [[resource], [another]]
+    harness.source[OWNER, REGION][0].resources[another["arn"]] = IPAM  # every receipt is covered
     assert main(args()) == 0
     assert any(call[0] == "received-shares" and call[3].get("nextToken") == "1"
                for call in harness.calls)
@@ -513,7 +525,7 @@ def test_temporary_prefix_and_migration_tags_do_not_exempt_unknown_owners(harnes
                      {"key": "MigrationId", "value": MIGRATION}]
     assert main(args("apply"), input_fn=lambda _: pytest.fail("Unproven receipt must block")) == 1
     output = capsys.readouterr().out
-    assert f"include owner {OTHER_OWNER} in --owners" in output
+    assert f"owner {OTHER_OWNER} is outside the approved owner scope" in output
     assert "status=CURRENT_MIGRATION" not in output
     assert not harness.writes()
 
@@ -587,7 +599,7 @@ def test_pending_empty_share_named_in_principal_inventory_is_an_intended_depende
                     input_fn=lambda _: pytest.fail("Intended inventory dependency is pending")) == 1
     output = capsys.readouterr().out
     assert "pending intended received entitlements" in output
-    assert f"include owner {OTHER_OWNER} in --owners" in output
+    assert f"owner {OTHER_OWNER} is outside the approved owner scope" in output
     assert not harness.writes()
 
 
@@ -625,19 +637,26 @@ def test_received_resource_denial_blocks_even_when_other_shares_are_audited(harn
     assert not harness.writes()
 
 
-def test_received_audit_filters_union_regions_by_consumer_enabled_regions(harness, capsys):
-    harness.enabled_regions[OWNER].append({"RegionName": "eu-west-1", "OptInStatus": "opted-in"})
+def test_received_audit_covers_every_enabled_consumer_region_without_a_flag(harness, capsys):
     harness.enabled_regions[CONSUMER].append({"RegionName": "eu-west-1", "OptInStatus": "not-opted-in"})
-    harness.enabled_regions[OWNER].append({"RegionName": "ap-south-1", "OptInStatus": "opted-in"})
     harness.enabled_regions[CONSUMER].append({"RegionName": "ap-south-1", "OptInStatus": "opted-in"})
-    assert main(args() + ["--scan-enabled-regions"]) == 0
+    assert main(args(regions=f"{REGION},eu-west-1")) == 0
     pairs = {(call[1], call[2]) for call in harness.calls if call[0] == "received-shares"}
-    assert (OWNER, "eu-west-1") in pairs
-    assert (CONSUMER, "eu-west-1") not in pairs
-    assert (CONSUMER, "ap-south-1") in pairs
-    assert {(OWNER, HOME), (CONSUMER, HOME)} <= pairs
+    assert (CONSUMER, "eu-west-1") not in pairs            # explicitly requested, not enabled
+    assert (CONSUMER, "ap-south-1") in pairs               # enabled, found without --scan-enabled-regions
+    assert (CONSUMER, HOME) in pairs                       # RAM's home Region for global resources
+    assert not any(account == OWNER for account, _region in pairs)
     assert f"account={CONSUMER} region=eu-west-1 phase=received-regions status=EXCLUDED" in capsys.readouterr().out
-    assert len([call for call in harness.calls if call[0] == "regions" and call[1] == OWNER]) == 1
+    assert not any(call[0] == "regions" and call[1] == OWNER for call in harness.calls)
+
+
+def test_owner_discovery_follows_the_regions_consumers_receive_from(harness):
+    harness.enabled_regions[CONSUMER].append({"RegionName": "ap-south-1", "OptInStatus": "opted-in"})
+    harness.receive(region="ap-south-1")
+    harness.source[OWNER, "ap-south-1"] = [group(region="ap-south-1")]
+    assert main(args()) == 0
+    discovered = {(call[1], call[2]) for call in harness.calls if call[0] == "discovery"}
+    assert (OWNER, "ap-south-1") in discovered             # not in --regions; implied by a dependency
 
 
 def test_consumer_enabled_region_denial_blocks_complete_audit(harness, capsys):
@@ -670,11 +689,13 @@ def test_received_counts_and_blockers_are_part_of_optional_export(harness, tmp_p
     assert audit["counts"]["received_resources"] == 1
     assert audit["scopes"][CONSUMER] == [HOME, REGION]
     assert audit["entries"][0]["owner"] == OTHER_OWNER
-    assert any(f"include owner {OTHER_OWNER} in --owners" in reason for reason in audit["blocked"])
+    assert any(f"owner {OTHER_OWNER} is outside the approved owner scope" in reason
+               for reason in audit["blocked"])
     assert not harness.writes()
 
 
 def test_received_totals_distinguish_unique_resources_from_recipient_observations(harness, capsys):
+    harness.source[OWNER, REGION][0].consumers = (CONSUMER, OTHER_CONSUMER)
     harness.receive()
     harness.receive(receiver=OTHER_CONSUMER)
     assert main(args(consumers=f"{CONSUMER},{OTHER_CONSUMER}")) == 0
@@ -1428,3 +1449,95 @@ def test_apply_and_verify_require_the_reviewed_record(harness, capsys, mode):
     assert cli.main(args(mode), input_fn=lambda _: pytest.fail("must not confirm")) == 1
     assert f"{mode} requires --record" in capsys.readouterr().out
     assert not harness.writes()
+
+
+# ---------------------------------------------------------------------------
+# Consumer-driven dependency scope and owner-scope approval (v0.2.0)
+# ---------------------------------------------------------------------------
+def receive_two_from_other_owner(harness):
+    share = harness.receive(owner=OTHER_OWNER, suffix="a")
+    rows = harness.received_resources[CONSUMER, REGION, share["resourceShareArn"]]
+    rows.append(dict(rows[0], arn=rows[0]["arn"] + "-2"))
+    harness.receive(receiver=OTHER_CONSUMER, owner=OTHER_OWNER, suffix="b")
+
+
+def owner_token(path):
+    request = record_module.load(path, MIGRATION)["owner_scope_request"]
+    return request, f"APPROVE-OWNERS {MIGRATION} {request['id']}"
+
+
+def test_out_of_scope_owner_is_one_actionable_proposal(harness, capsys, migration_record):
+    receive_two_from_other_owner(harness)
+    argv = with_record(args(consumers=f"{CONSUMER},{OTHER_CONSUMER}"), migration_record)
+    assert main(argv) == 1
+    output = capsys.readouterr().out
+    lines = [l for l in output.splitlines()
+             if f"phase=owner-scope owner={OTHER_OWNER} status=APPROVAL_REQUIRED" in l]
+    assert len(lines) == 1                       # not one blocker per repeated observation
+    assert "provides 2 unique received resources (ec2:IpamPool x3)" in lines[0]
+    assert "through 2 shares" in lines[0] and "(3 observations)" in lines[0]
+    assert f"to migrating accounts {CONSUMER},{OTHER_CONSUMER}" in lines[0]
+    assert ("authentication", OTHER_OWNER) not in harness.calls
+    request, _ = owner_token(migration_record)
+    assert request["owners"] == [OTHER_OWNER]
+    assert request["evidence"][OTHER_OWNER]["unique_resources"] == 2
+    assert record_module.load(migration_record, MIGRATION)["scope"]["proposed_owners"] == [OTHER_OWNER]
+
+
+def test_owner_scope_expands_only_after_bound_approval_and_explicit_mapping(
+        harness, capsys, migration_record):
+    harness.receive(owner=OTHER_OWNER)
+    harness.source[OTHER_OWNER, REGION] = [group(owner=OTHER_OWNER)]
+    plan_argv = with_record(args(), migration_record)
+    assert main(plan_argv) == 1
+    request, token = owner_token(migration_record)
+    assert main(["approve", "--record", str(migration_record)],
+                input_fn=lambda _p: f"APPROVE-OWNERS {MIGRATION}") == 2
+    assert main(plan_argv) == 1                  # a wrong token never expands the scope
+    assert ("authentication", OTHER_OWNER) not in harness.calls
+    capsys.readouterr()
+    assert main(["approve", "--record", str(migration_record)], input_fn=lambda _p: token) == 0
+    assert f"proposed_owners={OTHER_OWNER}" in capsys.readouterr().out
+    harness.auth_errors[OTHER_OWNER] = denied("GetCallerIdentity")
+    assert main(plan_argv) == 1                  # approved, but still needs its own access
+    assert "phase=owner-scope status=APPROVED" in capsys.readouterr().out
+    del harness.auth_errors[OTHER_OWNER]
+    assert main(plan_argv + ["--profile-map", json.dumps({OTHER_OWNER: "approved-other-owner"})]) == 0
+    assert ("discovery", OTHER_OWNER, REGION) in harness.calls
+    record = record_module.load(migration_record, MIGRATION)
+    assert record["scope"]["approved_owner_scope"] == [OTHER_OWNER]
+    assert OTHER_OWNER in record["scope"]["stationary_owners"]
+    assert record["plan"]["status"] == "PLANNED"
+
+
+def test_uncovered_received_dependency_from_a_selected_owner_blocks(harness, capsys):
+    share = harness.receive(suffix="extra")
+    harness.received_resources[CONSUMER, REGION, share["resourceShareArn"]][0]["arn"] = \
+        f"arn:aws:ec2:{REGION}:{OWNER}:ipam-pool/uncovered"
+    assert main(args()) == 1
+    output = capsys.readouterr().out
+    assert "status=NOT_COVERED" in output
+    assert "not covered by any planned temporary share" in output and "ipam-pool/uncovered" in output
+    assert not harness.writes()
+
+
+def test_coverage_does_not_repeat_an_upstream_discovery_blocker(harness, capsys):
+    harness.discovery_errors[OWNER, REGION] = MigrationError(
+        f"{ORIGINAL_SHARE}: Non-default permission differs and requires approval")
+    harness.receive()
+    assert main(args()) == 1
+    output = capsys.readouterr().out
+    assert "requires approval" in output and "not covered by any planned" not in output
+
+
+def test_record_scope_distinguishes_account_roles(harness, migration_record):
+    argv = with_record(args(owners=f"{OWNER},{OTHER_OWNER}",
+                            consumers=f"{CONSUMER},{OTHER_OWNER}"), migration_record)
+    assert main(argv + ["--profile-map", json.dumps({OTHER_OWNER: "other-owner"})]) == 0
+    scope = record_module.load(migration_record, MIGRATION)["scope"]
+    assert scope["migrating_consumers"] == [CONSUMER]
+    assert scope["migrating_owners"] == [OTHER_OWNER]
+    assert scope["stationary_owners"] == [OWNER]
+    assert harness.discovery_kwargs["migrating_owners"] == {OTHER_OWNER}
+    received = {call[1] for call in harness.calls if call[0] == "received-shares"}
+    assert received == {CONSUMER, OTHER_OWNER}   # migrating owners are audited, stationary are not

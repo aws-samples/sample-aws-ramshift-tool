@@ -570,6 +570,14 @@ class Discovery:
                             f"{arn}: selected active source-organization consumers outside "
                             f"this principal scope: {sorted(outside_scope)}")
                 unrelated = consumers - self.consumers - {owner}
+                if unrelated and owner in self.migrating_owners:
+                    # A stationary consumer of a migrating owner loses access when the owner
+                    # leaves; bridging that direction is not supported (requirements §10).
+                    raise MigrationError(
+                        f"migrating owner {owner} shares with stationary consumers "
+                        f"{sorted(unrelated)}; their access ends when the owner leaves its "
+                        "organization and owner-migration continuity is not supported by this "
+                        "tool version")
                 if unrelated:
                     plan.excluded.append(
                         f"{arn}: unrelated consumers outside migration population: {sorted(unrelated)}")

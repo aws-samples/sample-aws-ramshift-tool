@@ -38,8 +38,9 @@ from ram_migration_discovery import (
     Discovery, describe_difference, external_catalog, revalidate_change,
 )
 from ram_migration_record import (
-    APPLICABLE, approval_for, approve_permission_change, latest, new_record,
-    pending_requests, permission_requests, plan_digest, tool_identity,
+    APPLICABLE, approval_for, approve_owner_scope, approve_permission_change, approved_owners,
+    latest, new_record, owner_scope_request, pending_requests, permission_requests,
+    plan_digest, tool_identity,
 )
 from ram_migration_record import load as load_record
 from ram_migration_record import update as update_record
@@ -344,8 +345,13 @@ def authenticate(router: Router, accounts: set[str], opts: Options, report: Repo
             if row.error]
 
 
-def region_scopes(router: WriteGate, opts: Options, report: Reporter) -> tuple[dict, list[str]]:
-    scopes = {owner: list(opts.regions) for owner in opts.owners}
+def region_scopes(router: WriteGate, opts: Options, report: Reporter,
+                  dependencies: dict[str, set[str]] | None = None) -> tuple[dict, list[str]]:
+    """Explicit Regions, plus every Region where a migrating account receives
+    this owner's resources (consumer-driven), plus all enabled Regions on request."""
+    dependencies = dependencies or {}
+    scopes = {owner: sorted(set(opts.regions) | dependencies.get(owner, set()))
+              for owner in opts.owners}
     failures = []
     if opts.args.scan_enabled_regions:
         def scan(owner, _region):
@@ -354,7 +360,7 @@ def region_scopes(router: WriteGate, opts: Options, report: Reporter) -> tuple[d
                        if r.get("OptInStatus") in ("opt-in-not-required", "opted-in")]
             if not enabled:
                 raise MigrationError("No enabled Regions returned; discovery scope is unresolved")
-            return sorted(set(opts.regions + enabled)), set(enabled)
+            return sorted(set(opts.regions + enabled) | dependencies.get(owner, set())), set(enabled)
         for row in scoped_fanout({owner: [RAM_HOME_REGION] for owner in opts.owners}, scan, opts):
             if row.error:
                 failures.append(f"owner={row.account} phase=regions status=BLOCKED {row.error}")
@@ -385,75 +391,49 @@ class ReceivedAudit:
         }
 
     def to_dict(self) -> dict:
-        return {"scopes": self.scopes, "counts": self.counts(), "entries": self.entries,
+        entries = [{k: v for k, v in entry.items() if k != "context"} for entry in self.entries]
+        return {"scopes": self.scopes, "counts": self.counts(), "entries": entries,
                 "blocked": self.blocked, "excluded": self.excluded}
 
 
-def received_scopes(router: WriteGate, owner_scopes: dict[str, list[str]], opts: Options,
+def received_scopes(router: WriteGate, opts: Options,
                     report: Reporter) -> tuple[dict[str, list[str]], list[str]]:
-    """Audit approved accounts only, filtering Regions known to be disabled."""
+    """Consumer-driven: every enabled Region of every migrating account, plus
+    RAM's global home. Stationary owners are not audited: their own received
+    dependencies are not affected by the migration."""
     failures = []
     failed_accounts = set()
-    if opts.args.scan_enabled_regions:
-        unresolved = set(opts.consumers) - set(opts.known_enabled_regions)
-        def enabled(account, _region):
-            rows = router.client(account, "ec2", RAM_HOME_REGION).describe_regions(AllRegions=True)["Regions"]
-            regions = {row["RegionName"] for row in rows
-                       if row.get("OptInStatus") in ("opt-in-not-required", "opted-in")}
-            if not regions or any(not REGION.fullmatch(region) for region in regions):
-                raise MigrationError("Enabled Region scope is unresolved")
-            return regions
-        for row in scoped_fanout({account: [RAM_HOME_REGION] for account in unresolved}, enabled, opts):
-            if row.error:
-                failed_accounts.add(row.account)
-                failures.append(f"account={row.account} phase=received-regions status=BLOCKED {row.error}")
-            else:
-                opts.known_enabled_regions[row.account] = row.value
-    union = {region for regions in owner_scopes.values() for region in regions} | {RAM_HOME_REGION}
+    unresolved = set(opts.consumers) - set(opts.known_enabled_regions)
+
+    def enabled(account, _region):
+        rows = router.client(account, "ec2", RAM_HOME_REGION).describe_regions(AllRegions=True)["Regions"]
+        regions = {row["RegionName"] for row in rows
+                   if row.get("OptInStatus") in ("opt-in-not-required", "opted-in")}
+        if not regions or any(not REGION.fullmatch(region) for region in regions):
+            raise MigrationError("Enabled Region scope is unresolved")
+        return regions
+    for row in scoped_fanout({account: [RAM_HOME_REGION] for account in unresolved}, enabled, opts):
+        if row.error:
+            failed_accounts.add(row.account)
+            failures.append(f"account={row.account} phase=received-regions status=BLOCKED {row.error}")
+        else:
+            opts.known_enabled_regions[row.account] = row.value
     scopes = {}
-    for account in sorted(set(opts.owners + opts.consumers)):
+    for account in sorted(set(opts.consumers)):
         if account in failed_accounts:
             continue
-        regions = set(owner_scopes.get(account, []))
-        if account in opts.consumers:
-            regions |= union
-        known = opts.known_enabled_regions.get(account)
-        if known is not None:
-            for region in sorted(regions - known):
-                report.emit(f"account={account} region={region} phase=received-regions "
-                            "status=EXCLUDED Region is not enabled in this account")
-            regions &= known
-        scopes[account] = sorted(regions)
+        known = opts.known_enabled_regions[account]
+        for region in sorted(set(opts.regions) - known - {RAM_HOME_REGION}):
+            report.emit(f"account={account} region={region} phase=received-regions "
+                        "status=EXCLUDED Region is not enabled in this account")
+        scopes[account] = sorted(known | {RAM_HOME_REGION})
     return scopes, failures
 
 
-def received_preflight(router: WriteGate, stacks: Stacks, owner_scopes: dict[str, list[str]],
-                       persisted: dict[tuple[str, str], list[Group]], plan: Plan, opts: Options,
-                       report: Reporter) -> ReceivedAudit:
-    """Account for received dependencies without attempting to re-share them."""
-    scopes, errors = received_scopes(router, owner_scopes, opts, report)
+def received_inventory(router: WriteGate, opts: Options, report: Reporter) -> ReceivedAudit:
+    """Read-only inventory of what the migrating accounts actually receive."""
+    scopes, errors = received_scopes(router, opts, report)
     audit = ReceivedAudit(scopes=scopes, blocked=errors)
-    proven: dict[tuple[str, str, str], Group] = {}
-    persisted_scopes = grouped_scopes([group for groups in persisted.values() for group in groups])[1]
-    for row in scoped_fanout(persisted_scopes, stacks.shares, opts):
-        if row.error:
-            audit.blocked.append(
-                f"owner={row.account} region={row.region} phase=received-provenance status=BLOCKED {row.error}")
-            continue
-        for group in persisted[row.account, row.region]:
-            share = row.value.get(group.logical_id)
-            if share is None or share.get("owningAccountId") != group.owner:
-                audit.blocked.append(f"{row.account}/{row.region}/{group.key}: "
-                                     "stored migration share ownership could not be proven")
-                continue
-            proven[group.owner, group.region, share["resourceShareArn"]] = group
-
-    intended_shares: dict[tuple[str, str], set[str]] = defaultdict(set)
-    intended_resources: dict[tuple[str, str], set[str]] = defaultdict(set)
-    for group in plan.groups:
-        for consumer in group.consumers:
-            intended_shares[consumer, group.region].update(group.source_shares)
-            intended_resources[consumer, group.region].update(group.resources)
 
     def inspect(account, region):
         result = ReceivedAudit()
@@ -492,63 +472,9 @@ def received_preflight(router: WriteGate, stacks: Stacks, owner_scopes: dict[str
                 state = share.get("status", "UNKNOWN")
                 if state not in ("ACTIVE", "PENDING", "FAILED", "DELETING", "DELETED"):
                     raise MigrationError(f"Received share status is missing or unsupported: {state}")
-                entry = {"account": account, "owner": owner, "region": region, "share": arn,
-                         "share_status": state, "resources": items, "status": "OWNER_INCLUDED"}
-                result.entries.append(entry)
-                owned = proven.get((owner, region, arn))
-                if owned is not None:
-                    if account not in owned.consumers or \
-                            any(owned.resources.get(item["arn"]) != item["type"] for item in items):
-                        entry["status"] = "BLOCKED"
-                        result.blocked.append(f"{context} status=BLOCKED received migration entitlement "
-                                              "differs from its owning persisted scope; reconcile explicitly")
-                    else:
-                        entry["status"] = "CURRENT_MIGRATION"
-                        result.excluded.append(f"{context} status=EXCLUDED "
-                                               "current migration share proven through its owning persisted scope")
-                    continue
-                relevant = (bool(items) or arn in intended_shares[account, region]
-                            or bool(seen & intended_resources[account, region])
-                            or account in opts.principals.get(arn, []))
-                if state != "ACTIVE":
-                    if (state == "PENDING" and relevant) or (
-                            any(item["status"] == "PENDING" for item in items) and
-                            (arn in intended_shares[account, region]
-                             or bool(seen & intended_resources[account, region]))):
-                        entry["status"] = "BLOCKED"
-                        result.blocked.append(f"{context} status=BLOCKED "
-                                              f"pending intended received entitlements (share status {state}); "
-                                              "resolve the intended sharing/invitation before apply")
-                        if owner not in opts.owners:
-                            result.blocked.append(f"{context} status=BLOCKED "
-                                                  f"include owner {owner} in --owners and supply an explicit "
-                                                  "profile/role mapping for the intended dependency")
-                    else:
-                        entry["status"] = "EXCLUDED"
-                        result.excluded.append(f"{context} status=EXCLUDED "
-                                               f"nonactive received share status {state}; no active access inferred")
-                    continue
-                if not items:
-                    entry["status"] = "EXCLUDED"
-                    result.excluded.append(f"{context} status=EXCLUDED empty active received share")
-                    continue
-                if owner not in opts.owners:
-                    entry["status"] = "BLOCKED"
-                    for item in items:
-                        result.blocked.append(
-                            f"{context} resource={item['arn']} status=BLOCKED "
-                            f"received dependency belongs to unselected owner {owner}; "
-                            f"include owner {owner} in --owners and supply an explicit profile/role mapping. "
-                            "Received resources cannot be re-shared by this account")
-                elif region not in owner_scopes[owner]:
-                    entry["status"] = "BLOCKED"
-                    result.blocked.append(f"{context} status=BLOCKED "
-                                          "resource owner's Region is outside the selected discovery scope")
-                for item in items:
-                    if item["status"] != "AVAILABLE":
-                        entry["status"] = "BLOCKED"
-                        result.blocked.append(f"{context} resource={item['arn']} status=BLOCKED "
-                                              f"intended received resource status {item['status']}")
+                result.entries.append({"account": account, "owner": owner, "region": region,
+                                       "share": arn, "share_status": state, "resources": items,
+                                       "status": "OBSERVED", "context": context})
             except Exception as exc:
                 result.blocked.append(f"{context} status=BLOCKED {failure_text(exc)}")
         return result
@@ -560,7 +486,144 @@ def received_preflight(router: WriteGate, stacks: Stacks, owner_scopes: dict[str
         else:
             audit.entries.extend(row.value.entries)
             audit.blocked.extend(row.value.blocked)
-            audit.excluded.extend(row.value.excluded)
+    return audit
+
+
+def dependency_regions(audit: ReceivedAudit | None) -> dict[str, set[str]]:
+    """Owner Regions implied by what migrating accounts actually receive."""
+    regions: dict[str, set[str]] = defaultdict(set)
+    for entry in (audit.entries if audit else []):
+        if entry["share_status"] in ("ACTIVE", "PENDING"):
+            regions[entry["owner"]].add(entry["region"])
+    return regions
+
+
+def received_provenance(stacks: Stacks, persisted: dict[tuple[str, str], list[Group]],
+                        opts: Options) -> tuple[dict[tuple[str, str, str], Group], list[str]]:
+    proven: dict[tuple[str, str, str], Group] = {}
+    blocked = []
+    persisted_scopes = grouped_scopes([group for groups in persisted.values() for group in groups])[1]
+    for row in scoped_fanout(persisted_scopes, stacks.shares, opts):
+        if row.error:
+            blocked.append(
+                f"owner={row.account} region={row.region} phase=received-provenance status=BLOCKED {row.error}")
+            continue
+        for group in persisted[row.account, row.region]:
+            share = row.value.get(group.logical_id)
+            if share is None or share.get("owningAccountId") != group.owner:
+                blocked.append(f"{row.account}/{row.region}/{group.key}: "
+                               "stored migration share ownership could not be proven")
+                continue
+            proven[group.owner, group.region, share["resourceShareArn"]] = group
+    return proven, blocked
+
+
+def classify_received(audit: ReceivedAudit, plan: Plan, proven: dict, owner_scopes: dict,
+                      opts: Options) -> dict[str, dict]:
+    """Every active received dependency of a migrating account must be covered by a
+    planned temporary share. Owners outside the approved scope are proposed, never
+    added silently. Returns the proposed-owner evidence."""
+    intended_shares: dict[tuple[str, str], set[str]] = defaultdict(set)
+    intended_resources: dict[tuple[str, str], set[str]] = defaultdict(set)
+    covered: set[tuple[str, str, str, str]] = set()
+    for group in plan.groups:
+        for consumer in group.consumers:
+            intended_shares[consumer, group.region].update(group.source_shares)
+            intended_resources[consumer, group.region].update(group.resources)
+            covered.update((consumer, group.owner, group.region, arn) for arn in group.resources)
+    proposed: dict[str, dict] = {}
+
+    def propose(entry: dict, pending: bool = False) -> None:
+        evidence = proposed.setdefault(entry["owner"], {
+            "consumers": set(), "regions": set(), "shares": set(), "resource_types": defaultdict(int),
+            "resources": set(), "observations": 0, "pending_shares": set()})
+        evidence["consumers"].add(entry["account"])
+        evidence["regions"].add(entry["region"])
+        (evidence["pending_shares"] if pending else evidence["shares"]).add(entry["share"])
+        for item in entry["resources"]:
+            evidence["resources"].add(item["arn"])
+            evidence["resource_types"][item["type"]] += 1
+            evidence["observations"] += 1
+
+    for entry in audit.entries:
+        account, owner, region, arn = entry["account"], entry["owner"], entry["region"], entry["share"]
+        context, state, items = entry["context"], entry["share_status"], entry["resources"]
+        seen = {item["arn"] for item in items}
+        entry["status"] = "OWNER_INCLUDED"
+        owned = proven.get((owner, region, arn))
+        if owned is not None:
+            if account not in owned.consumers or \
+                    any(owned.resources.get(item["arn"]) != item["type"] for item in items):
+                entry["status"] = "BLOCKED"
+                audit.blocked.append(f"{context} status=BLOCKED received migration entitlement "
+                                     "differs from its owning persisted scope; reconcile explicitly")
+            else:
+                entry["status"] = "CURRENT_MIGRATION"
+                audit.excluded.append(f"{context} status=EXCLUDED "
+                                      "current migration share proven through its owning persisted scope")
+            continue
+        relevant = (bool(items) or arn in intended_shares[account, region]
+                    or bool(seen & intended_resources[account, region])
+                    or account in opts.principals.get(arn, []))
+        if state != "ACTIVE":
+            if (state == "PENDING" and relevant) or (
+                    any(item["status"] == "PENDING" for item in items) and
+                    (arn in intended_shares[account, region]
+                     or bool(seen & intended_resources[account, region]))):
+                entry["status"] = "BLOCKED"
+                audit.blocked.append(f"{context} status=BLOCKED "
+                                     f"pending intended received entitlements (share status {state}); "
+                                     "resolve the intended sharing/invitation before apply")
+                if owner not in opts.owners:
+                    propose(entry, pending=True)
+            else:
+                entry["status"] = "EXCLUDED"
+                audit.excluded.append(f"{context} status=EXCLUDED "
+                                      f"nonactive received share status {state}; no active access inferred")
+            continue
+        if not items:
+            entry["status"] = "EXCLUDED"
+            audit.excluded.append(f"{context} status=EXCLUDED empty active received share")
+            continue
+        if owner not in opts.owners:
+            entry["status"] = "OUTSIDE_OWNER_SCOPE"
+            propose(entry)
+            continue
+        if region not in owner_scopes.get(owner, []):
+            entry["status"] = "BLOCKED"
+            audit.blocked.append(f"{context} status=BLOCKED "
+                                 "resource owner's Region is outside the selected discovery scope")
+        for item in items:
+            if item["status"] != "AVAILABLE":
+                entry["status"] = "BLOCKED"
+                audit.blocked.append(f"{context} resource={item['arn']} status=BLOCKED "
+                                     f"intended received resource status {item['status']}")
+        upstream = any(arn in reason for reason in plan.blocked)
+        uncovered = [item["arn"] for item in items if item["status"] == "AVAILABLE"
+                     and (account, owner, region, item["arn"]) not in covered]
+        if uncovered and not upstream:
+            entry["status"] = "NOT_COVERED"
+            audit.blocked.append(f"{context} status=BLOCKED received dependencies are not covered by any "
+                                 f"planned temporary share: {', '.join(sorted(uncovered))}; "
+                                 "they would be lost when the account leaves")
+    for owner, evidence in sorted(proposed.items()):
+        types = ", ".join(f"{kind} x{count}" for kind, count in sorted(evidence["resource_types"].items()))
+        audit.blocked.append(
+            f"phase=owner-scope owner={owner} status=APPROVAL_REQUIRED owner {owner} is outside the "
+            f"approved owner scope but provides {len(evidence['resources'])} unique received resources "
+            f"({types or 'pending share'}) through {len(evidence['shares'] | evidence['pending_shares'])} "
+            f"shares in {','.join(sorted(evidence['regions']))} to migrating accounts "
+            f"{','.join(sorted(evidence['consumers']))} ({evidence['observations']} observations). "
+            f"Approve the proposed owner list, then re-run plan with an explicit profile/role mapping for "
+            f"{owner}. Received resources cannot be re-shared by the receiving account")
+    return {owner: {"consumers": sorted(e["consumers"]), "regions": sorted(e["regions"]),
+                    "shares": sorted(e["shares"]), "pending_shares": sorted(e["pending_shares"]),
+                    "resource_types": dict(sorted(e["resource_types"].items())),
+                    "unique_resources": len(e["resources"]), "observations": e["observations"]}
+            for owner, e in sorted(proposed.items())}
+
+
+def print_received(audit: ReceivedAudit, report: Reporter) -> None:
     inventory: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
     for entry in audit.entries:
         inventory[entry["account"], entry["owner"], entry["region"]].append(entry)
@@ -574,7 +637,6 @@ def received_preflight(router: WriteGate, stacks: Stacks, owner_scopes: dict[str
                     f"shares={len(entries)} "
                     f"resources={len({item['arn'] for entry in entries for item in entry['resources']})}")
     report.emit("phase=received-inventory " + " ".join(f"{key}={value}" for key, value in audit.counts().items()))
-    return audit
 
 
 def merge_plan(plan: Plan, addition: Plan) -> None:
@@ -919,7 +981,7 @@ def reviewed_plan_problem(record: dict, plan: Plan, scope: dict) -> str | None:
 
 
 def record_plan(record: dict, plan: Plan, scope: dict, prepared: dict, received: Any,
-                capability_provenance: dict, status: str) -> dict:
+                capability_provenance: dict, status: str, proposed: dict | None = None) -> dict:
     record = dict(record)
     record["scope"] = scope
     record["plan"] = {
@@ -939,6 +1001,7 @@ def record_plan(record: dict, plan: Plan, scope: dict, prepared: dict, received:
     }
     record["permission_change_requests"] = permission_requests(plan.migration,
                                                                plan.permission_changes)
+    record["owner_scope_request"] = owner_scope_request(plan.migration, proposed or {})
     return record
 
 
@@ -971,10 +1034,15 @@ def run_approve(opts: Options, ask: Callable[[str], str], report: Reporter) -> i
     if latest(record, "plan") is None:
         raise MigrationError("approve requires a recorded plan; run plan --record first")
     pending = pending_requests(record)
-    if not pending:
+    owners_request = record.get("owner_scope_request")
+    if owners_request and owners_request["id"] in {
+            a.get("approval_id") for a in record.get("approvals", {}).get("owner_scope", [])}:
+        owners_request = None
+    if not pending and not owners_request:
         report.emit(f"migration={migration} phase=approve status=NOTHING_PENDING")
         return 0
     approved = []
+    owners_approved = None
     for request in pending:
         report.emit(f"migration={migration} phase=approve change={request['id']} "
                     f"permission={request['permission_arn']} resource_type={request['resource_type']} "
@@ -999,7 +1067,30 @@ def run_approve(opts: Options, ask: Callable[[str], str], report: Reporter) -> i
             continue
         approved.append(request)
         report.emit(f"change={request['id']} phase=approve status=CONFIRMED")
-    if approved:
+    if owners_request:
+        report.emit(f"migration={migration} phase=approve owner-scope={owners_request['id']} "
+                    f"proposed_owners={','.join(owners_request['owners'])}")
+        for owner, evidence in owners_request["evidence"].items():
+            types = ", ".join(f"{k} x{v}" for k, v in evidence["resource_types"].items())
+            report.emit(f"  owner={owner} unique_resources={evidence['unique_resources']} "
+                        f"observations={evidence['observations']} shares={len(evidence['shares'])} "
+                        f"pending_shares={len(evidence['pending_shares'])} "
+                        f"regions={','.join(evidence['regions'])} "
+                        f"consumers={','.join(evidence['consumers'])} types=[{types}]")
+        report.emit("  Approval adds these owners to this migration's owner scope only. Plan must "
+                    "then be re-run with explicit access mappings for them before anything is applied.")
+        token = f"APPROVE-OWNERS {migration} {owners_request['id']}"
+        try:
+            reply = ask(f"Type {token} to approve this owner scope: ")
+        except EOFError:
+            reply = ""
+        if reply == token:
+            owners_approved = owners_request
+            report.emit(f"owner-scope={owners_request['id']} phase=approve status=CONFIRMED")
+        else:
+            report.emit(f"owner-scope={owners_request['id']} phase=approve status=NOT_APPROVED "
+                        "confirmation did not match")
+    if approved or owners_approved:
         def add_approvals(current: dict) -> None:
             reviewed = {r["id"]: r for r in current.get("permission_change_requests", [])}
             for request in approved:
@@ -1007,12 +1098,19 @@ def run_approve(opts: Options, ask: Callable[[str], str], report: Reporter) -> i
                     raise MigrationError(f"{request['id']}: the record changed during review; "
                                          "re-run approve against the latest plan revision")
                 approve_permission_change(current, request)
-        update_record(path, migration, add_approvals, mode="approve", status="APPROVED",
-                      approved=[request["id"] for request in approved])
-        for request in approved:
-            report.emit(f"change={request['id']} phase=approve status=APPROVED")
+            if owners_approved:
+                if current.get("owner_scope_request") != owners_approved:
+                    raise MigrationError(f"{owners_approved['id']}: the record changed during review; "
+                                         "re-run approve against the latest plan revision")
+                approve_owner_scope(current, owners_approved)
+        ids = [request["id"] for request in approved] + \
+            ([owners_approved["id"]] if owners_approved else [])
+        update_record(path, migration, add_approvals, mode="approve", status="APPROVED", approved=ids)
+        for approval_id in ids:
+            report.emit(f"approval={approval_id} phase=approve status=APPROVED")
         report.emit("Re-run plan with --record to produce a PLANNED revision for review before apply.")
-    return 0 if len(approved) == len(pending) else 2
+    complete = len(approved) == len(pending) and (owners_request is None or owners_approved)
+    return 0 if complete else 2
 
 
 def summary(plan: Plan, report: Reporter, status: str, *, created: int = 0, reused: int = 0,
@@ -1045,7 +1143,14 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
             record = new_record(args.migration_id)
         else:
             record = load_record(args.record, args.migration_id)
+    approved_owner_scope = approved_owners(record) if record else set()
+    added_owners = sorted(approved_owner_scope - set(opts.owners))
+    if added_owners:
+        opts.owners = sorted(set(opts.owners) | approved_owner_scope)
+        report.emit(f"phase=owner-scope status=APPROVED owners={','.join(added_owners)} "
+                    "source=record; supply profile/role mappings for these owners")
     scope = account_scope(opts)
+    scope["approved_owner_scope"] = sorted(approved_owner_scope)
     approvals = record["approvals"]["permission_changes"] if record else []
 
     def note(status: str, mutate: Callable[[dict], Any] = lambda _record: None,
@@ -1070,7 +1175,12 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                           blockers=len(plan.blocked), phase="authentication")
         note("BLOCKED", blockers=list(plan.blocked), phase="authentication")
         return 1
-    scopes, failures = region_scopes(gate, opts, report)
+    received = None
+    if args.mode != "verify":
+        # Consumer-driven: what the migrating accounts receive decides which owner
+        # Regions must be inspected, so the inventory comes first.
+        received = received_inventory(gate, opts, report)
+    scopes, failures = region_scopes(gate, opts, report, dependency_regions(received))
     plan.blocked.extend(failures)
     stacks = Stacks(gate, plan.migration, timeout=args.timeout)
     if not callable(getattr(stacks, "persisted_groups", None)):
@@ -1093,7 +1203,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
             merge_plan(plan, Plan(plan.migration, groups=row.value))
 
     capability_provenance: dict = {}
-    received = None
+    proposed: dict[str, dict] = {}
     if args.mode != "verify":
         capabilities, capability_provenance = capabilities_for(opts)
         report.emit(f"phase=plan capability_provenance={json.dumps(capability_provenance, sort_keys=True)}")
@@ -1112,7 +1222,11 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                 plan.blocked.append(f"owner={row.account} region={row.region} phase=discovery {row.error}")
             else:
                 merge_plan(plan, row.value)
-        received = received_preflight(gate, stacks, scopes, persisted_groups, plan, opts, report)
+        proven, provenance_blocked = received_provenance(stacks, persisted_groups, opts)
+        received.blocked.extend(provenance_blocked)
+        proposed = classify_received(received, plan, proven, scopes, opts)
+        scope["proposed_owners"] = sorted(proposed)
+        print_received(received, report)
         plan.blocked.extend(received.blocked)
         plan.excluded.extend(received.excluded)
     additional_consumers = {consumer for group in plan.groups for consumer in group.consumers} \
@@ -1151,7 +1265,8 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
             record = update_record(
                 args.record, plan.migration,
                 lambda current: current.update(record_plan(
-                    current, plan, scope, prepared, received, capability_provenance, status)),
+                    current, plan, scope, prepared, received, capability_provenance, status,
+                    proposed)),
                 mode="plan", status=status, create=True,
                 plan_digest=plan_digest(plan.groups, scope), blockers=len(plan.blocked),
                 permission_changes_pending=pending)

@@ -1475,3 +1475,24 @@ def test_additive_template_merges_change_evidence_and_rejects_conflicts():
     conflicting["Resources"][plain.logical_id]["Metadata"]["PermissionChanges"][0]["ApprovalId"] = "pc-other"
     with pytest.raises(MigrationError, match="approval differs"):
         additive_template(merged, conflicting, MIGRATION)
+
+
+# ---------------------------------------------------------------------------
+# Account roles: migrating owners (v0.2.0)
+# ---------------------------------------------------------------------------
+def test_migrating_owner_sharing_with_stationary_consumers_blocks(clients):
+    cs, stubs = clients
+    stub_discovery(stubs, principals={SOURCE: [CONSUMER, OTHER]}, read_permissions=False)
+    result = Discovery(OfflineRouter(cs), {CONSUMER, OWNER}, MIGRATION, {}, {KIND.lower(): True},
+                       migrating_owners={OWNER}).inspect(OWNER, REGION)
+    assert not result.groups
+    assert f"migrating owner {OWNER} shares with stationary consumers ['{OTHER}']" in result.blocked[0]
+
+
+def test_stationary_owner_with_unrelated_consumers_only_excludes_them(clients):
+    cs, stubs = clients
+    stub_discovery(stubs, principals={SOURCE: [CONSUMER, OTHER]})
+    result = Discovery(OfflineRouter(cs), {CONSUMER}, MIGRATION, {}, {KIND.lower(): True},
+                       migrating_owners=set()).inspect(OWNER, REGION)
+    assert not result.blocked and result.groups[0].consumers == (CONSUMER,)
+    assert any("unrelated consumers outside migration population" in e for e in result.excluded)
