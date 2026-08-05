@@ -79,8 +79,43 @@ def new_record(migration: str) -> dict:
         "baseline": None,
         "shares": [],
         "verifications": [],
+        "drops": [],
+        "completion": None,
         "history": [],
     }
+
+
+DROP_KINDS = ("original_share", "association", "entitlement", "tgw_attachment", "tgw_route",
+              "ipam_allocation", "pca_access", "resolver_endpoint")
+
+
+def drop_id(kind: str, consumer: str | None, region: str | None, subject: str,
+            first_absent_at: str) -> str:
+    return hashlib.sha256("|".join(
+        [kind, consumer or "", region or "", subject, first_absent_at]).encode()).hexdigest()[:16]
+
+
+def add_drops(record: dict, drops: list[dict]) -> int:
+    """Append drop events once each; failure drops are permanent evidence."""
+    known = {d["id"] for d in record.setdefault("drops", [])}
+    added = 0
+    for drop in drops:
+        if drop.get("kind") not in DROP_KINDS or drop.get("severity") not in (
+                "informational", "failure"):
+            raise MigrationError(f"Unsupported drop event: {drop.get('kind')}/{drop.get('severity')}")
+        if drop["kind"] == "original_share" and drop["severity"] != "informational":
+            raise MigrationError("Original-share drops are informational")
+        if drop["kind"] != "original_share" and drop["severity"] != "failure":
+            raise MigrationError("Association and resource drops are failures")
+        if drop["id"] not in known:
+            record["drops"].append(dict(drop))
+            known.add(drop["id"])
+            added += 1
+    return added
+
+
+def failure_drops(record: dict) -> list[dict]:
+    return [d for d in record.get("drops", []) if d.get("severity") == "failure"]
 
 
 def _content_digest(record: dict) -> str:
