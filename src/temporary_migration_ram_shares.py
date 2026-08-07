@@ -38,13 +38,18 @@ from ram_migration_discovery import (
     Discovery, describe_difference, external_catalog, revalidate_change,
 )
 from ram_migration_record import (
-    APPLICABLE, approval_for, approve_owner_scope, approve_permission_change, approved_owners,
-    latest, new_record, owner_scope_request, pending_requests, permission_requests,
-    plan_digest, tool_identity,
+    APPLICABLE, add_drops, approval_for, approve_owner_scope, approve_permission_change,
+    approved_owners, drop_id, failure_drops, latest, new_record, owner_scope_request,
+    pending_requests, permission_requests, plan_digest, tool_identity,
 )
 from ram_migration_record import load as load_record
 from ram_migration_record import update as update_record
-from ram_migration_stacks import Stacks, accept, stack_name, verify_group
+from ram_migration_stacks import Stacks, accept, delete_share, stack_name, verify_group
+
+try:
+    import ram_migration_verification as verification
+except ImportError:  # pragma: no cover - ships in the same release
+    verification = None
 
 RAM_HOME_REGION = "us-east-1"
 REGION = re.compile(r"^[a-z]{2}(?:-[a-z]+)+-\d+$")
@@ -76,6 +81,13 @@ def positive_number(value: str) -> float:
     return number
 
 
+def nonnegative_number(value: str) -> float:
+    number = float(value)
+    if not 0 <= number < float("inf"):
+        raise argparse.ArgumentTypeError("use a nonnegative finite number")
+    return number
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -85,7 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("mode", nargs="?",
-                        choices=("plan", "approve", "apply", "verify", "monitor"),
+                        choices=("plan", "approve", "apply", "verify", "complete", "monitor"),
                         default="plan")
     parser.add_argument("--migration-id", help="stable identifier for this migration")
     parser.add_argument("--record", type=Path,
@@ -121,6 +133,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="bounded eventual-consistency/transient polling attempts")
     parser.add_argument("--poll-interval", type=positive_number, default=2,
                         help="initial polling delay in seconds, with bounded jitter/backoff")
+    parser.add_argument("--settle-seconds", type=nonnegative_number, default=300,
+                        help="complete: seconds to keep re-verifying after each temporary share "
+                             "deletion before deleting the next one")
     parser.add_argument("--export-plan", type=Path,
                         help="optional local JSON plan export (plan/apply only)")
     parser.add_argument("--monitor-config", help="JSON object/file passed to ram_migration_monitor.monitor")
@@ -178,18 +193,19 @@ def options(args: argparse.Namespace, ask: Callable[[str], str]) -> Options:
         if args.migration_id and not MIGRATION_ID.fullmatch(args.migration_id):
             raise MigrationError("Supply a valid --migration-id or omit it to use the record's")
         return Options(args, [], [], [], [], {}, {}, None, {})
-    if args.mode in ("apply", "verify") and not args.record:
+    if args.mode in ("apply", "verify", "complete") and not args.record:
         raise MigrationError(f"{args.mode} requires --record: the reviewed migration record "
                              "written by plan")
+    from_record = args.mode in ("verify", "complete")
     interactive = args.interactive or sys.stdin.isatty()
     if args.mode != "monitor" and interactive:
         if not args.migration_id:
             args.migration_id = ask("Migration identifier: ").strip()
-        if not args.owners:
+        if not args.owners and not from_record:
             args.owners = [ask("Owner/inspection account IDs (comma or space separated): ").split()]
         if args.mode in ("plan", "apply") and not args.consumers:
             args.consumers = [ask("Migrating consumer account IDs (comma or space separated): ").split()]
-        if not args.regions and not args.scan_enabled_regions:
+        if not args.regions and not args.scan_enabled_regions and not from_record:
             args.regions = [ask("Regions (comma or space separated): ").split()]
     if interactive and not any((args.profile, args.source_profile, args.destination_profile,
                                 args.account_map, args.profile_map, args.role_map)):
@@ -204,11 +220,11 @@ def options(args: argparse.Namespace, ask: Callable[[str], str]) -> Options:
         if not args.migration_id or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}",
                                                     args.migration_id):
             raise MigrationError("Supply --migration-id (1-128 letters, digits, dots, underscores or hyphens)")
-        if not owners:
+        if not owners and not from_record:
             raise MigrationError("Supply explicit --owners/--accounts")
         if args.mode in ("plan", "apply") and not consumers:
             raise MigrationError("Supply explicit --consumers")
-        if not regions and not args.scan_enabled_regions:
+        if not regions and not args.scan_enabled_regions and not from_record:
             raise MigrationError("Supply --regions or --scan-enabled-regions")
     if args.export_plan and args.mode not in ("plan", "apply"):
         raise MigrationError("--export-plan is supported only for plan/apply")
@@ -245,7 +261,8 @@ def options(args: argparse.Namespace, ask: Callable[[str], str]) -> Options:
         raise MigrationError("Role assumption requires an explicit base --profile")
     if args.role_name and not re.fullmatch(r"[A-Za-z0-9+=,.@_/-]+", args.role_name):
         raise MigrationError("--role-name must be an IAM role name/path")
-    if interactive and set(owners + consumers) - set(mappings) and not args.sso_role and not args.role_name:
+    if interactive and not from_record and set(owners + consumers) - set(mappings) and \
+            not args.sso_role and not args.role_name:
         args.sso_role = ask(
             "SSO role for unmapped accounts (explicit role name; blank to use account/profile maps): "
         ).strip() or None
@@ -704,103 +721,222 @@ def validate_groups(groups: list[Group], scopes: dict[str, list[str]]) -> None:
             raise MigrationError("Owner must not be a consumer of its own migration share")
 
 
-@dataclass(frozen=True, order=True)
-class Association:
-    association_id: str
-    rule_id: str
-    vpc_id: str
-    status: str
+HEALTH = {
+    "resolver_association": ("status", "COMPLETE"),
+    "resolver_endpoint": ("status", "OPERATIONAL"),
+    "tgw_attachment": ("state", "available"),
+    "tgw_route": ("state", "active"),
+    "pca_access": ("consumer_read", "OK"),
+}
+DROP_KIND = {"resolver_association": "association"}
+UNAVAILABLE = "resource_checks_unavailable"
+RESOLVER_TYPE = "route53resolver:resolverrule"
 
 
-@dataclass
-class ResolverSnapshot:
-    observed_at: str = field(default_factory=timestamp)
-    records: dict[tuple[str, str, str], tuple[Association, ...]] = field(default_factory=dict)
+def verifier() -> Any:
+    if verification is None:
+        raise MigrationError("ram_migration_verification is required for baseline and verification")
+    return verification
 
 
-def resolver_snapshot(router: WriteGate, groups: list[Group], opts: Options,
-                      report: Reporter, phase: str) -> tuple[ResolverSnapshot, list[str]]:
-    """Resolve IDs from the owner's actual rule inventory; never parse IDs from ARNs."""
-    snapshot = ResolverSnapshot()
-    wanted: dict[tuple[str, str], set[str]] = defaultdict(set)
-    expected: dict[tuple[str, str], set[tuple[str, str, str]]] = defaultdict(set)
-    for group in groups:
-        for arn, kind in group.resources.items():
-            if kind.lower() in ("route53resolver:resolverrule", "route53resolver:resolver-rule"):
-                wanted[group.owner, group.region].add(arn)
-                for consumer in group.consumers:
-                    expected[consumer, group.region].add((group.owner, group.region, arn))
-    failures = []
-    rules: dict[tuple[str, str, str], str] = {}
-    owner_scopes: dict[str, list[str]] = defaultdict(list)
-    for owner, region in wanted:
-        owner_scopes[owner].append(region)
+def value(obj: Any, name: str) -> Any:
+    """Read an Observation/Comparison field from an object or a mapping."""
+    return obj[name] if isinstance(obj, dict) else getattr(obj, name)
 
-    def rule_ids(owner, region):
-        rows = pages(router.client(owner, "route53resolver", region),
-                     "list_resolver_rules", "ResolverRules")
-        found = {r["Arn"]: r["Id"] for r in rows if r.get("Arn") in wanted[owner, region]}
-        if set(found) != wanted[owner, region] or any(not value for value in found.values()):
-            raise MigrationError("Cannot resolve all planned Resolver rule IDs from the owner inventory")
-        return found
 
-    for row in scoped_fanout(owner_scopes, rule_ids, opts):
+def temporary_share_arns(record: dict | None, shares: dict) -> frozenset[str]:
+    arns = {s["share_arn"] for s in (record or {}).get("shares", []) if s.get("share_arn")}
+    for by_logical in shares.values():
+        arns.update(share["resourceShareArn"] for share in by_logical.values())
+    return frozenset(arns)
+
+
+def describe_item(item: dict) -> str:
+    fields = [f"{key}={item[key]}" for key in (
+        "consumer", "owner", "region", "resource_arn", "vpc_id", "rule_id", "association_id",
+        "endpoint_id", "tgw_id", "attachment_id", "route_table_id", "destination", "pool_id",
+        "allocation_id", "cidr", "status", "state", "owner_association_state", "ca_status",
+        "consumer_read") if item.get(key) not in (None, "")]
+    if item["kind"] == "entitlement":
+        fields.append(f"via_shares={len(item.get('via_shares', []))} "
+                      f"via_temporary={len(item.get('via_temporary', []))} "
+                      f"via_other={len(item.get('via_other', []))}")
+    return f"kind={item['kind']} " + " ".join(fields)
+
+
+def observe(router: Any, groups: list, temporary: frozenset[str], opts: Options,
+            report: Reporter, phase: str) -> Any:
+    observation = verifier().collect(router, groups, temporary_shares=temporary,
+                                     workers=opts.args.region_workers)
+    for item in sorted(value(observation, "items"), key=lambda row: row["key"]):
+        report.emit(f"phase={phase} {describe_item(item)}")
+    for gap in value(observation, "gaps"):
+        report.emit(f"phase={phase} status=GAP collector={gap.get('collector')} "
+                    f"account={gap.get('account')} region={gap.get('region')} "
+                    f"resource={gap.get('resource_arn')} reason={gap.get('reason')}")
+    return observation
+
+
+def unassociated_rules(groups: list, observation: Any) -> list[tuple[str, str, str]]:
+    """Planned Resolver rules a consumer never associated: reported, never called missing."""
+    associated = {(item.get("consumer"), item.get("region"), item.get("resource_arn"))
+                  for item in value(observation, "items") if item["kind"] == "resolver_association"}
+    return sorted({(consumer, group.region, arn) for group in groups
+                   for consumer in group.consumers for arn, kind in group.resources.items()
+                   if kind.lower() == RESOLVER_TYPE and (consumer, group.region, arn) not in associated})
+
+
+def capture_problems(observation: Any) -> list[str]:
+    """A baseline is captured only from a complete, stable observation."""
+    problems = [f"phase=baseline status=BLOCKED collector={gap.get('collector')} "
+                f"account={gap.get('account')} region={gap.get('region')} "
+                f"resource={gap.get('resource_arn')} {gap.get('reason')}; the original baseline "
+                "cannot be captured completely" for gap in value(observation, "gaps")
+                if gap.get("reason") != UNAVAILABLE]
+    for item in value(observation, "items"):
+        rule = HEALTH.get(item["kind"])
+        if rule and item.get(rule[0]) != rule[1]:
+            problems.append(f"phase=baseline status=BLOCKED {describe_item(item)}: not {rule[1]}; "
+                            "capture requires a stable original state")
+        if item["kind"] == "entitlement" and not item.get("via_shares"):
+            problems.append(f"phase=baseline status=BLOCKED {describe_item(item)}: "
+                            "not visible to the consumer")
+    return problems
+
+
+def losses(comparison: Any) -> list[dict]:
+    rows = [{"key": entry["key"], "item": entry.get("item") or entry.get("before"),
+             "reason": "missing"} for entry in value(comparison, "missing")]
+    rows += [{"key": entry["key"], "item": entry.get("before") or entry.get("item"),
+              "reason": "; ".join(entry.get("reasons", [])) or "degraded"}
+             for entry in value(comparison, "degraded")]
+    return rows
+
+
+def scoped_items(items: list[dict], groups: list) -> list[dict]:
+    """Baseline items belonging to these groups' consumers and resources."""
+    pairs = {(consumer, arn) for group in groups for consumer in group.consumers
+             for arn in group.resources}
+    resources = {arn for _, arn in pairs}
+    return [item for item in items if item.get("resource_arn") in resources and (
+        item.get("consumer") is None or (item.get("consumer"), item.get("resource_arn")) in pairs)]
+
+
+def baseline_check(record: dict | None, observation: Any, groups: list) -> tuple[list[str], Any]:
+    """Pre-write: capture problems if no baseline exists, else losses against it."""
+    baseline = (record or {}).get("baseline")
+    if baseline is None:
+        return capture_problems(observation), None
+    comparison = verifier().compare(scoped_items(baseline["items"], groups), observation)
+    status = value(comparison, "status")
+    if status == "LOSS":
+        return [f"phase=baseline status=BLOCKED original {loss['reason']}: {loss['key']}; the "
+                "recorded baseline is never replaced - restore it or start a new migration record"
+                for loss in losses(comparison)], comparison
+    if status != "INTACT":
+        return [f"phase=baseline status=BLOCKED observation gap {gap.get('collector')} "
+                f"{gap.get('account')} {gap.get('region')} {gap.get('reason')}"
+                for gap in value(comparison, "gaps")] or [
+                    "phase=baseline status=BLOCKED observation is incomplete"], comparison
+    return [], comparison
+
+
+def consumer_organizations(router: Any, consumers: list[str],
+                           opts: Options) -> tuple[dict[str, str], list[str]]:
+    def read(account, _region):
+        try:
+            organization = router.client(account, "organizations", RAM_HOME_REGION).describe_organization()
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "AWSOrganizationsNotInUseException":
+                return "STANDALONE"
+            raise
+        identifier = (organization.get("Organization") or {}).get("Id")
+        if not identifier:
+            raise MigrationError("Organization identity was not returned")
+        return identifier
+    found, errors = {}, []
+    for row in scoped_fanout({account: ["organization"] for account in consumers}, read, opts):
         if row.error:
-            failures.append(f"owner={row.account} region={row.region} phase={phase} {row.error}")
+            errors.append(f"account={row.account} phase=organization status=BLOCKED {row.error}")
         else:
-            rules.update({(row.account, row.region, arn): rule for arn, rule in row.value.items()})
-    if failures:
-        return snapshot, failures
-
-    consumer_scopes: dict[str, list[str]] = defaultdict(list)
-    for consumer, region in expected:
-        consumer_scopes[consumer].append(region)
-
-    def associations(consumer, region):
-        rows = pages(router.client(consumer, "route53resolver", region),
-                     "list_resolver_rule_associations", "ResolverRuleAssociations")
-        result = {}
-        for key in expected[consumer, region]:
-            arn, rule_id = key[2], rules[key]
-            matches = [r for r in rows if r.get("ResolverRuleId") == rule_id]
-            if any(not all(r.get(field) for field in ("Id", "ResolverRuleId", "VPCId", "Status"))
-                   for r in matches):
-                raise MigrationError(f"{arn}: Resolver association identity/status fields missing")
-            records = tuple(sorted(Association(r["Id"], r["ResolverRuleId"], r["VPCId"], r["Status"])
-                                   for r in matches))
-            if len({record.association_id for record in records}) != len(records):
-                raise MigrationError(f"{arn}: duplicate Resolver association IDs")
-            result[consumer, region, arn] = records
-        return result
-
-    for row in scoped_fanout(consumer_scopes, associations, opts):
-        if row.error:
-            failures.append(f"consumer={row.account} region={row.region} phase={phase} {row.error}")
-            continue
-        snapshot.records.update(row.value)
-        for (consumer, region, arn), records in sorted(row.value.items()):
-            if not records:
-                report.emit(f"consumer={consumer} region={region} resource={arn} phase={phase} "
-                            "status=MISSING_ASSOCIATION no association observed; sharing does not repair it")
-            for record in records:
-                report.emit(f"consumer={consumer} region={region} resource={arn} phase={phase} "
-                            f"vpc={record.vpc_id} rule={record.rule_id} association={record.association_id} "
-                            f"status={record.status} timestamp={snapshot.observed_at}")
-                if record.status != "COMPLETE":
-                    failures.append(f"{consumer}/{region}/{arn}/{record.association_id}: "
-                                    f"Resolver association {record.status} during {phase}")
-    return snapshot, failures
+            found[row.account] = row.value
+    return found, errors
 
 
-def compare_resolver(before: ResolverSnapshot, after: ResolverSnapshot) -> list[str]:
-    failures = []
-    for key, original in before.records.items():
-        current = after.records.get(key)
-        if current is None or original != current:
-            failures.append(f"consumer={key[0]} region={key[1]} resource={key[2]} "
-                            "phase=resolver-comparison status=INCOMPLETE "
-                            f"association state changed: before={original!r} after={current!r}")
-    return failures
+def new_baseline(observation: Any, organizations: dict, revision: int) -> dict:
+    gaps = list(value(observation, "gaps"))
+    return {"schema": 1, "captured_at": value(observation, "observed_at"),
+            "captured_in_revision": revision, "complete": not gaps, "gaps": gaps,
+            "consumer_organizations": dict(sorted(organizations.items())),
+            "items": sorted(value(observation, "items"), key=lambda row: row["key"])}
+
+
+def drops_from(comparison: Any, observation: Any, organizations: dict, detected_by: str,
+               last_present_at: str, evidence: str) -> list[dict]:
+    if comparison is None or value(comparison, "status") != "LOSS":
+        return []
+    first_absent = value(observation, "observed_at")
+    drops = []
+    for loss in losses(comparison):
+        item = loss["item"] or {}
+        kind = DROP_KIND.get(item.get("kind"), item.get("kind", "entitlement"))
+        consumer = item.get("consumer")
+        drops.append({"id": drop_id(kind, consumer, item.get("region"), loss["key"], first_absent),
+                      "kind": kind, "severity": "failure", "consumer": consumer,
+                      "owner": item.get("owner"), "region": item.get("region"), "subject": loss["key"],
+                      "last_present_at": last_present_at, "first_absent_at": first_absent,
+                      "detected_by": detected_by,
+                      "consumer_organization_at_detection": organizations.get(consumer, "UNKNOWN"),
+                      "evidence": evidence, "reason": loss["reason"]})
+    return drops
+
+
+def migration_status(record: dict, comparison: Any | None,
+                     organizations: dict) -> tuple[str, list[str]]:
+    """FAILED > INCONCLUSIVE > PENDING_MIGRATION > MIGRATION_VALIDATED."""
+    baseline = record.get("baseline")
+    reasons = [f"failure drop {d['kind']} {d['subject']} first absent {d['first_absent_at']}"
+               for d in failure_drops(record)]
+    if comparison is not None and value(comparison, "status") == "LOSS":
+        reasons += [f"{loss['reason']}: {loss['key']}" for loss in losses(comparison)]
+    if reasons:
+        return "FAILED", sorted(set(reasons))
+    if baseline is None:
+        return "INCONCLUSIVE", ["no original baseline is recorded; apply captures it before its first write"]
+    if not baseline.get("complete"):
+        return "INCONCLUSIVE", [f"baseline is incomplete: {gap.get('collector')} {gap.get('reason')}"
+                                for gap in baseline.get("gaps", [])] or ["baseline is incomplete"]
+    if comparison is None or value(comparison, "status") != "INTACT":
+        gaps = value(comparison, "gaps") if comparison is not None else []
+        return "INCONCLUSIVE", [f"observation gap: {gap.get('collector')} {gap.get('account')} "
+                                f"{gap.get('region')} {gap.get('reason')}" for gap in gaps] or [
+                                    "the current observation is incomplete"]
+    before = baseline.get("consumer_organizations", {})
+    unknown = sorted(consumer for consumer in before if consumer not in organizations)
+    if unknown:
+        return "INCONCLUSIVE", [f"current organization of {consumer} is unknown" for consumer in unknown]
+    staying = sorted(consumer for consumer, org in before.items() if organizations[consumer] == org)
+    if staying:
+        return "PENDING_MIGRATION", [f"{consumer} is still in its baseline organization {before[consumer]}"
+                                     for consumer in staying]
+    return "MIGRATION_VALIDATED", []
+
+
+def fill_scope_from_record(opts: Options, record: dict) -> None:
+    """verify/complete use the reviewed scope; explicit flags must agree with it."""
+    scope = record.get("scope") or {}
+    owners = sorted(set(scope.get("stationary_owners", [])) | set(scope.get("migrating_owners", [])))
+    consumers = sorted(set(scope.get("migrating_consumers", [])) | set(scope.get("migrating_owners", [])))
+    regions = sorted(set(scope.get("regions", [])) | {RAM_HOME_REGION})
+    if not owners or not consumers:
+        raise MigrationError("The migration record has no reviewed account scope; run plan --record")
+    for label, given, recorded in (("--owners", opts.owners, owners),
+                                   ("--consumers", opts.consumers, consumers)):
+        if given and sorted(set(given)) != recorded:
+            raise MigrationError(f"{label} differs from the migration record scope {recorded}")
+    if opts.args.regions and sorted(set(opts.regions)) != regions:
+        raise MigrationError(f"--regions differs from the migration record scope {regions}")
+    opts.owners, opts.consumers, opts.regions = owners, consumers, regions
 
 
 def transient(exc: Exception, verification: bool = False) -> bool:
@@ -1115,21 +1251,33 @@ def run_approve(opts: Options, ask: Callable[[str], str], report: Reporter) -> i
 
 def summary(plan: Plan, report: Reporter, status: str, *, created: int = 0, reused: int = 0,
             accepted: int = 0, reused_invitations: int = 0, failures: int = 0,
-            missing_baseline: int = 0) -> None:
+            comparison: Any = None, unassociated: int = 0, sharing: str | None = None,
+            migration: str | None = None) -> None:
     resources = {arn for group in plan.groups for arn in group.resources}
     entitlements = {(group.owner, group.region, arn, consumer, group.permissions[kind])
                     for group in plan.groups for arn, kind in group.resources.items()
                     for consumer in group.consumers}
-    report.emit(f"status={status} migration={plan.migration} resources_in_plan={len(resources)} "
-                f"expected_entitlements={len(entitlements)} planned_shares={len(plan.groups)} "
-                f"created_shares={created} reused_shares={reused} accepted_invitations={accepted} "
-                f"reused_invitations={reused_invitations} exclusions={len(plan.excluded)} "
-                f"blockers={len(plan.blocked)} verification_failures={failures} "
-                f"missing_preexisting_associations={missing_baseline}")
+    line = (f"status={status} migration={plan.migration} resources_in_plan={len(resources)} "
+            f"expected_entitlements={len(entitlements)} planned_shares={len(plan.groups)} "
+            f"created_shares={created} reused_shares={reused} accepted_invitations={accepted} "
+            f"reused_invitations={reused_invitations} exclusions={len(plan.excluded)} "
+            f"blockers={len(plan.blocked)} verification_failures={failures}")
+    if sharing:
+        line += f" sharing_status={sharing}"
+    if migration:
+        line += f" migration_status={migration}"
+    if comparison is not None:
+        line += (f" baseline_status={value(comparison, 'status')} "
+                 f"baseline_missing={len(value(comparison, 'missing'))} "
+                 f"baseline_degraded={len(value(comparison, 'degraded'))} "
+                 f"observation_gaps={len(value(comparison, 'gaps'))}")
+    if unassociated:
+        line += f" unassociated_resolver_rules={unassociated}"
+    report.emit(line)
     report.emit("Sharing status is not live migration acceptance evidence. "
                 "Resource totals cover planned entitlements; excluded inventory is reported separately.")
-    if missing_baseline:
-        report.emit("Resolver continuity is unproven where preexisting associations were absent; "
+    if unassociated:
+        report.emit("Resolver rules without an association had none before migration; "
                     "no association repair was performed.")
 
 
@@ -1143,6 +1291,8 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
             record = new_record(args.migration_id)
         else:
             record = load_record(args.record, args.migration_id)
+    if args.mode == "verify":
+        fill_scope_from_record(opts, record)
     approved_owner_scope = approved_owners(record) if record else set()
     added_owners = sorted(approved_owner_scope - set(opts.owners))
     if added_owners:
@@ -1250,11 +1400,26 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         problem = reviewed_plan_problem(record, plan, scope)
         if problem:
             plan.blocked.append(f"phase=reviewed-record {problem}")
-    baseline = ResolverSnapshot()
-    if args.mode == "apply" and not plan.blocked:
-        baseline, failures = resolver_snapshot(gate, plan.groups, opts, report, "resolver-before")
-        plan.blocked.extend(failures)
-    missing_baseline = sum(not records for records in baseline.records.values())
+    if args.mode == "verify" and record is not None:
+        recorded = {(s["owner"], s["region"], s["logical_id"]) for s in record.get("shares", [])}
+        stored = {(g.owner, g.region, g.logical_id) for g in plan.groups}
+        plan.blocked += [f"phase=reviewed-record recorded temporary share {owner}/{region}/{logical} "
+                         "is missing from its migration stack" for owner, region, logical
+                         in sorted(recorded - stored)]
+        plan.blocked += [f"phase=reviewed-record stack entitlement {owner}/{region}/{logical} is not "
+                         "in the migration record" for owner, region, logical in sorted(stored - recorded)]
+    consumers_in_scope = sorted({c for g in plan.groups for c in g.consumers})
+    preflight, organizations, pending_drops = None, {}, []
+    if args.mode == "apply" and not plan.blocked and plan.groups:
+        organizations, errors = consumer_organizations(gate, consumers_in_scope, opts)
+        plan.blocked.extend(errors)
+        preflight = observe(gate, plan.groups, temporary_share_arns(record, {}), opts, report,
+                            "baseline-preflight")
+        problems, comparison = baseline_check(record, preflight, plan.groups)
+        plan.blocked.extend(problems)
+        pending_drops = drops_from(comparison, preflight, organizations, "apply",
+                                   record["baseline"]["captured_at"] if record and record.get("baseline")
+                                   else "", f"record revision {record['revision'] if record else 0}")
     if args.mode != "verify":
         print_plan(plan, prepared, report)
         requests = print_permission_changes(plan, approvals, report)
@@ -1288,8 +1453,9 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         if args.mode == "verify":
             for reason in plan.blocked:
                 report.emit(f"phase=verification status=BLOCKED {reason}")
-        summary(plan, report, "BLOCKED", missing_baseline=missing_baseline)
-        note("BLOCKED", blockers=list(plan.blocked))
+        summary(plan, report, "BLOCKED")
+        note("BLOCKED", lambda current: add_drops(current, pending_drops),
+             blockers=list(plan.blocked), drops=len(pending_drops))
         return 1
     if args.mode == "plan":
         summary(plan, report, "PLANNED")
@@ -1297,6 +1463,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
     if not plan.groups:
         report.emit("status=INCOMPLETE No stored/planned migration entitlements found in the requested scope")
         summary(plan, report, "INCOMPLETE", failures=1)
+        note("INCOMPLETE", failures=["no stored or planned migration entitlements"])
         return 1
 
     failures = []
@@ -1334,12 +1501,39 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                 except Exception as exc:
                     plan.blocked.append(f"{group.owner}/{group.region}: post-confirmation "
                                         f"permission revalidation {failure_text(exc)}")
+        # The original baseline is observed again immediately before the first write.
+        captured = None
+        if not plan.blocked:
+            at_gate = observe(gate, plan.groups, temporary_share_arns(record, {}), opts, report,
+                              "baseline")
+            problems, comparison = baseline_check(record, at_gate, plan.groups)
+            if record.get("baseline") is None and not problems:
+                moved = verifier().compare(value(preflight, "items"), at_gate)
+                problems += [f"phase=baseline status=BLOCKED original state changed during "
+                             f"confirmation ({loss['reason']}): {loss['key']}"
+                             for loss in losses(moved)]
+                if not problems:
+                    captured = new_baseline(at_gate, organizations, record["revision"] + 1)
+            plan.blocked.extend(problems)
+            pending_drops = drops_from(comparison, at_gate, organizations, "apply",
+                                       record["baseline"]["captured_at"] if record.get("baseline")
+                                       else "", f"record revision {record['revision']}")
         if plan.blocked:
             for reason in plan.blocked:
                 report.emit(f"phase=preflight status=BLOCKED {reason}")
-            summary(plan, report, "BLOCKED", missing_baseline=missing_baseline)
-            note("BLOCKED", blockers=list(plan.blocked), phase="post-confirmation")
+            summary(plan, report, "BLOCKED")
+            note("BLOCKED", lambda current: add_drops(current, pending_drops),
+                 blockers=list(plan.blocked), phase="post-confirmation", drops=len(pending_drops))
             return 1
+        if captured is not None:
+            def keep_baseline(current: dict) -> None:
+                if current.get("baseline") is not None:
+                    raise MigrationError("A baseline was recorded concurrently; re-run apply")
+                current["baseline"] = captured
+            note("BASELINE_CAPTURED", keep_baseline, baseline_items=len(captured["items"]),
+                 baseline_complete=captured["complete"])
+            report.emit(f"phase=baseline status=CAPTURED items={len(captured['items'])} "
+                        f"complete={str(captured['complete']).lower()} revision={record['revision']}")
         gate.open = True
         for row in scoped_fanout(group_scopes,
                                  lambda owner, region: stacks.apply(owner, region, grouped[owner, region]),
@@ -1413,25 +1607,256 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
             failures.append(f"{row.account}/{row.region}: verification {row.error}")
         else:
             failures.extend(row.value)
-    final, resolver_errors = resolver_snapshot(readonly, plan.groups, opts, report, "resolver-after")
-    failures.extend(resolver_errors)
-    if args.mode == "apply":
-        failures.extend(compare_resolver(baseline, final))
+    sharing_status = "SHARING_INCOMPLETE" if failures else "SHARING_READY"
+
+    # Every current observation is compared with the one recorded original baseline.
+    phase = "post-apply" if args.mode == "apply" else "verification"
+    final = observe(readonly, plan.groups, temporary_share_arns(record, shares), opts, report, phase)
+    organizations_now, errors = consumer_organizations(readonly, consumers_in_scope, opts)
+    baseline = record.get("baseline")
+    comparison = verifier().compare(scoped_items(baseline["items"], plan.groups), final) \
+        if baseline else None
+    new_drops = drops_from(comparison, final, organizations_now, args.mode,
+                           baseline["captured_at"] if baseline else "",
+                           f"record revision {record['revision']}")
+    projected = dict(record, drops=list(record.get("drops", [])) + new_drops)
+    status_now, reasons = migration_status(projected, comparison, organizations_now)
+    reasons += errors
+    if errors and status_now in ("MIGRATION_VALIDATED", "PENDING_MIGRATION"):
+        status_now = "INCONCLUSIVE"
+    for consumer, region, arn in unassociated_rules(plan.groups, final):
+        report.emit(f"consumer={consumer} region={region} resource={arn} phase={phase} "
+                    "status=NOT_ASSOCIATED this rule had no association before migration; "
+                    "sharing does not create one")
+    for loss in (losses(comparison) if comparison is not None else []):
+        report.emit(f"phase={phase} status=BASELINE_{loss['reason'].split(':')[0].upper()} "
+                    f"key={loss['key']} {loss['reason']}")
+    for reason in reasons:
+        report.emit(f"phase={phase} migration_status={status_now} {reason}")
     for reason in failures:
         report.emit(f"status=INCOMPLETE {reason}")
-    if args.mode == "apply" and failures:
-        report.emit("Successful temporary shares are retained. Resume this migration ID after resolving failures.")
-    status = "INCOMPLETE" if failures else "READY"
+    if args.mode == "apply":
+        if comparison is not None and value(comparison, "status") != "INTACT":
+            failures += [f"baseline {loss['reason']}: {loss['key']}" for loss in losses(comparison)] \
+                or [f"post-apply observation is incomplete: {len(value(comparison, 'gaps'))} gaps"]
+        if failures:
+            report.emit("Successful temporary shares are retained. Resume this migration ID after resolving failures.")
+        status = "INCOMPLETE" if failures else "SHARING_READY"
+        code = 1 if failures else 0
+    else:
+        status = status_now if sharing_status == "SHARING_READY" else sharing_status
+        code = 0 if status in ("MIGRATION_VALIDATED", "PENDING_MIGRATION") else \
+            3 if status == "INCONCLUSIVE" else 1
     summary(plan, report, status, created=created, reused=reused,
             accepted=accepted_count, reused_invitations=reused_invitations, failures=len(failures),
-            missing_baseline=missing_baseline)
-    def record_shares(current: dict) -> None:
+            comparison=comparison, unassociated=len(unassociated_rules(plan.groups, final)),
+            sharing=sharing_status, migration=status_now)
+    entry = {"at": value(final, "observed_at"), "mode": args.mode, "sharing_status": sharing_status,
+             "migration_status": status_now, "reasons": reasons,
+             "baseline_status": value(comparison, "status") if comparison is not None else None,
+             "missing": len(value(comparison, "missing")) if comparison is not None else None,
+             "degraded": len(value(comparison, "degraded")) if comparison is not None else None,
+             "gaps": len(value(final, "gaps")), "consumer_organizations": organizations_now}
+
+    def record_outcome(current: dict) -> None:
         if args.mode == "apply":
             current["shares"] = share_records(current.get("shares", []), plan.groups, shares,
                                               plan.migration)
-    note(status, record_shares, failures=failures, created=created, reused=reused,
-         accepted=accepted_count)
-    return 1 if failures else 0
+        add_drops(current, new_drops)
+        current.setdefault("verifications", []).append(entry)
+    note(status, record_outcome, failures=failures, created=created, reused=reused,
+         accepted=accepted_count, migration_status=status_now, drops=len(new_drops))
+    return code
+
+
+def settle(router: Any, groups: list, baseline: dict, temporary: frozenset[str],
+           organizations: dict, opts: Options, report: Reporter,
+           phase: str) -> tuple[list[str], list[dict]]:
+    """Keep re-verifying for the settle window; the first loss or gap stops completion."""
+    deadline = time.monotonic() + opts.args.settle_seconds
+    while True:
+        observation = observe(router, groups, temporary, opts, report, phase)
+        comparison = verifier().compare(scoped_items(baseline["items"], groups), observation)
+        replacement = verifier().replacement_access(router, groups, temporary,
+                                                    workers=opts.args.region_workers)
+        problems = [f"original {loss['reason']}: {loss['key']}" for loss in losses(comparison)]
+        if value(comparison, "status") == "INCONCLUSIVE":
+            problems += [f"observation gap {gap.get('collector')} {gap.get('account')} "
+                         f"{gap.get('region')} {gap.get('reason')}" for gap in value(comparison, "gaps")] \
+                or ["observation is incomplete"]
+        problems += [f"replacement access missing for {row.get('consumer')} {row.get('region')} "
+                     f"{row.get('resource_arn')}" for row in replacement["uncovered"]]
+        problems += [f"replacement gap {gap.get('account')} {gap.get('region')} {gap.get('reason')}"
+                     for gap in replacement["gaps"]]
+        if problems:
+            return problems, drops_from(comparison, observation, organizations, "complete",
+                                        baseline["captured_at"], phase)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return [], []
+        time.sleep(min(30.0, remaining))
+
+
+def run_complete(router: Router, opts: Options, ask: Callable[[str], str], report: Reporter) -> int:
+    """Retire the temporary path only after proving nothing original is missing or dropped."""
+    args = opts.args
+    record = load_record(args.record, args.migration_id)
+    migration = record["migration_id"]
+    if record.get("completion"):
+        report.emit(f"migration={migration} phase=complete status=ALREADY_COMPLETE "
+                    f"at={record['completion'].get('completed_at')}")
+        return 0
+    fill_scope_from_record(opts, record)
+
+    def note(status: str, mutate: Callable[[dict], Any] = lambda _record: None,
+             **details: Any) -> None:
+        nonlocal record
+        record = update_record(args.record, migration, mutate, mode="complete", status=status,
+                               **details)
+
+    def refuse(problems: list[str], drops: list[dict] | None = None) -> int:
+        for problem in problems:
+            report.emit(f"phase=complete status=BLOCKED {problem}")
+        report.emit(f"status=BLOCKED migration={migration} phase=complete blockers={len(problems)} "
+                    "temporary shares retained")
+        note("BLOCKED", lambda current: add_drops(current, drops or []), blockers=problems)
+        return 1
+
+    blocked = authenticate(router, set(opts.owners + opts.consumers), opts, report)
+    if blocked:
+        return refuse(blocked)
+    entries = [entry for entry in record.get("shares", []) if entry.get("share_arn")]
+    if not entries:
+        return refuse(["the migration record has no temporary shares to retire"])
+    gate = WriteGate(router)
+    stacks = Stacks(gate, migration, timeout=args.timeout)
+    scopes: dict[str, list[str]] = defaultdict(list)
+    for entry in entries:
+        if entry["region"] not in scopes[entry["owner"]]:
+            scopes[entry["owner"]].append(entry["region"])
+    groups: list[Group] = []
+    shares: dict[tuple[str, str], dict] = {}
+    problems: list[str] = []
+    for row in scoped_fanout(scopes, lambda owner, region: (stacks.persisted_groups(owner, region),
+                                                            stacks.shares(owner, region)), opts):
+        if row.error:
+            problems.append(f"owner={row.account} region={row.region} phase=stored-plan {row.error}")
+        else:
+            groups.extend(row.value[0])
+            shares[row.account, row.region] = row.value[1]
+    recorded = {(e["owner"], e["region"], e["logical_id"]): e for e in entries}
+    stored = {(g.owner, g.region, g.logical_id): g for g in groups}
+    problems += [f"recorded temporary share {'/'.join(key)} is missing from its migration stack"
+                 for key in sorted(set(recorded) - set(stored))]
+    problems += [f"stack entitlement {'/'.join(key)} is not in the migration record"
+                 for key in sorted(set(stored) - set(recorded))]
+    for key, entry in sorted(recorded.items()):
+        live = shares.get(key[:2], {}).get(key[2])
+        if live and live["resourceShareArn"] != entry["share_arn"]:
+            problems.append(f"{'/'.join(key)}: stack share {live['resourceShareArn']} differs from "
+                            f"recorded {entry['share_arn']}")
+    if problems:
+        return refuse(problems)
+
+    temporary = temporary_share_arns(record, shares)
+    consumers = sorted({consumer for group in groups for consumer in group.consumers})
+    organizations, errors = consumer_organizations(gate, consumers, opts)
+    problems += errors
+    baseline = record.get("baseline")
+    observation = observe(gate, groups, temporary, opts, report, "complete-preflight")
+    comparison = None
+    if baseline is None or not baseline.get("complete"):
+        problems.append("a complete original baseline is required before the temporary path is retired")
+    else:
+        comparison = verifier().compare(scoped_items(baseline["items"], groups), observation)
+        if value(comparison, "status") != "INTACT":
+            problems += [f"original {loss['reason']}: {loss['key']}" for loss in losses(comparison)] or [
+                f"observation gap {gap.get('collector')} {gap.get('account')} {gap.get('region')} "
+                f"{gap.get('reason')}" for gap in value(comparison, "gaps")]
+    problems += [f"failure drop recorded: {drop['kind']} {drop['subject']} first absent "
+                 f"{drop['first_absent_at']}" for drop in failure_drops(record)]
+    replacement = verifier().replacement_access(gate, groups, temporary, workers=args.region_workers)
+    for row in replacement["covered"]:
+        report.emit(f"phase=replacement status=COVERED consumer={row.get('consumer')} "
+                    f"region={row.get('region')} resource={row.get('resource_arn')}")
+    problems += [f"phase=replacement consumer={row.get('consumer')} region={row.get('region')} "
+                 f"resource={row.get('resource_arn')}: only the temporary share provides access; "
+                 "establish permanent replacement sharing first" for row in replacement["uncovered"]]
+    problems += [f"phase=replacement gap {gap.get('account')} {gap.get('region')} {gap.get('reason')}"
+                 for gap in replacement["gaps"]]
+    if problems:
+        return refuse(problems, drops_from(comparison, observation, organizations, "complete",
+                                           baseline["captured_at"] if baseline else "",
+                                           f"record revision {record['revision']}"))
+
+    # Smallest share first: the first deletion is the canary step.
+    order = sorted(entries, key=lambda e: (len(stored[e["owner"], e["region"], e["logical_id"]].resources),
+                                           e["owner"], e["region"], e["logical_id"]))
+    for entry in order:
+        group = stored[entry["owner"], entry["region"], entry["logical_id"]]
+        report.emit(f"owner={entry['owner']} region={entry['region']} phase=complete action=DELETE_SHARE "
+                    f"share={entry['share_arn']} consumers={','.join(group.consumers)} "
+                    f"resources={len(group.resources)}")
+    owner_regions = sorted({(entry["owner"], entry["region"]) for entry in entries})
+    for owner, region in owner_regions:
+        report.emit(f"owner={owner} region={region} phase=complete action=DELETE_STACK "
+                    f"stack={stack_name(migration, owner, region)}")
+    token = f"COMPLETE {migration}"
+    try:
+        reply = ask(f"Type {token} to delete these temporary shares and stacks, re-verifying after each: ")
+    except EOFError:
+        reply = ""
+    if reply != token:
+        report.emit("status=CANCELLED Confirmation did not match; no AWS writes requested")
+        return 2
+    gate.open = True
+    deleted: list[str] = []
+    for entry in order:
+        group = stored[entry["owner"], entry["region"], entry["logical_id"]]
+        try:
+            delete_share(gate, entry["owner"], entry["region"], entry["share_arn"], migration,
+                         timeout=args.timeout)
+        except Exception as exc:
+            report.emit(f"status=FAILED share={entry['share_arn']} phase=complete {failure_text(exc)}")
+            note("FAILED", failures=[failure_text(exc)], deleted=list(deleted))
+            return 1
+        deleted.append(entry["share_arn"])
+        report.emit(f"owner={entry['owner']} region={entry['region']} share={entry['share_arn']} "
+                    "phase=complete status=SHARE_DELETED")
+        note("SHARE_DELETED", deleted=list(deleted), share=entry["share_arn"])
+        losses_now, drops = settle(gate, [group], baseline, temporary, organizations, opts, report,
+                                   f"complete-settle-{len(deleted)}")
+        if losses_now:
+            for problem in losses_now:
+                report.emit(f"status=FAILED phase=complete {problem}")
+            report.emit("Completion stopped; the remaining temporary shares are retained.")
+            note("FAILED", lambda current: add_drops(current, drops), failures=losses_now,
+                 deleted=list(deleted))
+            return 1
+    losses_now, drops = settle(gate, groups, baseline, temporary, organizations, opts, report,
+                               "complete-final")
+    if losses_now:
+        for problem in losses_now:
+            report.emit(f"status=FAILED phase=complete {problem}")
+        note("FAILED", lambda current: add_drops(current, drops), failures=losses_now,
+             deleted=list(deleted))
+        return 1
+    removed = []
+    for owner, region in owner_regions:
+        try:
+            removed.append(stacks.delete(owner, region))
+        except Exception as exc:
+            report.emit(f"status=FAILED owner={owner} region={region} phase=complete {failure_text(exc)}")
+            note("FAILED", failures=[failure_text(exc)], deleted=list(deleted), stacks=list(removed))
+            return 1
+        report.emit(f"owner={owner} region={region} phase=complete status=STACK_DELETED")
+    completion = {"completed_at": timestamp(), "deleted_shares": deleted, "deleted_stacks": removed,
+                  "consumer_organizations": organizations}
+    note("COMPLETED", lambda current: current.__setitem__("completion", completion),
+         deleted=len(deleted), stacks=len(removed))
+    report.emit(f"status=COMPLETED migration={migration} deleted_shares={len(deleted)} "
+                f"deleted_stacks={len(removed)} original baseline intact")
+    return 0
 
 
 def main(argv: list[str] | None = None, *, input_fn: Callable[[str], str] | None = None) -> int:
@@ -1446,6 +1871,8 @@ def main(argv: list[str] | None = None, *, input_fn: Callable[[str], str] | None
             check_sdk()  # Offline service-model preflight, before authenticating.
         router = Router(opts.profiles, opts.mappings, role_name=args.role_name,
                         sso_role=args.sso_role or "")
+        if args.mode == "complete":
+            return run_complete(router, opts, ask, report)
         if args.mode == "monitor":
             try:
                 module = importlib.import_module("ram_migration_monitor")

@@ -451,6 +451,38 @@ class Stacks:
                 next_update = time.monotonic() + 30
             time.sleep(5)
 
+    def delete(self, owner: str, region: str, interval: float = 5) -> str:
+        """Delete a migration stack whose temporary shares are all already deleted."""
+        stack = self.existing(owner, region)
+        if stack is None:
+            return "ABSENT"
+        template = self._template(owner, region, stack)
+        reader = self.router.client(owner, "cloudformation", region)
+        ram = self.router.client(owner, "ram", region)
+        for row in pages(reader, "list_stack_resources", "StackResourceSummaries",
+                         StackName=stack["StackId"]):
+            if row.get("ResourceType") != "AWS::RAM::ResourceShare" or \
+                    row.get("LogicalResourceId") not in template["Resources"]:
+                raise MigrationError("Non-migration resource in migration stack; refusing to delete it")
+            arn = row.get("PhysicalResourceId")
+            rows = pages(ram, "get_resource_shares", "resourceShares", resourceOwner="SELF",
+                         resourceShareArns=[arn]) if arn else []
+            if any(share.get("status") != "DELETED" for share in rows):
+                raise MigrationError(f"{arn}: temporary share still exists; complete deletes and "
+                                     "verifies every share before deleting its stack")
+        self.router.client(owner, "cloudformation", region, write=True).delete_stack(
+            StackName=stack["StackId"])
+        deadline = time.monotonic() + self.timeout
+        while True:
+            state = reader.describe_stacks(StackName=stack["StackId"])["Stacks"][0]["StackStatus"]
+            if state == "DELETE_COMPLETE":
+                return stack["StackId"]
+            if not state.endswith("_IN_PROGRESS"):
+                raise MigrationError(f"{stack['StackId']}: {state} while deleting the migration stack")
+            if time.monotonic() >= deadline:
+                raise MigrationError(f"{stack['StackId']}: stack deletion did not finish before the timeout")
+            time.sleep(interval)
+
     def shares(self, owner: str, region: str) -> dict[str, dict]:
         stack = self.existing(owner, region)
         if stack is None:
@@ -486,6 +518,43 @@ class Stacks:
         if set(result) != set(template["Resources"]):
             raise MigrationError("Migration stack resource inventory is incomplete")
         return result
+
+
+def delete_share(router: Router, owner: str, region: str, arn: str, migration: str,
+                 timeout: float = 600, interval: float = 3) -> None:
+    """Delete one verified temporary migration share; never an original share."""
+    account_id(owner)
+    _owner_arn(arn, owner)
+    if arn.split(":")[2:4] != ["ram", region]:
+        raise MigrationError(f"{arn}: temporary share ARN belongs to another service/Region")
+    ram = router.client(owner, "ram", region, write=True)
+
+    def current() -> dict | None:
+        rows = pages(ram, "get_resource_shares", "resourceShares", resourceOwner="SELF",
+                     resourceShareArns=[arn])
+        if len(rows) > 1 or any(row.get("resourceShareArn") != arn for row in rows):
+            raise MigrationError(f"{arn}: ambiguous share readback")
+        return rows[0] if rows else None
+    share = current()
+    if share is None or share.get("status") == "DELETED":
+        return
+    values = tags(share.get("tags", []))
+    if share.get("owningAccountId") != owner or not managed(share.get("tags", []), migration) or \
+            values.get("owneraccount") != owner or not values.get("entitlementhash") or \
+            not str(share.get("name", "")).startswith(PURPOSE + "-"):
+        raise MigrationError(f"{arn}: refusing to delete a share that is not this migration's "
+                             "temporary share")
+    ram.delete_resource_share(resourceShareArn=arn)
+    deadline = time.monotonic() + timeout
+    while True:
+        share = current()
+        if share is None or share.get("status") == "DELETED":
+            return
+        if share.get("status") not in ("ACTIVE", "DELETING"):
+            raise MigrationError(f"{arn}: unexpected status {share.get('status')} while deleting")
+        if time.monotonic() >= deadline:
+            raise MigrationError(f"{arn}: deletion did not finish before the timeout")
+        time.sleep(interval)
 
 
 def accept(router: Router, consumer: str, region: str, allowed: dict[str, str]) -> None:

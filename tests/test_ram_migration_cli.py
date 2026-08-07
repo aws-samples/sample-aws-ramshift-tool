@@ -146,10 +146,97 @@ class LocalClients:
             for arn, kind in g.resources.items() if kind == RESOLVER
         ]}
 
+    def describe_organization(self, **_kwargs):
+        self.harness.calls.append(("organization", self.account))
+        org = self.harness.organizations[self.account]
+        if org == "STANDALONE":
+            raise ClientError({"Error": {"Code": "AWSOrganizationsNotInUseException",
+                                         "Message": "not in an organization"}}, "DescribeOrganization")
+        return {"Organization": {"Id": org}}
+
     def list_resolver_rule_associations(self, **_kwargs):
         samples = self.harness.resolver_samples[self.account, self.region]
         sample = samples.pop(0) if len(samples) > 1 else samples[0]
         return {"ResolverRuleAssociations": copy.deepcopy(sample)}
+
+
+class FakeVerification:
+    """Reference implementation of the verification contract over harness state."""
+    def __init__(self, harness):
+        self.harness = harness
+
+    def items(self, groups, temporary, pop=True):
+        h = self.harness
+        items = []
+        samples = {}
+        for g in groups:
+            for consumer in g.consumers:
+                key = consumer, g.region
+                if key not in samples:
+                    queue = h.resolver_samples[key]
+                    samples[key] = (queue.pop(0) if pop and len(queue) > 1 else queue[0])
+                for arn, kind in sorted(g.resources.items()):
+                    site = (consumer, g.region, arn)
+                    other = [] if site in h.original_lost else sorted(set(g.source_shares))
+                    if site in h.replacement:
+                        other = sorted(set(other) | {f"arn:aws:ram:{g.region}:{g.owner}:resource-share/permanent"})
+                    temp = Harness.share(g)["resourceShareArn"]
+                    via_temp = [temp] if temp in temporary and temp not in h.deleted_shares else []
+                    items.append({"kind": "entitlement", "key": f"entitlement|{consumer}|{g.region}|{arn}",
+                                  "consumer": consumer, "owner": g.owner, "region": g.region,
+                                  "resource_arn": arn, "type": kind, "via_shares": other + via_temp,
+                                  "via_temporary": via_temp, "via_other": other})
+                    if kind == RESOLVER:
+                        for row in samples[key]:
+                            items.append({"kind": "resolver_association",
+                                          "key": f"resolver_association|{consumer}|{g.region}|{row['Id']}",
+                                          "consumer": consumer, "owner": g.owner, "region": g.region,
+                                          "resource_arn": arn, "rule_id": row["ResolverRuleId"],
+                                          "vpc_id": row["VPCId"], "association_id": row["Id"],
+                                          "status": row["Status"]})
+        return items
+
+    def collect(self, router, groups, *, temporary_shares=frozenset(), workers=4):
+        self.harness.calls.append(("collect", len(groups), tuple(sorted(temporary_shares))))
+        return SimpleNamespace(observed_at=f"t{len(self.harness.calls)}",
+                               items=self.items(groups, temporary_shares),
+                               gaps=[dict(gap) for gap in self.harness.collect_gaps])
+
+    def compare(self, baseline_items, observation):
+        current = {item["key"]: item for item in observation.items}
+        present, missing, degraded = [], [], []
+        for item in baseline_items:
+            now = current.get(item["key"])
+            if now is None:
+                missing.append({"key": item["key"], "item": item})
+                continue
+            reasons = []
+            if item["kind"] == "entitlement" and not now.get("via_shares"):
+                reasons.append("not visible to the consumer")
+            if item["kind"] == "resolver_association":
+                if now.get("status") != "COMPLETE":
+                    reasons.append(f"status {now.get('status')}")
+                for field in ("vpc_id", "rule_id"):
+                    if now.get(field) != item.get(field):
+                        reasons.append(f"{field} changed")
+            if reasons:
+                degraded.append({"key": item["key"], "before": item, "after": now, "reasons": reasons})
+            else:
+                present.append(item["key"])
+        keys = {item["key"] for item in baseline_items}
+        gaps = list(observation.gaps)
+        status = "LOSS" if missing or degraded else ("INCONCLUSIVE" if gaps else "INTACT")
+        return SimpleNamespace(present=present, missing=missing, degraded=degraded,
+                               added=[k for k in current if k not in keys], gaps=gaps, status=status)
+
+    def replacement_access(self, router, groups, temporary_shares, *, workers=4):
+        covered, uncovered = [], []
+        for item in self.items(groups, temporary_shares, pop=False):
+            if item["kind"] == "entitlement":
+                row = {k: item[k] for k in ("consumer", "region", "resource_arn")}
+                (covered if item["via_other"] else uncovered).append(row)
+        return {"covered": covered, "uncovered": uncovered,
+                "gaps": [dict(gap) for gap in self.harness.replacement_gaps]}
 
 
 class Harness:
@@ -185,6 +272,14 @@ class Harness:
         self.catalog = {IPAM.lower(): True, RESOLVER.lower(): True}
         self.permission_changes = {}
         self.discovery_kwargs = {}
+        self.organizations = defaultdict(lambda: "o-sourceorg01")
+        self.original_lost = set()        # (consumer, region, resource) no longer visible via originals
+        self.replacement = set()          # (consumer, region, resource) visible via a permanent share
+        self.collect_gaps = []            # gaps every collect returns
+        self.replacement_gaps = []
+        self.deleted_shares = []
+        self.deleted_stacks = []
+        self.after_delete = None          # callback(harness, share_arn) run after a deletion
         harness = self
 
         class LocalRouter:
@@ -270,6 +365,11 @@ class Harness:
                             rows.append(harness.invitation(g, consumer))
                 return "local-migration-stack"
 
+            def delete(self, owner, region):
+                harness.calls.append(("delete-stack", owner, region))
+                harness.deleted_stacks.append((owner, region))
+                return f"local-stack-{owner}-{region}"
+
             def shares(self, owner, region):
                 harness.calls.append(("shares", owner, region))
                 harness.share_reads[owner, region] += 1
@@ -292,7 +392,16 @@ class Harness:
                     raise error
             router.client(g.owner, "ram", g.region)
 
+        def local_delete_share(router, owner, region, arn, migration, timeout=600):
+            harness.calls.append(("delete-share", owner, region, arn))
+            router.client(owner, "ram", region, write=True)  # the write gate must be open
+            harness.deleted_shares.append(arn)
+            if harness.after_delete:
+                harness.after_delete(harness, arn)
+
         monkeypatch.setattr(cli, "Router", LocalRouter)
+        monkeypatch.setattr(cli, "verification", FakeVerification(self))
+        monkeypatch.setattr(cli, "delete_share", local_delete_share)
         monkeypatch.setattr(cli, "Discovery", LocalDiscovery)
         monkeypatch.setattr(cli, "Stacks", LocalStacks)
         monkeypatch.setattr(cli, "verify_group", local_verify)
@@ -356,6 +465,25 @@ def restore(harness, saved):
         setattr(harness, key, value)
 
 
+def simulate_recorded_apply(harness, path):
+    """Record what an earlier apply would have: created shares and the original baseline."""
+    groups = [g for stored in harness.stored.values() for g in stored]
+    if not groups:
+        return
+    shares = defaultdict(dict)
+    for g in groups:
+        shares[g.owner, g.region][g.logical_id] = Harness.share(g)
+    items = FakeVerification(harness).items(groups, frozenset(), pop=False)
+    consumers = sorted({c for g in groups for c in g.consumers})
+    observation = SimpleNamespace(observed_at="t0", items=items, gaps=[])
+
+    def mutate(current):
+        current["baseline"] = cli.new_baseline(
+            observation, {c: harness.organizations[c] for c in consumers}, current["revision"] + 1)
+        current["shares"] = cli.share_records([], groups, shares, MIGRATION)
+    record_module.update(path, MIGRATION, mutate, mode="apply", status="SHARING_READY")
+
+
 def main(argv, input_fn=None):
     """Run the CLI as operators must: apply/verify consume a reviewed plan record.
 
@@ -385,6 +513,8 @@ def main(argv, input_fn=None):
                          input_fn=lambda _: pytest.fail("plan must not prompt"))
             if harness:
                 restore(harness, saved)
+                if mode == "verify":
+                    simulate_recorded_apply(harness, record)
         argv += ["--record", str(record)]
     return cli.main(argv, input_fn=input_fn)
 
@@ -675,7 +805,7 @@ def test_verify_does_not_audit_unrelated_received_owners_or_legacy_paths(harness
     harness.receive(owner=OTHER_OWNER)
     harness.received_errors[CONSUMER, REGION] = denied("GetResourceShares")
     assert main(args("verify", consumers=None)) == 0
-    assert "status=READY" in capsys.readouterr().out
+    assert "sharing_status=SHARING_READY" in capsys.readouterr().out
     assert not any(call[0] in ("received-shares", "received-resources") for call in harness.calls)
     assert ("authentication", OTHER_OWNER) not in harness.calls
     assert not harness.writes()
@@ -930,7 +1060,7 @@ def test_apply_confirms_once_before_writes_and_verifies(harness, capsys):
     assert labels.index("confirmation") < labels.index("write") < labels.index("accept-write") < labels.index("verify")
     assert harness.prepare_counts[OWNER, REGION] == 2
     output = capsys.readouterr().out
-    assert "status=READY" in output and "accepted_invitations=1" in output
+    assert "status=SHARING_READY" in output and "accepted_invitations=1" in output
     assert "created_shares=1" in output
     assert not any(call[0] in ("cleanup", "delete", "associate-resolver", "migrate") for call in harness.calls)
 
@@ -973,7 +1103,7 @@ def test_verify_uses_stored_groups_without_source_discovery_or_acceptance(harnes
     assert any(call[0] == "persisted" for call in harness.calls)
     assert not any(call[0] in ("discovery", "prepare", "apply") for call in harness.calls)
     assert ("authentication", CONSUMER) in harness.calls
-    assert "status=READY" in capsys.readouterr().out
+    assert "sharing_status=SHARING_READY" in capsys.readouterr().out
 
 
 def test_verify_without_stored_entitlements_is_not_ready(harness, capsys):
@@ -1184,39 +1314,46 @@ def association(association_id="association-original", vpc="vpc-original", statu
     return {"Id": association_id, "ResolverRuleId": "actual-owner-rule-id", "VPCId": vpc, "Status": status}
 
 
-def test_apply_resolver_snapshot_uses_actual_ids_and_preserves_them(harness, capsys):
+def test_apply_baseline_keeps_actual_ids_and_compares_after_writes(harness, capsys, migration_record):
     harness.source[OWNER, REGION] = [group(kind=RESOLVER)]
-    harness.resolver_samples[CONSUMER, REGION] = [[association()], [association()]]
+    harness.resolver_samples[CONSUMER, REGION] = [[association()], [association()], [association()]]
     assert main(args("apply"), input_fn=harness.confirm) == 0
     output = capsys.readouterr().out
-    assert "association=association-original" in output
-    assert "rule=actual-owner-rule-id" in output
-    assert "phase=resolver-before" in output and "phase=resolver-after" in output
-    assert "status=READY" in output
+    assert "association_id=association-original" in output and "rule_id=actual-owner-rule-id" in output
+    assert "phase=baseline status=CAPTURED" in output and "phase=post-apply" in output
+    assert "status=SHARING_READY" in output and "baseline_status=INTACT" in output
+    baseline = record_module.load(migration_record, MIGRATION)["baseline"]
+    assert f"resolver_association|{CONSUMER}|{REGION}|association-original" in \
+        {item["key"] for item in baseline["items"]}
+    assert baseline["complete"] and baseline["consumer_organizations"] == {CONSUMER: "o-sourceorg01"}
 
 
-@pytest.mark.parametrize("after", [
-    [],
-    [association("association-replacement")],
-    [association(vpc="vpc-replacement")],
-    [association(status="FAILED")],
+@pytest.mark.parametrize("after,reason", [
+    ([], "MISSING"),
+    ([association("association-replacement")], "MISSING"),
+    ([association(vpc="vpc-replacement")], "VPC_ID"),
+    ([association(status="FAILED")], "STATUS"),
 ])
-def test_resolver_changes_fail_even_when_counts_match(harness, after, capsys):
+def test_any_change_to_a_baseline_association_fails_and_is_a_permanent_drop(
+        harness, after, reason, capsys, migration_record):
     harness.source[OWNER, REGION] = [group(kind=RESOLVER)]
-    harness.resolver_samples[CONSUMER, REGION] = [[association()], after]
+    harness.resolver_samples[CONSUMER, REGION] = [[association()], [association()], after]
     assert main(args("apply"), input_fn=harness.confirm) == 1
     output = capsys.readouterr().out
-    assert "association state changed" in output
-    assert "status=INCOMPLETE" in output and "status=READY" not in output
+    assert "status=INCOMPLETE" in output
+    assert not any(line.startswith("status=SHARING_READY") for line in output.splitlines())
+    assert f"status=BASELINE_{reason}" in output
+    drop, = record_module.load(migration_record, MIGRATION)["drops"]
+    assert (drop["kind"], drop["severity"], drop["detected_by"]) == ("association", "failure", "apply")
 
 
-def test_missing_preexisting_associations_are_not_claimed_as_preserved(harness, capsys):
+def test_unassociated_rules_are_reported_not_claimed_as_missing(harness, capsys):
     harness.source[OWNER, REGION] = [group(kind=RESOLVER)]
     assert main(args("apply"), input_fn=harness.confirm) == 0
     output = capsys.readouterr().out
-    assert "missing_preexisting_associations=1" in output and "continuity is unproven" in output
-    assert "status=MISSING_ASSOCIATION" in output
-    assert "PASS" not in output and "no association repair was performed" in output
+    assert "status=NOT_ASSOCIATED" in output and "unassociated_resolver_rules=1" in output
+    assert "baseline_missing=0" in output and "no association repair was performed" in output
+    assert "PASS" not in output
 
 
 def test_unhealthy_resolver_baseline_blocks_before_confirmation(harness):
@@ -1226,12 +1363,18 @@ def test_unhealthy_resolver_baseline_blocks_before_confirmation(harness):
     assert not harness.writes()
 
 
-def test_resolver_snapshot_access_denial_blocks_before_writes(harness, capsys):
+def test_collector_access_denial_blocks_baseline_before_writes(harness, capsys, migration_record):
     harness.source[OWNER, REGION] = [group(kind=RESOLVER)]
-    harness.resolver_error = denied("ListResolverRules")
-    assert main(args("apply"), input_fn=lambda _: pytest.fail("Baseline is blocked")) == 1
-    assert "operation=ListResolverRules" in capsys.readouterr().out
+    assert main(with_record(args(), migration_record)) == 0
+    harness.collect_gaps = [{"collector": "resolver", "account": OWNER, "region": REGION,
+                             "resource_arn": "arn:resolver", "reason":
+                             "AccessDeniedException request local-request-id operation=ListResolverRules"}]
+    assert main(with_record(args("apply"), migration_record),
+                input_fn=lambda _: pytest.fail("Baseline is blocked")) == 1
+    output = capsys.readouterr().out
+    assert "operation=ListResolverRules" in output and "cannot be captured completely" in output
     assert not harness.writes()
+    assert record_module.load(migration_record, MIGRATION)["baseline"] is None
 
 
 def test_merge_retains_optional_permission_and_stack_evidence():
@@ -1387,7 +1530,9 @@ def test_approved_change_is_revalidated_then_applied_and_recorded(harness, capsy
     first_write = harness.calls.index(next(c for c in harness.calls if c[0] == "write"))
     assert confirmation < first_write
     record = record_module.load(migration_record, MIGRATION)
-    assert [h["mode"] for h in record["history"]] == ["plan", "approve", "plan", "apply"]
+    assert [(h["mode"], h["status"]) for h in record["history"]] == [
+        ("plan", "BLOCKED"), ("approve", "APPROVED"), ("plan", "PLANNED"),
+        ("apply", "BASELINE_CAPTURED"), ("apply", "SHARING_READY")]
     share, = record["shares"]
     assert share["share_arn"].startswith(f"arn:aws:ram:{REGION}:{OWNER}:resource-share/temporary-")
 
