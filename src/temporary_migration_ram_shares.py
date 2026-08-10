@@ -777,10 +777,13 @@ def observe(router: Any, groups: list, temporary: frozenset[str], opts: Options,
     return observation
 
 
-def unassociated_rules(groups: list, observation: Any) -> list[tuple[str, str, str]]:
-    """Planned Resolver rules a consumer never associated: reported, never called missing."""
+def unassociated_rules(groups: list, observation: Any,
+                       baseline: dict | None = None) -> list[tuple[str, str, str]]:
+    """Planned Resolver rules a consumer never associated: reported, never called missing.
+    A rule associated in the baseline is never one of them; its loss is a baseline loss."""
+    items = [*value(observation, "items"), *(baseline or {}).get("items", [])]
     associated = {(item.get("consumer"), item.get("region"), item.get("resource_arn"))
-                  for item in value(observation, "items") if item["kind"] == "resolver_association"}
+                  for item in items if item["kind"] == "resolver_association"}
     return sorted({(consumer, group.region, arn) for group in groups
                    for consumer in group.consumers for arn, kind in group.resources.items()
                    if kind.lower() == RESOLVER_TYPE and (consumer, group.region, arn) not in associated})
@@ -912,9 +915,12 @@ def migration_status(record: dict, comparison: Any | None,
                                 f"{gap.get('region')} {gap.get('reason')}" for gap in gaps] or [
                                     "the current observation is incomplete"]
     before = baseline.get("consumer_organizations", {})
-    unknown = sorted(consumer for consumer in before if consumer not in organizations)
+    unknown = [f"current organization of {consumer} is unknown"
+               for consumer in sorted(before) if consumer not in organizations]
+    unknown += [f"{consumer} has no baseline organization; the original baseline does not cover it"
+                for consumer in sorted(set(organizations) - set(before))]
     if unknown:
-        return "INCONCLUSIVE", [f"current organization of {consumer} is unknown" for consumer in unknown]
+        return "INCONCLUSIVE", unknown
     staying = sorted(consumer for consumer, org in before.items() if organizations[consumer] == org)
     if staying:
         return "PENDING_MIGRATION", [f"{consumer} is still in its baseline organization {before[consumer]}"
@@ -922,8 +928,12 @@ def migration_status(record: dict, comparison: Any | None,
     return "MIGRATION_VALIDATED", []
 
 
-def fill_scope_from_record(opts: Options, record: dict) -> None:
-    """verify/complete use the reviewed scope; explicit flags must agree with it."""
+def fill_scope_from_record(opts: Options, record: dict) -> dict[str, set[str]]:
+    """verify/complete use the reviewed scope; explicit flags must agree with it.
+
+    Returns each owner's recorded group and share Regions, which include Regions
+    implied by consumer dependencies or enabled-Region scans rather than --regions.
+    """
     scope = record.get("scope") or {}
     owners = sorted(set(scope.get("stationary_owners", [])) | set(scope.get("migrating_owners", [])))
     consumers = sorted(set(scope.get("migrating_consumers", [])) | set(scope.get("migrating_owners", [])))
@@ -937,6 +947,10 @@ def fill_scope_from_record(opts: Options, record: dict) -> None:
     if opts.args.regions and sorted(set(opts.regions)) != regions:
         raise MigrationError(f"--regions differs from the migration record scope {regions}")
     opts.owners, opts.consumers, opts.regions = owners, consumers, regions
+    located: dict[str, set[str]] = defaultdict(set)
+    for row in [*record.get("shares", []), *(record.get("plan") or {}).get("groups", [])]:
+        located[row["owner"]].add(row["region"])
+    return dict(located)
 
 
 def transient(exc: Exception, verification: bool = False) -> bool:
@@ -1291,8 +1305,9 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
             record = new_record(args.migration_id)
         else:
             record = load_record(args.record, args.migration_id)
+    recorded_regions: dict[str, set[str]] = {}
     if args.mode == "verify":
-        fill_scope_from_record(opts, record)
+        recorded_regions = fill_scope_from_record(opts, record)
     approved_owner_scope = approved_owners(record) if record else set()
     added_owners = sorted(approved_owner_scope - set(opts.owners))
     if added_owners:
@@ -1330,7 +1345,8 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         # Consumer-driven: what the migrating accounts receive decides which owner
         # Regions must be inspected, so the inventory comes first.
         received = received_inventory(gate, opts, report)
-    scopes, failures = region_scopes(gate, opts, report, dependency_regions(received))
+    scopes, failures = region_scopes(gate, opts, report, dependency_regions(received)
+                                     if received is not None else recorded_regions)
     plan.blocked.extend(failures)
     stacks = Stacks(gate, plan.migration, timeout=args.timeout)
     if not callable(getattr(stacks, "persisted_groups", None)):
@@ -1624,7 +1640,8 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
     reasons += errors
     if errors and status_now in ("MIGRATION_VALIDATED", "PENDING_MIGRATION"):
         status_now = "INCONCLUSIVE"
-    for consumer, region, arn in unassociated_rules(plan.groups, final):
+    unassociated = unassociated_rules(plan.groups, final, baseline)
+    for consumer, region, arn in unassociated:
         report.emit(f"consumer={consumer} region={region} resource={arn} phase={phase} "
                     "status=NOT_ASSOCIATED this rule had no association before migration; "
                     "sharing does not create one")
@@ -1649,7 +1666,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
             3 if status == "INCONCLUSIVE" else 1
     summary(plan, report, status, created=created, reused=reused,
             accepted=accepted_count, reused_invitations=reused_invitations, failures=len(failures),
-            comparison=comparison, unassociated=len(unassociated_rules(plan.groups, final)),
+            comparison=comparison, unassociated=len(unassociated),
             sharing=sharing_status, migration=status_now)
     entry = {"at": value(final, "observed_at"), "mode": args.mode, "sharing_status": sharing_status,
              "migration_status": status_now, "reasons": reasons,
@@ -1768,6 +1785,9 @@ def run_complete(router: Router, opts: Options, ask: Callable[[str], str], repor
     if baseline is None or not baseline.get("complete"):
         problems.append("a complete original baseline is required before the temporary path is retired")
     else:
+        problems += [f"consumer {consumer} is not covered by the original baseline; its original "
+                     "state was never recorded, so its temporary shares cannot be retired safely"
+                     for consumer in consumers if consumer not in baseline.get("consumer_organizations", {})]
         comparison = verifier().compare(scoped_items(baseline["items"], groups), observation)
         if value(comparison, "status") != "INTACT":
             problems += [f"original {loss['reason']}: {loss['key']}" for loss in losses(comparison)] or [

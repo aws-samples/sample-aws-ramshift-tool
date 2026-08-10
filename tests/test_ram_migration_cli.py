@@ -149,6 +149,8 @@ class LocalClients:
     def describe_organization(self, **_kwargs):
         self.harness.calls.append(("organization", self.account))
         org = self.harness.organizations[self.account]
+        if isinstance(org, Exception):
+            raise org
         if org == "STANDALONE":
             raise ClientError({"Error": {"Code": "AWSOrganizationsNotInUseException",
                                          "Message": "not in an organization"}}, "DescribeOrganization")
@@ -1686,3 +1688,904 @@ def test_record_scope_distinguishes_account_roles(harness, migration_record):
     assert harness.discovery_kwargs["migrating_owners"] == {OTHER_OWNER}
     received = {call[1] for call in harness.calls if call[0] == "received-shares"}
     assert received == {CONSUMER, OTHER_OWNER}   # migrating owners are audited, stationary are not
+
+
+# ---------------------------------------------------------------------------
+# Original baseline, verification statuses and guarded completion
+# ---------------------------------------------------------------------------
+RULE = f"arn:aws:route53resolver:{REGION}:{OWNER}:resolver-rule/arn-name"
+POOL = f"arn:aws:ec2:{REGION}:{OWNER}:ipam-pool/test"
+ASSOCIATION_KEY = f"resolver_association|{CONSUMER}|{REGION}|association-original"
+OTHER_PERMISSION = "arn:aws:ram::aws:permission/AnotherApprovedPermission"
+
+
+def entitlement_key(arn, consumer=CONSUMER, region=REGION):
+    return f"entitlement|{consumer}|{region}|{arn}"
+
+
+def mode_args(mode, path, *extra):
+    """verify/complete take owners, consumers and Regions from the record."""
+    return [mode, "--migration-id", MIGRATION, "--profile", "explicit-source",
+            "--retry-limit", "2", "--record", str(path), *extra]
+
+
+def complete_args(path, *extra):
+    return mode_args("complete", path, "--settle-seconds", "0", *extra)
+
+
+def quietly(argv, input_fn=None):
+    with contextlib.redirect_stdout(io.StringIO()):
+        return main(argv, input_fn=input_fn)
+
+
+def read_record(path):
+    return record_module.load(path, MIGRATION)
+
+
+def applied(harness, path, argv=None, code=0):
+    """plan --record, then apply through the CLI: stacks, shares, baseline, verification."""
+    argv = list(argv or args())
+    assert quietly(with_record(argv, path)) == 0
+    assert quietly(with_record(["apply", *argv], path), harness.confirm) == code
+    harness.calls.clear()
+    return read_record(path)
+
+
+def resolver_applied(harness, path, sample=None):
+    harness.source[OWNER, REGION] = [group(kind=RESOLVER)]
+    harness.resolver_samples[CONSUMER, REGION] = [sample if sample is not None else [association()]]
+    return applied(harness, path)
+
+
+def rewrite(path, **fields):
+    """A tool-written revision with these fields replaced, e.g. a record from an older release."""
+    record_module.update(path, MIGRATION, lambda current: current.update(fields),
+                         mode="apply", status="LOCAL_FIXTURE")
+
+
+def recorded_drop(path, kind="association", severity="failure", subject=ASSOCIATION_KEY):
+    """A drop event written by the monitor through the record module."""
+    drop = {"kind": kind, "severity": severity, "consumer": CONSUMER, "owner": OWNER,
+            "region": REGION, "subject": subject, "last_present_at": "2026-10-14T05:00:00Z",
+            "first_absent_at": "2026-10-14T05:05:00Z", "detected_by": "monitor",
+            "consumer_organization_at_detection": "o-sourceorg01",
+            "evidence": "local-evidence/monitor.json"}
+    drop["id"] = record_module.drop_id(kind, CONSUMER, REGION, subject, drop["first_absent_at"])
+    record_module.update(path, MIGRATION, lambda current: record_module.add_drops(current, [drop]),
+                         mode="monitor", status="DROP_RECORDED")
+    return drop
+
+
+def gap(collector="tgw", reason="AccessDeniedException operation=DescribeTransitGatewayAttachments"):
+    return {"collector": collector, "account": CONSUMER, "region": REGION,
+            "resource_arn": POOL, "reason": reason}
+
+
+def summary_line(output):
+    return next(line for line in output.splitlines()
+                if line.startswith("status=") and f" migration={MIGRATION} " in line)
+
+
+def pool_group(*names, owner=OWNER, region=REGION, permission=IPAM_PERMISSION, consumers=(CONSUMER,)):
+    return Group(owner, region, tuple(consumers), {IPAM: permission},
+                 {f"arn:aws:ec2:{region}:{owner}:ipam-pool/{name}": IPAM for name in names},
+                 [f"arn:aws:ram:{region}:{owner}:resource-share/original"])
+
+
+def share_arn(g):
+    return Harness.share(g)["resourceShareArn"]
+
+
+def confirm_complete(harness):
+    def confirm(_prompt):
+        harness.calls.append(("confirmation",))
+        return f"COMPLETE {MIGRATION}"
+    return confirm
+
+
+def write_clients(harness):
+    return [index for index, call in enumerate(harness.calls) if call[0] == "client" and call[4]]
+
+
+def completion_events(harness):
+    return [f"collect-{call[1]}" if call[0] == "collect" else call[0] for call in harness.calls
+            if call[0] in ("collect", "delete-share", "delete-stack")]
+
+
+# verify ---------------------------------------------------------------------
+def test_verify_without_a_baseline_is_inconclusive_and_never_creates_one(
+        harness, capsys, migration_record):
+    applied(harness, migration_record)
+    rewrite(migration_record, baseline=None)
+    capsys.readouterr()
+    assert main(mode_args("verify", migration_record)) == 3
+    output = capsys.readouterr().out
+    assert "status=INCONCLUSIVE" in summary_line(output)
+    assert "sharing_status=SHARING_READY migration_status=INCONCLUSIVE" in output
+    assert "no original baseline is recorded" in output
+    record = read_record(migration_record)
+    assert record["baseline"] is None
+    entry = record["verifications"][-1]
+    assert (entry["mode"], entry["migration_status"], entry["baseline_status"]) == (
+        "verify", "INCONCLUSIVE", None)
+    assert not harness.writes()
+
+
+@pytest.mark.parametrize("persisting", [True, False])
+def test_verify_with_an_incomplete_baseline_is_inconclusive(
+        harness, capsys, migration_record, persisting):
+    harness.collect_gaps = [gap("pca", "resource_checks_unavailable")]
+    record = applied(harness, migration_record, code=1)  # gaps never count as success
+    assert record["baseline"]["complete"] is False and record["shares"]
+    if not persisting:
+        harness.collect_gaps = []  # a later complete observation cannot complete the baseline
+    capsys.readouterr()
+    assert main(mode_args("verify", migration_record)) == 3
+    output = capsys.readouterr().out
+    assert "status=INCONCLUSIVE" in summary_line(output)
+    assert "migration_status=INCONCLUSIVE baseline is incomplete: pca resource_checks_unavailable" in output
+    assert read_record(migration_record)["baseline"] == record["baseline"]
+
+
+def test_verify_observation_gaps_are_inconclusive(harness, capsys, migration_record):
+    applied(harness, migration_record)
+    harness.collect_gaps = [gap()]
+    capsys.readouterr()
+    assert main(mode_args("verify", migration_record)) == 3
+    output = capsys.readouterr().out
+    assert "phase=verification status=GAP collector=tgw" in output
+    assert "migration_status=INCONCLUSIVE observation gap: tgw" in output
+    line = summary_line(output)
+    assert "status=INCONCLUSIVE" in line
+    assert "baseline_status=INCONCLUSIVE baseline_missing=0 baseline_degraded=0 observation_gaps=1" in line
+    assert read_record(migration_record)["drops"] == []
+
+
+@pytest.mark.parametrize("change,kind,subject,reason", [
+    ("association-missing", "association", ASSOCIATION_KEY, "missing"),
+    ("association-failed", "association", ASSOCIATION_KEY, "status FAILED"),
+    ("entitlement-invisible", "entitlement", entitlement_key(RULE), "not visible to the consumer"),
+])
+def test_verify_baseline_loss_fails_and_records_a_verify_drop(
+        harness, capsys, migration_record, change, kind, subject, reason):
+    record = resolver_applied(harness, migration_record)
+    if change == "association-missing":
+        harness.resolver_samples[CONSUMER, REGION] = [[]]
+    elif change == "association-failed":
+        harness.resolver_samples[CONSUMER, REGION] = [[association(status="FAILED")]]
+    else:
+        harness.original_lost.add((CONSUMER, REGION, RULE))
+        harness.deleted_shares.append(share_arn(harness.stored[OWNER, REGION][0]))
+    capsys.readouterr()
+    assert main(mode_args("verify", migration_record)) == 1
+    output = capsys.readouterr().out
+    assert "status=FAILED" in summary_line(output)
+    assert f"migration_status=FAILED {reason}: {subject}" in output
+    after = read_record(migration_record)
+    drop, = after["drops"]
+    assert (drop["kind"], drop["severity"], drop["detected_by"], drop["subject"]) == (
+        kind, "failure", "verify", subject)
+    assert (drop["consumer"], drop["owner"], drop["region"]) == (CONSUMER, OWNER, REGION)
+    assert drop["consumer_organization_at_detection"] == "o-sourceorg01"
+    assert drop["last_present_at"] == record["baseline"]["captured_at"]
+    assert after["baseline"] == record["baseline"]
+    assert (after["history"][-1]["mode"], after["history"][-1]["status"]) == ("verify", "FAILED")
+
+
+def test_verify_recorded_failure_drop_fails_even_when_the_baseline_is_intact(
+        harness, capsys, migration_record):
+    resolver_applied(harness, migration_record)
+    drop = recorded_drop(migration_record)
+    harness.organizations[CONSUMER] = "o-destination1"
+    capsys.readouterr()
+    assert main(mode_args("verify", migration_record)) == 1
+    output = capsys.readouterr().out
+    line = summary_line(output)
+    assert "status=FAILED" in line and "baseline_status=INTACT baseline_missing=0" in line
+    assert f"failure drop association {ASSOCIATION_KEY} first absent {drop['first_absent_at']}" in output
+    assert read_record(migration_record)["drops"] == [drop]
+    assert read_record(migration_record)["verifications"][-1]["migration_status"] == "FAILED"
+
+
+def test_verify_informational_original_share_drop_is_not_a_failure(harness, capsys, migration_record):
+    applied(harness, migration_record)
+    recorded_drop(migration_record, kind="original_share", severity="informational",
+                  subject=ORIGINAL_SHARE)
+    harness.organizations[CONSUMER] = "o-destination1"
+    capsys.readouterr()
+    assert main(mode_args("verify", migration_record)) == 0
+    assert "status=MIGRATION_VALIDATED" in summary_line(capsys.readouterr().out)
+
+
+def test_verify_consumer_still_in_its_baseline_organization_is_pending(harness, capsys, migration_record):
+    applied(harness, migration_record)
+    capsys.readouterr()
+    assert main(mode_args("verify", migration_record)) == 0
+    output = capsys.readouterr().out
+    assert "status=PENDING_MIGRATION" in summary_line(output)
+    assert "sharing_status=SHARING_READY migration_status=PENDING_MIGRATION" in output
+    assert f"{CONSUMER} is still in its baseline organization o-sourceorg01" in output
+    assert read_record(migration_record)["verifications"][-1]["migration_status"] == "PENDING_MIGRATION"
+
+
+@pytest.mark.parametrize("organization", ["o-destination1", "STANDALONE"])
+def test_verify_consumer_outside_its_baseline_organization_is_validated(
+        harness, capsys, migration_record, organization):
+    applied(harness, migration_record)
+    harness.organizations[CONSUMER] = organization
+    capsys.readouterr()
+    assert main(mode_args("verify", migration_record)) == 0
+    output = capsys.readouterr().out
+    assert "status=MIGRATION_VALIDATED" in summary_line(output)
+    assert "still in its baseline organization" not in output
+    entry = read_record(migration_record)["verifications"][-1]
+    assert entry["consumer_organizations"] == {CONSUMER: organization}
+    assert (entry["baseline_status"], entry["migration_status"]) == ("INTACT", "MIGRATION_VALIDATED")
+
+
+def test_verify_stays_pending_until_every_consumer_has_left(harness, capsys, migration_record):
+    harness.source[OWNER, REGION][0].consumers = (CONSUMER, OTHER_CONSUMER)
+    applied(harness, migration_record, args(consumers=f"{CONSUMER},{OTHER_CONSUMER}"))
+    harness.organizations[CONSUMER] = "o-destination1"
+    capsys.readouterr()
+    assert main(mode_args("verify", migration_record)) == 0
+    output = capsys.readouterr().out
+    assert "status=PENDING_MIGRATION" in summary_line(output)
+    assert f"{OTHER_CONSUMER} is still in its baseline organization" in output
+    assert f"{CONSUMER} is still in its baseline organization" not in output
+    harness.organizations[OTHER_CONSUMER] = "STANDALONE"
+    assert main(mode_args("verify", migration_record)) == 0
+    assert "status=MIGRATION_VALIDATED" in summary_line(capsys.readouterr().out)
+
+
+@pytest.mark.parametrize("failure,detail", [
+    (denied("DescribeOrganization"), "operation=DescribeOrganization"),
+    ("", "Organization identity was not returned"),
+])
+def test_verify_organization_lookup_error_is_inconclusive(
+        harness, capsys, migration_record, failure, detail):
+    applied(harness, migration_record)
+    harness.organizations[CONSUMER] = failure
+    capsys.readouterr()
+    assert main(mode_args("verify", migration_record)) == 3
+    output = capsys.readouterr().out
+    assert "status=INCONCLUSIVE" in summary_line(output)
+    assert f"current organization of {CONSUMER} is unknown" in output
+    assert f"account={CONSUMER} phase=organization status=BLOCKED" in output and detail in output
+    assert read_record(migration_record)["verifications"][-1]["consumer_organizations"] == {}
+
+
+def test_verify_organization_error_never_hides_a_baseline_loss(harness, capsys, migration_record):
+    resolver_applied(harness, migration_record)
+    harness.resolver_samples[CONSUMER, REGION] = [[]]
+    harness.organizations[CONSUMER] = denied("DescribeOrganization")
+    capsys.readouterr()
+    assert main(mode_args("verify", migration_record)) == 1
+    assert "status=FAILED" in summary_line(capsys.readouterr().out)
+    drop, = read_record(migration_record)["drops"]
+    assert drop["consumer_organization_at_detection"] == "UNKNOWN"
+
+
+@pytest.mark.parametrize("state", ["intact", "added", "lost", "gaps", "migrated", "no-baseline"])
+def test_verify_never_writes_or_replaces_the_baseline(harness, migration_record, state):
+    resolver_applied(harness, migration_record)
+    if state == "added":
+        harness.resolver_samples[CONSUMER, REGION] = [[association(), association("association-new")]]
+    elif state == "lost":
+        harness.resolver_samples[CONSUMER, REGION] = [[]]
+    elif state == "gaps":
+        harness.collect_gaps = [gap()]
+    elif state == "migrated":
+        harness.organizations[CONSUMER] = "o-destination1"
+    elif state == "no-baseline":
+        rewrite(migration_record, baseline=None)
+    before = read_record(migration_record)
+    quietly(mode_args("verify", migration_record))
+    after = read_record(migration_record)
+    assert after["baseline"] == before["baseline"]
+    assert after["shares"] == before["shares"]
+    assert after["revision"] == before["revision"] + 1
+    assert after["history"][-1]["mode"] == "verify"
+    assert "BASELINE_CAPTURED" not in [h["status"] for h in after["history"] if h["mode"] == "verify"]
+
+
+def test_verify_appends_one_verification_entry_per_run(harness, migration_record):
+    record = applied(harness, migration_record)
+    assert [entry["mode"] for entry in record["verifications"]] == ["apply"]
+    assert quietly(mode_args("verify", migration_record)) == 0
+    harness.organizations[CONSUMER] = "STANDALONE"
+    assert quietly(mode_args("verify", migration_record)) == 0
+    after = read_record(migration_record)
+    assert after["verifications"][:1] == record["verifications"]
+    assert [(e["mode"], e["migration_status"]) for e in after["verifications"]] == [
+        ("apply", "PENDING_MIGRATION"), ("verify", "PENDING_MIGRATION"),
+        ("verify", "MIGRATION_VALIDATED")]
+    entry = after["verifications"][-1]
+    assert (entry["sharing_status"], entry["baseline_status"]) == ("SHARING_READY", "INTACT")
+    assert (entry["missing"], entry["degraded"], entry["gaps"]) == (0, 0, 0)
+    assert entry["consumer_organizations"] == {CONSUMER: "STANDALONE"} and entry["reasons"] == []
+
+
+@pytest.mark.parametrize("option,value", [
+    ("--owners", OTHER_OWNER),
+    ("--owners", f"{OWNER},{OTHER_OWNER}"),
+    ("--consumers", OTHER_CONSUMER),
+    ("--consumers", f"{CONSUMER},{OTHER_CONSUMER}"),
+    ("--regions", "eu-west-1"),
+    ("--regions", f"{REGION},eu-west-1"),
+])
+def test_verify_refuses_explicit_scope_that_disagrees_with_the_record(
+        harness, capsys, migration_record, option, value):
+    record = applied(harness, migration_record)
+    capsys.readouterr()
+    assert main(mode_args("verify", migration_record, option, value)) == 1
+    assert f"{option} differs from the migration record scope" in capsys.readouterr().out
+    assert [call[0] for call in harness.calls] == ["router"]
+    assert read_record(migration_record)["revision"] == record["revision"]
+
+
+def test_verify_accepts_explicit_scope_that_matches_the_record(harness, capsys, migration_record):
+    applied(harness, migration_record)
+    capsys.readouterr()
+    assert main(with_record(args("verify"), migration_record)) == 0
+    assert "status=PENDING_MIGRATION" in summary_line(capsys.readouterr().out)
+
+
+def test_verify_blocks_when_a_recorded_share_is_missing_from_its_stack(harness, capsys, migration_record):
+    harness.source[OWNER, REGION] = [pool_group("test"), pool_group("second", permission=OTHER_PERMISSION)]
+    applied(harness, migration_record)
+    removed = harness.stored[OWNER, REGION].pop()
+    capsys.readouterr()
+    assert main(mode_args("verify", migration_record)) == 1
+    output = capsys.readouterr().out
+    assert (f"phase=verification status=BLOCKED phase=reviewed-record recorded temporary share "
+            f"{OWNER}/{REGION}/{removed.logical_id} is missing from its migration stack") in output
+    assert "is not in the migration record" not in output
+    assert not any(call[0] == "collect" for call in harness.calls)
+    last = read_record(migration_record)["history"][-1]
+    assert (last["mode"], last["status"]) == ("verify", "BLOCKED")
+
+
+def test_verify_blocks_when_a_stack_entitlement_is_absent_from_the_record(
+        harness, capsys, migration_record):
+    applied(harness, migration_record)
+    extra = pool_group("unrecorded", permission=OTHER_PERMISSION)
+    harness.stored[OWNER, REGION].append(extra)
+    capsys.readouterr()
+    assert main(mode_args("verify", migration_record)) == 1
+    output = capsys.readouterr().out
+    assert (f"phase=verification status=BLOCKED phase=reviewed-record stack entitlement "
+            f"{OWNER}/{REGION}/{extra.logical_id} is not in the migration record") in output
+    assert "is missing from its migration stack" not in output
+    assert not any(call[0] == "collect" for call in harness.calls)
+
+
+def test_verify_reads_every_recorded_region_including_consumer_dependency_regions(
+        harness, capsys, migration_record):
+    harness.enabled_regions[CONSUMER].append({"RegionName": "ap-south-1", "OptInStatus": "opted-in"})
+    harness.receive(region="ap-south-1")
+    harness.source[OWNER, "ap-south-1"] = [group(region="ap-south-1")]
+    record = applied(harness, migration_record)
+    assert {share["region"] for share in record["shares"]} == {REGION, "ap-south-1"}
+    assert "ap-south-1" not in record["scope"]["regions"]  # implied by a dependency, not --regions
+    capsys.readouterr()
+    assert main(mode_args("verify", migration_record)) == 0
+    output = capsys.readouterr().out
+    assert "sharing_status=SHARING_READY migration_status=PENDING_MIGRATION" in output
+    assert ("persisted", OWNER, "ap-south-1") in harness.calls
+    assert not any(call[0] in ("discovery", "received-shares") for call in harness.calls)
+
+
+def test_consumer_without_a_baseline_organization_is_never_validated(harness, capsys, migration_record):
+    applied(harness, migration_record)  # the recorded baseline covers CONSUMER only
+    harness.source[OWNER, REGION].append(group(consumer=OTHER_CONSUMER))
+    record = applied(harness, migration_record, args(consumers=f"{CONSUMER},{OTHER_CONSUMER}"))
+    assert record["baseline"]["consumer_organizations"] == {CONSUMER: "o-sourceorg01"}
+    harness.organizations[CONSUMER] = "o-destination1"  # OTHER_CONSUMER never left
+    capsys.readouterr()
+    assert main(mode_args("verify", migration_record)) == 3
+    output = capsys.readouterr().out
+    assert "status=INCONCLUSIVE" in summary_line(output)
+    assert f"{OTHER_CONSUMER} has no baseline organization" in output
+
+
+# apply ----------------------------------------------------------------------
+@pytest.mark.parametrize("after,reason", [
+    ([], "missing"),
+    ([association("association-replacement")], "missing"),
+    ([association(status="FAILED")], "status FAILED"),
+])
+def test_resumed_apply_blocks_before_writes_when_a_baseline_item_is_lost(
+        harness, capsys, migration_record, after, reason):
+    record = resolver_applied(harness, migration_record)
+    harness.resolver_samples[CONSUMER, REGION] = [after]
+    capsys.readouterr()
+    assert main(with_record(args("apply"), migration_record),
+                input_fn=lambda _: pytest.fail("A lost baseline item blocks before confirmation")) == 1
+    output = capsys.readouterr().out
+    assert f"phase=baseline status=BLOCKED original {reason}: {ASSOCIATION_KEY}" in output
+    assert "the recorded baseline is never replaced" in output
+    assert not harness.writes() and not any(call[0] == "apply" for call in harness.calls)
+    current = read_record(migration_record)
+    assert current["baseline"] == record["baseline"]
+    drop, = current["drops"]
+    assert (drop["kind"], drop["severity"], drop["detected_by"], drop["subject"]) == (
+        "association", "failure", "apply", ASSOCIATION_KEY)
+    assert drop["last_present_at"] == record["baseline"]["captured_at"]
+    last = current["history"][-1]
+    assert (last["mode"], last["status"], last["drops"]) == ("apply", "BLOCKED", 1)
+
+
+def test_resumed_apply_with_an_observation_gap_blocks_before_writes(harness, capsys, migration_record):
+    record = applied(harness, migration_record)
+    harness.collect_gaps = [gap()]
+    capsys.readouterr()
+    assert main(with_record(args("apply"), migration_record),
+                input_fn=lambda _: pytest.fail("An incomplete observation blocks")) == 1
+    assert "phase=baseline status=BLOCKED observation gap tgw" in capsys.readouterr().out
+    assert not harness.writes()
+    assert read_record(migration_record)["baseline"] == record["baseline"]
+
+
+def test_baseline_is_captured_once_and_a_later_apply_never_replaces_it(harness, capsys, migration_record):
+    first = resolver_applied(harness, migration_record)
+    captured = [h for h in first["history"] if h["status"] == "BASELINE_CAPTURED"]
+    assert len(captured) == 1 and first["baseline"]["captured_in_revision"] == captured[0]["revision"]
+    added = f"resolver_association|{CONSUMER}|{REGION}|association-new"
+    harness.resolver_samples[CONSUMER, REGION] = [[association(), association("association-new")]]
+    capsys.readouterr()
+    assert main(with_record(args("apply"), migration_record), input_fn=harness.confirm) == 0
+    output = capsys.readouterr().out
+    assert "phase=baseline status=CAPTURED" not in output
+    assert "status=SHARING_READY" in summary_line(output) and "baseline_status=INTACT" in output
+    record = read_record(migration_record)
+    assert record["baseline"] == first["baseline"]
+    assert added not in {item["key"] for item in record["baseline"]["items"]}
+    assert [h["status"] for h in record["history"]].count("BASELINE_CAPTURED") == 1
+    assert len(record["shares"]) == 1
+
+
+@pytest.mark.parametrize("change,expected", [
+    ("association-missing", f"original state changed during confirmation (missing): {ASSOCIATION_KEY}"),
+    ("association-replaced", f"original state changed during confirmation (missing): {ASSOCIATION_KEY}"),
+    ("association-moved", f"original state changed during confirmation (vpc_id changed): {ASSOCIATION_KEY}"),
+    ("association-failed", "status=FAILED: not COMPLETE; capture requires a stable original state"),
+    ("entitlement-lost", f"resource_arn={RULE} via_shares=0 via_temporary=0 via_other=0: "
+                         "not visible to the consumer"),
+])
+def test_state_change_during_confirmation_blocks_at_the_write_gate(
+        harness, capsys, migration_record, change, expected):
+    harness.source[OWNER, REGION] = [group(kind=RESOLVER)]
+    harness.resolver_samples[CONSUMER, REGION] = [[association()]]
+    assert quietly(with_record(args(), migration_record)) == 0
+    after = {"association-missing": [], "association-replaced": [association("association-new")],
+             "association-moved": [association(vpc="vpc-other")],
+             "association-failed": [association(status="FAILED")]}
+
+    def confirm(prompt):
+        if change in after:
+            harness.resolver_samples[CONSUMER, REGION] = [after[change]]
+        else:
+            harness.original_lost.add((CONSUMER, REGION, RULE))
+        return harness.confirm(prompt)
+    capsys.readouterr()
+    assert main(with_record(args("apply"), migration_record), input_fn=confirm) == 1
+    output = capsys.readouterr().out
+    assert expected in output and "status=BLOCKED" in summary_line(output)
+    assert "phase=baseline-preflight" in output and "phase=baseline kind=" in output
+    assert not harness.writes() and not any(call[0] == "apply" for call in harness.calls)
+    assert [call[0] for call in harness.calls].count("confirmation") == 1
+    record = read_record(migration_record)
+    assert record["baseline"] is None and record["drops"] == [] and record["shares"] == []
+    last = record["history"][-1]
+    assert (last["mode"], last["status"], last["phase"]) == ("apply", "BLOCKED", "post-confirmation")
+
+
+@pytest.mark.parametrize("reply", ["no", f"APPLY {MIGRATION} ", f"COMPLETE {MIGRATION}", None])
+def test_cancelled_confirmation_captures_no_baseline(harness, capsys, migration_record, reply):
+    harness.source[OWNER, REGION] = [group(kind=RESOLVER)]
+    harness.resolver_samples[CONSUMER, REGION] = [[association()]]
+    assert quietly(with_record(args(), migration_record)) == 0
+
+    def answer(_prompt):
+        if reply is None:
+            raise EOFError
+        return reply
+    assert main(with_record(args("apply"), migration_record), input_fn=answer) == 2
+    assert "status=CANCELLED" in capsys.readouterr().out
+    record = read_record(migration_record)
+    assert record["baseline"] is None and record["shares"] == []
+    assert "BASELINE_CAPTURED" not in [h["status"] for h in record["history"]]
+    assert not harness.writes()
+    # The next apply captures the original state at its own write gate.
+    harness.resolver_samples[CONSUMER, REGION] = [[association("association-later")]]
+    assert quietly(with_record(args("apply"), migration_record), harness.confirm) == 0
+    keys = {item["key"] for item in read_record(migration_record)["baseline"]["items"]}
+    assert f"resolver_association|{CONSUMER}|{REGION}|association-later" in keys
+    assert ASSOCIATION_KEY not in keys
+
+
+def test_unassociated_rules_are_never_counted_as_missing_on_resume_verify_or_complete(
+        harness, capsys, migration_record):
+    record = resolver_applied(harness, migration_record, sample=[])
+    assert not [item for item in record["baseline"]["items"] if item["kind"] == "resolver_association"]
+    capsys.readouterr()
+    assert main(with_record(args("apply"), migration_record), input_fn=harness.confirm) == 0
+    output = capsys.readouterr().out
+    assert f"consumer={CONSUMER} region={REGION} resource={RULE} phase=post-apply status=NOT_ASSOCIATED" \
+        in output
+    assert "baseline_missing=0" in output and "unassociated_resolver_rules=1" in output
+    assert main(mode_args("verify", migration_record)) == 0
+    output = capsys.readouterr().out
+    assert "status=NOT_ASSOCIATED" in output and "baseline_missing=0" in output
+    assert "status=PENDING_MIGRATION" in summary_line(output)
+    assert main(complete_args(migration_record), input_fn=confirm_complete(harness)) == 0
+    assert read_record(migration_record)["drops"] == []
+
+
+def test_rule_unassociated_for_one_consumer_is_not_missing_for_either(harness, capsys, migration_record):
+    harness.source[OWNER, REGION] = [group(kind=RESOLVER)]
+    harness.source[OWNER, REGION][0].consumers = (CONSUMER, OTHER_CONSUMER)
+    harness.resolver_samples[CONSUMER, REGION] = [[association()]]
+    applied(harness, migration_record, args(consumers=f"{CONSUMER},{OTHER_CONSUMER}"))
+    capsys.readouterr()
+    assert main(mode_args("verify", migration_record)) == 0
+    output = capsys.readouterr().out
+    assert f"consumer={OTHER_CONSUMER} region={REGION} resource={RULE} phase=verification " \
+           "status=NOT_ASSOCIATED" in output
+    assert f"consumer={CONSUMER} region={REGION} resource={RULE} phase=verification " \
+           "status=NOT_ASSOCIATED" not in output
+    line = summary_line(output)
+    assert "baseline_missing=0" in line and "unassociated_resolver_rules=1" in line
+
+
+def test_lost_baseline_association_is_reported_missing_never_as_unassociated(
+        harness, capsys, migration_record):
+    resolver_applied(harness, migration_record)
+    harness.resolver_samples[CONSUMER, REGION] = [[]]
+    capsys.readouterr()
+    assert main(mode_args("verify", migration_record)) == 1
+    output = capsys.readouterr().out
+    assert f"status=BASELINE_MISSING key={ASSOCIATION_KEY}" in output
+    assert "NOT_ASSOCIATED" not in output and "unassociated_resolver_rules" not in output
+    assert "had none before migration" not in output
+
+
+# complete -------------------------------------------------------------------
+def refused(harness, path, capsys, *expected):
+    """complete must stop before its confirmation, delete nothing and record why."""
+    before = read_record(path)
+    deleted = list(harness.deleted_shares)
+    harness.calls.clear()
+    assert main(complete_args(path),
+                input_fn=lambda _: pytest.fail("A refused completion must not confirm")) == 1
+    output = capsys.readouterr().out
+    for text in expected:
+        assert text in output
+    assert f"status=BLOCKED migration={MIGRATION} phase=complete" in output
+    assert "temporary shares retained" in output
+    assert harness.deleted_shares == deleted and not harness.deleted_stacks
+    assert not write_clients(harness)
+    record = read_record(path)
+    assert record["completion"] is None and record["shares"] == before["shares"]
+    assert record["baseline"] == before["baseline"]
+    last = record["history"][-1]
+    assert (last["mode"], last["status"]) == ("complete", "BLOCKED")
+    return record
+
+
+def test_complete_requires_the_record(harness, capsys):
+    assert main(["complete", "--migration-id", MIGRATION, "--profile", "explicit-source"]) == 1
+    assert "complete requires --record" in capsys.readouterr().out
+    assert not harness.calls
+
+
+def test_complete_refuses_without_a_baseline(harness, capsys, migration_record):
+    applied(harness, migration_record)
+    rewrite(migration_record, baseline=None)
+    capsys.readouterr()
+    refused(harness, migration_record, capsys,
+            "a complete original baseline is required before the temporary path is retired")
+
+
+def test_complete_refuses_with_an_incomplete_baseline(harness, capsys, migration_record):
+    harness.collect_gaps = [gap("pca", "resource_checks_unavailable")]
+    applied(harness, migration_record, code=1)
+    harness.collect_gaps = []
+    capsys.readouterr()
+    refused(harness, migration_record, capsys,
+            "a complete original baseline is required before the temporary path is retired")
+
+
+@pytest.mark.parametrize("after,reason", [
+    ([], "missing"),
+    ([association(vpc="vpc-replacement")], "vpc_id changed"),
+    ([association(status="FAILED")], "status FAILED"),
+])
+def test_complete_refuses_on_any_baseline_loss_and_records_the_drop(
+        harness, capsys, migration_record, after, reason):
+    resolver_applied(harness, migration_record)
+    harness.resolver_samples[CONSUMER, REGION] = [after]
+    capsys.readouterr()
+    record = refused(harness, migration_record, capsys, f"original {reason}: {ASSOCIATION_KEY}")
+    drop, = record["drops"]
+    assert (drop["kind"], drop["severity"], drop["detected_by"], drop["subject"]) == (
+        "association", "failure", "complete", ASSOCIATION_KEY)
+
+
+def test_complete_refuses_with_a_recorded_failure_drop(harness, capsys, migration_record):
+    resolver_applied(harness, migration_record)
+    drop = recorded_drop(migration_record)  # the association recovered; the drop is permanent
+    capsys.readouterr()
+    record = refused(harness, migration_record, capsys,
+                     f"failure drop recorded: association {ASSOCIATION_KEY} first absent "
+                     f"{drop['first_absent_at']}")
+    assert record["drops"] == [drop]
+
+
+def test_complete_refuses_while_only_the_temporary_share_provides_access(
+        harness, capsys, migration_record):
+    applied(harness, migration_record)
+    harness.original_lost.add((CONSUMER, REGION, POOL))  # no permanent replacement share yet
+    capsys.readouterr()
+    refused(harness, migration_record, capsys,
+            f"phase=replacement consumer={CONSUMER} region={REGION} resource={POOL}: only the "
+            "temporary share provides access; establish permanent replacement sharing first")
+
+
+def test_complete_refuses_on_replacement_gaps(harness, capsys, migration_record):
+    applied(harness, migration_record)
+    harness.replacement_gaps = [gap("replacement", "AccessDeniedException operation=ListResources")]
+    capsys.readouterr()
+    refused(harness, migration_record, capsys,
+            f"phase=replacement gap {CONSUMER} {REGION} AccessDeniedException operation=ListResources")
+
+
+def test_complete_refuses_on_observation_gaps(harness, capsys, migration_record):
+    applied(harness, migration_record)
+    harness.collect_gaps = [gap()]
+    capsys.readouterr()
+    refused(harness, migration_record, capsys, f"observation gap tgw {CONSUMER} {REGION}")
+
+
+@pytest.mark.parametrize("mismatch", ["recorded-only", "stack-only", "share-arn", "stack-absent"])
+def test_complete_refuses_on_record_stack_mismatch(harness, capsys, migration_record, mismatch):
+    first, second = pool_group("test"), pool_group("second", permission=OTHER_PERMISSION)
+    harness.source[OWNER, REGION] = [first, second]
+    record = applied(harness, migration_record)
+    if mismatch == "recorded-only":
+        harness.stored[OWNER, REGION] = [g for g in harness.stored[OWNER, REGION] if g.key != second.key]
+        expected = (f"recorded temporary share {OWNER}/{REGION}/{second.logical_id} is missing "
+                    "from its migration stack")
+    elif mismatch == "stack-only":
+        extra = pool_group("unrecorded", permission="arn:aws:ram::aws:permission/ThirdPermission")
+        harness.stored[OWNER, REGION].append(extra)
+        expected = f"stack entitlement {OWNER}/{REGION}/{extra.logical_id} is not in the migration record"
+    elif mismatch == "share-arn":
+        rewrite(migration_record, shares=[
+            dict(entry, share_arn=entry["share_arn"] + "-replaced")
+            if entry["logical_id"] == second.logical_id else entry for entry in record["shares"]])
+        expected = (f"{OWNER}/{REGION}/{second.logical_id}: stack share {share_arn(second)} differs "
+                    f"from recorded {share_arn(second)}-replaced")
+    else:
+        del harness.stored[OWNER, REGION]
+        expected = f"owner={OWNER} region={REGION} phase=stored-plan"
+    capsys.readouterr()
+    refused(harness, migration_record, capsys, expected)
+
+
+@pytest.mark.parametrize("failure", ["organization", "authentication"])
+def test_complete_refuses_when_accounts_or_organizations_cannot_be_read(
+        harness, capsys, migration_record, failure):
+    applied(harness, migration_record)
+    if failure == "organization":
+        harness.organizations[CONSUMER] = denied("DescribeOrganization")
+    else:
+        harness.auth_errors[CONSUMER] = denied("GetCallerIdentity")
+    capsys.readouterr()
+    refused(harness, migration_record, capsys,
+            f"account={CONSUMER} phase={failure} status=BLOCKED", "local-request-id")
+
+
+def test_complete_refuses_a_record_without_temporary_shares(harness, capsys, migration_record):
+    assert quietly(with_record(args(), migration_record)) == 0
+    capsys.readouterr()
+    refused(harness, migration_record, capsys, "the migration record has no temporary shares to retire")
+
+
+def test_complete_refuses_a_consumer_the_baseline_never_covered(harness, capsys, migration_record):
+    applied(harness, migration_record)
+    harness.source[OWNER, REGION].append(group(consumer=OTHER_CONSUMER))
+    applied(harness, migration_record, args(consumers=f"{CONSUMER},{OTHER_CONSUMER}"))
+    capsys.readouterr()
+    refused(harness, migration_record, capsys,
+            f"consumer {OTHER_CONSUMER} is not covered by the original baseline")
+
+
+@pytest.mark.parametrize("option,value", [
+    ("--owners", OTHER_OWNER), ("--consumers", OTHER_CONSUMER), ("--regions", "eu-west-1"),
+])
+def test_complete_refuses_explicit_scope_that_disagrees_with_the_record(
+        harness, capsys, migration_record, option, value):
+    record = applied(harness, migration_record)
+    capsys.readouterr()
+    assert main(complete_args(migration_record, option, value),
+                input_fn=lambda _: pytest.fail("must not confirm")) == 1
+    assert f"{option} differs from the migration record scope" in capsys.readouterr().out
+    assert [call[0] for call in harness.calls] == ["router"]
+    assert read_record(migration_record)["revision"] == record["revision"]
+
+
+@pytest.mark.parametrize("reply", [
+    "yes", f"APPLY {MIGRATION}", "COMPLETE another-migration", f"COMPLETE {MIGRATION} ",
+    f"complete {MIGRATION}", None,
+])
+def test_complete_wrong_token_exits_2_without_deleting(harness, capsys, migration_record, reply):
+    applied(harness, migration_record)
+    prompts = []
+
+    def answer(prompt):
+        prompts.append(prompt)
+        if reply is None:
+            raise EOFError
+        return reply
+    assert main(complete_args(migration_record), input_fn=answer) == 2
+    output = capsys.readouterr().out
+    assert "status=CANCELLED" in output and f"COMPLETE {MIGRATION}" in prompts[0]
+    assert "action=DELETE_SHARE" in output and "action=DELETE_STACK" in output
+    assert not harness.deleted_shares and not harness.deleted_stacks and not write_clients(harness)
+    record = read_record(migration_record)
+    assert record["completion"] is None
+    assert not [h for h in record["history"] if h["mode"] == "complete"]
+
+
+def test_complete_deletes_smallest_share_first_and_stacks_last(harness, capsys, migration_record):
+    large = pool_group("a1", "a2", "a3")
+    small = pool_group("b1", permission=OTHER_PERMISSION)
+    other = pool_group("c1", "c2", owner=OTHER_OWNER)
+    harness.source = {(OWNER, REGION): [large, small], (OTHER_OWNER, REGION): [other]}
+    applied(harness, migration_record, args(owners=f"{OWNER},{OTHER_OWNER}"))
+    sites = {(CONSUMER, g.region, arn) for g in (large, small, other) for arn in g.resources}
+    harness.original_lost |= sites  # the original organization share no longer applies,
+    harness.replacement |= sites    # a permanent share from the new landing zone does
+    harness.organizations[CONSUMER] = "o-destination1"
+    recorded_drop(migration_record, kind="original_share", severity="informational",
+                  subject=ORIGINAL_SHARE)
+    capsys.readouterr()
+    assert main(complete_args(migration_record), input_fn=confirm_complete(harness)) == 0
+    output = capsys.readouterr().out
+    order = [share_arn(g) for g in (small, other, large)]
+    assert harness.deleted_shares == order
+    assert completion_events(harness) == [
+        "collect-3", "delete-share", "collect-1", "delete-share", "collect-1",
+        "delete-share", "collect-1", "collect-3", "delete-stack", "delete-stack"]
+    confirmation = harness.calls.index(("confirmation",))
+    assert len(write_clients(harness)) == 3 and min(write_clients(harness)) > confirmation
+    assert harness.deleted_stacks == [(OWNER, REGION), (OTHER_OWNER, REGION)]
+    for index in (1, 2, 3):
+        assert f"phase=complete-settle-{index} kind=entitlement" in output
+    assert "phase=complete-final kind=entitlement" in output
+    assert f"status=COMPLETED migration={MIGRATION} deleted_shares=3 deleted_stacks=2" in output
+    record = read_record(migration_record)
+    assert record["completion"]["deleted_shares"] == order
+    assert record["completion"]["deleted_stacks"] == [f"local-stack-{OWNER}-{REGION}",
+                                                      f"local-stack-{OTHER_OWNER}-{REGION}"]
+    assert record["completion"]["consumer_organizations"] == {CONSUMER: "o-destination1"}
+    assert [(h["status"], h.get("share")) for h in record["history"] if h["mode"] == "complete"] == [
+        ("SHARE_DELETED", order[0]), ("SHARE_DELETED", order[1]), ("SHARE_DELETED", order[2]),
+        ("COMPLETED", None)]
+    assert len(record["shares"]) == 3 and not record_module.failure_drops(record)
+
+
+def test_complete_stops_at_the_first_loss_after_a_deletion(harness, capsys, migration_record):
+    small, large = pool_group("test"), pool_group("l1", "l2", permission=OTHER_PERMISSION)
+    harness.source[OWNER, REGION] = [large, small]
+    applied(harness, migration_record)
+
+    def lose_access(h, arn):  # the consumer had no permanent path after all
+        deleted = next(g for g in h.stored[OWNER, REGION] if share_arn(g) == arn)
+        h.original_lost.update((c, deleted.region, r) for c in deleted.consumers for r in deleted.resources)
+    harness.after_delete = lose_access
+    capsys.readouterr()
+    assert main(complete_args(migration_record), input_fn=confirm_complete(harness)) == 1
+    output = capsys.readouterr().out
+    assert harness.deleted_shares == [share_arn(small)] and not harness.deleted_stacks
+    assert completion_events(harness) == ["collect-2", "delete-share", "collect-1"]
+    assert f"status=FAILED phase=complete original not visible to the consumer: {entitlement_key(POOL)}" \
+        in output
+    assert f"status=FAILED phase=complete replacement access missing for {CONSUMER} {REGION} {POOL}" in output
+    assert "Completion stopped; the remaining temporary shares are retained." in output
+    record = read_record(migration_record)
+    drop, = record["drops"]
+    assert (drop["kind"], drop["severity"], drop["detected_by"], drop["subject"]) == (
+        "entitlement", "failure", "complete", entitlement_key(POOL))
+    assert drop["evidence"] == "complete-settle-1"
+    assert record["completion"] is None
+    assert [h["status"] for h in record["history"] if h["mode"] == "complete"] == [
+        "SHARE_DELETED", "FAILED"]
+    assert record["history"][-1]["deleted"] == [share_arn(small)]
+    # The failure drop is permanent: restoring access does not re-enable completion.
+    harness.after_delete = None
+    harness.original_lost.clear()
+    capsys.readouterr()
+    refused(harness, migration_record, capsys, f"failure drop recorded: entitlement {entitlement_key(POOL)}")
+    assert main(mode_args("verify", migration_record)) == 1
+    assert "status=FAILED" in summary_line(capsys.readouterr().out)
+
+
+def test_complete_settle_window_catches_a_delayed_loss(harness, capsys, migration_record, monkeypatch):
+    applied(harness, migration_record)
+    clock = [1000.0]
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock[0])
+
+    def sleep(seconds):
+        clock[0] += seconds
+        harness.original_lost.add((CONSUMER, REGION, POOL))  # fails after the first check
+    monkeypatch.setattr(cli.time, "sleep", sleep)
+    capsys.readouterr()
+    assert main(mode_args("complete", migration_record, "--settle-seconds", "60"),
+                input_fn=confirm_complete(harness)) == 1
+    output = capsys.readouterr().out
+    assert completion_events(harness) == ["collect-1", "delete-share", "collect-1", "collect-1"]
+    assert f"original not visible to the consumer: {entitlement_key(POOL)}" in output
+    assert not harness.deleted_stacks and read_record(migration_record)["completion"] is None
+
+
+def test_complete_reverifies_for_the_whole_settle_window(harness, migration_record, monkeypatch):
+    applied(harness, migration_record)
+    clock = [1000.0]
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(cli.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    assert quietly(mode_args("complete", migration_record, "--settle-seconds", "60"),
+                   confirm_complete(harness)) == 0
+    # preflight, then at 0s/30s/60s after the deletion and again for the final check
+    assert completion_events(harness) == ["collect-1", "delete-share"] + ["collect-1"] * 6 + ["delete-stack"]
+
+
+def test_complete_share_deletion_failure_stops_and_keeps_the_rest(harness, capsys, migration_record,
+                                                                  monkeypatch):
+    harness.source[OWNER, REGION] = [pool_group("test"), pool_group("l1", "l2", permission=OTHER_PERMISSION)]
+    applied(harness, migration_record)
+
+    def failing(router, owner, region, arn, migration, timeout=600):
+        harness.calls.append(("delete-share", owner, region, arn))
+        router.client(owner, "ram", region, write=True)
+        raise denied("DeleteResourceShare")
+    monkeypatch.setattr(cli, "delete_share", failing)
+    capsys.readouterr()
+    assert main(complete_args(migration_record), input_fn=confirm_complete(harness)) == 1
+    assert "phase=complete operation=DeleteResourceShare" in capsys.readouterr().out
+    assert completion_events(harness) == ["collect-2", "delete-share"] and not harness.deleted_stacks
+    record = read_record(migration_record)
+    assert record["completion"] is None
+    assert (record["history"][-1]["status"], record["history"][-1]["deleted"]) == ("FAILED", [])
+
+
+def test_complete_stack_deletion_failure_records_no_completion(harness, capsys, migration_record,
+                                                               monkeypatch):
+    applied(harness, migration_record)
+
+    def failing(self, owner, region):
+        raise MigrationError("stack deletion did not finish before the timeout")
+    monkeypatch.setattr(cli.Stacks, "delete", failing)
+    capsys.readouterr()
+    assert main(complete_args(migration_record), input_fn=confirm_complete(harness)) == 1
+    assert "stack deletion did not finish" in capsys.readouterr().out
+    record = read_record(migration_record)
+    assert record["completion"] is None
+    last = record["history"][-1]
+    assert (last["status"], last["deleted"], last["stacks"]) == (
+        "FAILED", [share_arn(harness.stored[OWNER, REGION][0])], [])
+
+
+def test_already_complete_record_is_a_no_op(harness, capsys, migration_record):
+    applied(harness, migration_record)
+    assert quietly(complete_args(migration_record), confirm_complete(harness)) == 0
+    record = read_record(migration_record)
+    harness.calls.clear()
+    capsys.readouterr()
+    assert main(complete_args(migration_record), input_fn=lambda _: pytest.fail("nothing to confirm")) == 0
+    assert (f"migration={MIGRATION} phase=complete status=ALREADY_COMPLETE "
+            f"at={record['completion']['completed_at']}") in capsys.readouterr().out
+    assert [call[0] for call in harness.calls] == ["router"]
+    assert read_record(migration_record) == record
