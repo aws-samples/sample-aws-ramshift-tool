@@ -3,8 +3,17 @@
 One JSON document per migration ID. ``plan`` writes the reviewed scope and its
 blockers, ``approve`` adds bound approvals, ``apply`` captures the original
 baseline once and records created shares, ``verify`` appends verification
-results. Every write is a new revision in a hash-chained history; a record that
-was edited outside the tool fails its integrity check and is refused.
+results. Every write is a new revision in a hash-chained history. Each history
+entry carries the digest of the record as written in its revision and hashes
+only its own fields, and ``load`` re-verifies the whole chain and the current
+content before anything uses the record.
+
+Plain SHA-256 makes the record tamper-evident against accidental edits only:
+anyone who can write the file can recompute every hash. With a record key in
+``RAM_MIGRATION_RECORD_KEY`` (or in the file named by
+``RAM_MIGRATION_RECORD_KEY_FILE``) every write also adds an HMAC-SHA256 that
+only the key holder can produce, and every load requires it. The contract is
+RAM_MIGRATION_RECORD.md section 1.
 """
 from __future__ import annotations
 
@@ -13,6 +22,7 @@ import copy
 import fcntl
 import getpass
 import hashlib
+import hmac
 import json
 import os
 import socket
@@ -22,7 +32,11 @@ from typing import Any, Callable
 
 from ram_migration_common import TOOL_VERSION, MigrationError, timestamp
 
-SCHEMA = "ram-migration-record/1"
+SCHEMA = "ram-migration-record/2"
+# Records written before history entries carried body_sha256. They still load,
+# with their chain verified as far as that format allows, and the next write
+# upgrades them to SCHEMA.
+LEGACY_SCHEMA = "ram-migration-record/1"
 SOURCES = (
     "temporary_migration_ram_shares.py", "ram_migration_common.py",
     "ram_migration_discovery.py", "ram_migration_stacks.py",
@@ -31,6 +45,14 @@ SOURCES = (
 )
 # Plan revisions whose scope apply may consume.
 APPLICABLE = "PLANNED"
+# Optional record key: the secret itself, or the path of a file holding it.
+# The key is never written to the record.
+KEY_ENV = "RAM_MIGRATION_RECORD_KEY"
+KEY_FILE_ENV = "RAM_MIGRATION_RECORD_KEY_FILE"
+MIN_KEY_BYTES = 16
+HMAC_ALGORITHM = "hmac-sha256"
+# Top-level fields that protect the content and so are not part of it.
+INTEGRITY_FIELDS = ("content_sha256", "content_hmac")
 
 
 def canonical(value: Any) -> bytes:
@@ -41,13 +63,24 @@ def sha256(value: Any) -> str:
     return hashlib.sha256(canonical(value)).hexdigest()
 
 
-def tool_identity() -> dict:
+def _source_identity() -> dict:
     root = Path(__file__).resolve().parent
     hashes = {}
     for name in SOURCES:
         path = root / name
         hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
     return {"version": TOOL_VERSION, "sources_sha256": hashes, "sources_digest": sha256(hashes)}
+
+
+# Hashed once, when the tool starts and imports this module, so the identity
+# describes the code that is running. A source file edited or replaced while a
+# long plan or apply runs cannot change the digest that run records or compares.
+_TOOL_IDENTITY = _source_identity()
+
+
+def tool_identity() -> dict:
+    """Tool version and source digests as of start-up; a fresh copy on every call."""
+    return copy.deepcopy(_TOOL_IDENTITY)
 
 
 def operator() -> dict:
@@ -81,6 +114,8 @@ def new_record(migration: str) -> dict:
         "verifications": [],
         "drops": [],
         "completion": None,
+        # Set only when a schema /1 record is upgraded; see _write.
+        "legacy_history": None,
         "history": [],
     }
 
@@ -118,11 +153,152 @@ def failure_drops(record: dict) -> list[dict]:
     return [d for d in record.get("drops", []) if d.get("severity") == "failure"]
 
 
+# ---------------------------------------------------------------------------
+# Integrity and authentication
+# ---------------------------------------------------------------------------
+
+def _content(record: dict) -> bytes:
+    """The bytes content_sha256 and content_hmac cover: the whole document, history included."""
+    return canonical({k: v for k, v in record.items() if k not in INTEGRITY_FIELDS})
+
+
 def _content_digest(record: dict) -> str:
-    return sha256({k: v for k, v in record.items() if k != "content_sha256"})
+    return hashlib.sha256(_content(record)).hexdigest()
+
+
+def _body(record: dict) -> dict:
+    """The record as written in one revision: everything but its history and integrity fields."""
+    return {k: v for k, v in record.items() if k not in (*INTEGRITY_FIELDS, "history")}
+
+
+def _entry_digest(entry: dict) -> str:
+    """A current-format entry hashes only its own fields, so it verifies on its own."""
+    return sha256({k: v for k, v in entry.items() if k != "sha256"})
+
+
+def _legacy_entry_digest(entry: dict, record: dict) -> str:
+    """A schema /1 entry hashed the body of its own revision. Only the latest revision of a
+    record still in schema /1 has that body, so only that entry can be recomputed."""
+    return sha256([entry.get("previous_sha256"), _body(record),
+                   {k: v for k, v in entry.items() if k != "sha256"}])
+
+
+def _record_key() -> bytes | None:
+    """The record key from the environment, read on every use; None when none is set."""
+    value, name = os.environ.get(KEY_ENV), os.environ.get(KEY_FILE_ENV)
+    if value is not None and name is not None:
+        raise MigrationError(f"set {KEY_ENV} or {KEY_FILE_ENV}, not both")
+    if name is not None:
+        try:
+            key = Path(name).read_bytes().strip()
+        except OSError as exc:
+            raise MigrationError(f"{KEY_FILE_ENV}: unable to read the record key file: {exc}") from exc
+    elif value is not None:
+        key = os.fsencode(value).strip()
+    else:
+        return None
+    if len(key) < MIN_KEY_BYTES:
+        raise MigrationError(f"{KEY_FILE_ENV if name is not None else KEY_ENV}: the record key must "
+                             f"be at least {MIN_KEY_BYTES} bytes; generate one with "
+                             "'openssl rand -hex 32'")
+    return key
+
+
+def _key_id(key: bytes) -> str:
+    """Names a key in the record and in errors without revealing it."""
+    return hmac.new(key, b"ram-migration-record key id", hashlib.sha256).hexdigest()[:16]
+
+
+def _content_hmac(key: bytes, content: bytes) -> str:
+    return hmac.new(key, content, hashlib.sha256).hexdigest()
+
+
+def _history_signer(history: Any) -> str | None:
+    """Key ID of the latest history entry that was written with a record key."""
+    for entry in reversed(history if isinstance(history, list) else []):
+        if isinstance(entry, dict) and entry.get("hmac_key_id"):
+            return str(entry["hmac_key_id"])
+    return None
+
+
+def _tampered(path: Path, detail: str) -> MigrationError:
+    return MigrationError(f"{path}: migration record integrity check failed; it was changed "
+                          f"outside this tool. Restore the last tool-written revision. ({detail})")
+
+
+def _authenticate(path: Path, record: dict, content: bytes) -> None:
+    """With a key set, require a content_hmac that verifies; without one, refuse a signed record."""
+    key = _record_key()
+    mac = record.get("content_hmac")
+    signer = _history_signer(record.get("history"))
+    if key is None:
+        if mac is not None or signer is not None:
+            claimed = (mac.get("key_id") if isinstance(mac, dict) else None) or signer
+            raise MigrationError(f"{path}: migration record is authenticated with record key "
+                                 f"{claimed}; set {KEY_ENV} or {KEY_FILE_ENV} to that key to load it")
+        return
+    if mac is None:
+        if signer is not None:
+            raise _tampered(path, f"content_hmac is missing, but revisions were written with "
+                                  f"record key {signer}")
+        raise MigrationError(f"{path}: migration record is not authenticated, but a record key is "
+                             "set; a record written without a key is never trusted once one is set. "
+                             f"Continue a migration started without a key with neither {KEY_ENV} "
+                             f"nor {KEY_FILE_ENV} set")
+    key_id = _key_id(key)
+    if not isinstance(mac, dict) or mac.get("algorithm") != HMAC_ALGORITHM or \
+            not isinstance(mac.get("value"), str):
+        raise _tampered(path, "content_hmac is malformed")
+    if mac.get("key_id") != key_id:
+        raise MigrationError(f"{path}: migration record is authenticated with record key "
+                             f"{mac.get('key_id')}, not with the configured key {key_id}")
+    if not hmac.compare_digest(mac["value"].encode(), _content_hmac(key, content).encode()):
+        raise _tampered(path, "content_hmac does not verify with the record key")
+
+
+def _verify_history(path: Path, record: dict) -> None:
+    """Every link, every current-format entry hash, and the latest entry against the content."""
+    history, revision = record.get("history"), record.get("revision")
+    if not isinstance(history, list) or type(revision) is not int or revision < 1 or \
+            len(history) != revision:
+        raise _tampered(path, "history is incomplete")
+    if record.get("schema") == LEGACY_SCHEMA:
+        legacy = revision  # every entry predates per-entry body digests
+    elif record.get("legacy_history") is None:
+        legacy = 0  # created in the current format
+    else:
+        pinned = record["legacy_history"]
+        legacy = pinned.get("revisions") if isinstance(pinned, dict) else None
+        if type(legacy) is not int or not 0 < legacy < revision or \
+                pinned.get("sha256") != sha256(history[:legacy]):
+            raise _tampered(path, "legacy_history does not match the history")
+    previous = None
+    for index, entry in enumerate(history, 1):
+        if not isinstance(entry, dict) or entry.get("revision") != index:
+            problem = "the entry is missing or out of sequence"
+        elif entry.get("previous_sha256") != previous:
+            problem = "previous_sha256 does not match the previous entry"
+        elif ("body_sha256" in entry) != (index > legacy):
+            problem = "the entry format does not match the record"
+        elif index > legacy and entry.get("sha256") != _entry_digest(entry):
+            problem = "sha256 does not match the entry"
+        else:
+            previous = entry.get("sha256")
+            continue
+        raise _tampered(path, f"history chain is broken at revision {index}: {problem}")
+    head = history[-1]
+    if legacy < revision:
+        problem = None if head.get("body_sha256") == sha256(_body(record)) else \
+            "body_sha256 does not match the record"
+    else:
+        problem = None if head.get("sha256") == _legacy_entry_digest(head, record) else \
+            "sha256 does not match the entry and the record"
+    if problem:
+        raise _tampered(path, f"history chain is broken at revision {revision}: {problem}")
 
 
 def load(path: Path, migration: str | None = None) -> dict:
+    """Read a record and verify all of it; refuse anything this tool did not write."""
     try:
         text = Path(path).read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -133,22 +309,16 @@ def load(path: Path, migration: str | None = None) -> dict:
         record = json.loads(text)
     except ValueError as exc:
         raise MigrationError(f"{path}: migration record is not valid JSON") from exc
-    if not isinstance(record, dict) or record.get("schema") != SCHEMA:
+    if not isinstance(record, dict) or record.get("schema") not in (SCHEMA, LEGACY_SCHEMA):
         raise MigrationError(f"{path}: unsupported migration record schema")
-    if record.get("content_sha256") != _content_digest(record):
-        raise MigrationError(f"{path}: migration record integrity check failed; it was changed "
-                             "outside this tool. Restore the last tool-written revision.")
+    content = _content(record)
+    if record.get("content_sha256") != hashlib.sha256(content).hexdigest():
+        raise _tampered(path, "content_sha256 does not match the content")
+    _authenticate(path, record, content)
     if migration is not None and record.get("migration_id") != migration:
         raise MigrationError(f"{path}: record belongs to migration {record.get('migration_id')!r}, "
                              f"not {migration!r}; approvals never transfer between migrations")
-    history = record.get("history")
-    if not isinstance(history, list) or len(history) != record.get("revision"):
-        raise MigrationError(f"{path}: migration record history is incomplete")
-    previous = None
-    for index, entry in enumerate(history, 1):
-        if entry.get("revision") != index or entry.get("previous_sha256") != previous:
-            raise MigrationError(f"{path}: migration record history chain is broken at revision {index}")
-        previous = entry.get("sha256")
+    _verify_history(path, record)
     return record
 
 
@@ -183,42 +353,125 @@ def update(path: Path, migration: str, mutate: Callable[[dict], Any], *, mode: s
 
 
 def save(path: Path, record: dict, *, mode: str, status: str, **details: Any) -> dict:
-    """Write ``record`` as the next revision if nobody else wrote in between."""
+    """Write ``record`` as the next revision only if the file still holds the revision
+    ``record`` was read from.
+
+    The check compares the content digest as well as the revision number: a record
+    that was deleted and re-created, or restored from a copy, can reach the same
+    revision number with other content. A record whose file has gone is never
+    re-created from memory.
+    """
     path = Path(path)
     with _locked(path):
-        if path.exists():
+        if not path.exists():
+            if int(record.get("revision") or 0) > 0:
+                raise MigrationError(f"{path}: migration record is missing, but the record being "
+                                     f"saved is at revision {record.get('revision')}; it was moved or "
+                                     "deleted after it was read. Restore it, then re-run the command")
+        else:
             current = load(path, record.get("migration_id"))
             if current.get("revision") != record.get("revision"):
-                raise MigrationError(f"{path}: record changed concurrently (revision "
-                                     f"{current.get('revision')} on disk, {record.get('revision')} "
-                                     "in memory); re-run the command")
+                change = (f"revision {current.get('revision')} on disk, {record.get('revision')} "
+                          "in memory")
+            elif current.get("content_sha256") != record.get("content_sha256"):
+                change = f"revision {current.get('revision')} on disk has different content"
+            else:
+                change = None
+            if change:
+                raise MigrationError(f"{path}: record changed concurrently ({change}); "
+                                     "re-run the command")
         return _write(path, record, mode=mode, status=status, **details)
 
 
 def _write(path: Path, record: dict, *, mode: str, status: str, **details: Any) -> dict:
-    """Write the next revision atomically; history entries are never rewritten."""
+    """Write the next revision atomically and durably; history entries are never rewritten.
+
+    A schema /1 record is upgraded: its entries stay as they were written and are
+    pinned by ``legacy_history``, and every later entry is in the current format.
+    """
+    key = _record_key()
+    key_id = None if key is None else _key_id(key)
+    path = Path(path)
     record = copy.deepcopy(record)
+    history = record.setdefault("history", [])
+    signer = _history_signer(history)
+    if signer is not None and signer != key_id:
+        raise MigrationError(f"{path}: the record is authenticated with record key {signer}; "
+                             f"set {KEY_ENV} or {KEY_FILE_ENV} to that key to write it")
+    if record.get("schema") == LEGACY_SCHEMA and history:
+        record["legacy_history"] = {"schema": LEGACY_SCHEMA, "revisions": len(history),
+                                    "sha256": sha256(history)}
+    record.setdefault("legacy_history", None)
+    record.pop("content_hmac", None)
+    record["schema"] = SCHEMA
     record["revision"] = int(record.get("revision", 0)) + 1
     record["updated_at"] = timestamp()
     record["tool"] = tool_identity()
-    history = record.setdefault("history", [])
     entry = {
+        **details,
+        # The tool's own fields follow the writer's details, which never replace them.
         "revision": record["revision"], "mode": mode, "status": status,
         "at": record["updated_at"], "tool_version": TOOL_VERSION,
-        "tool_sources_digest": record["tool"]["sources_digest"],
-        "operator": operator(), **details,
+        "tool_sources_digest": record["tool"]["sources_digest"], "operator": operator(),
         "previous_sha256": history[-1]["sha256"] if history else None,
+        "body_sha256": sha256(_body(record)),
+        "hmac_key_id": key_id,
     }
-    body = {k: v for k, v in record.items() if k not in ("content_sha256", "history")}
-    entry["sha256"] = sha256([entry["previous_sha256"], body,
-                              {k: v for k, v in entry.items() if k != "sha256"}])
+    entry["sha256"] = _entry_digest(entry)
     history.append(entry)
-    record["content_sha256"] = _content_digest(record)
-    path = Path(path)
-    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    temporary.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
+    content = _content(record)
+    record["content_sha256"] = hashlib.sha256(content).hexdigest()
+    if key is not None:
+        record["content_hmac"] = {"algorithm": HMAC_ALGORITHM, "key_id": key_id,
+                                  "value": _content_hmac(key, content)}
+    _replace(path, (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8"))
     return record
+
+
+def _sync(fd: int) -> None:
+    """fsync, then F_FULLFSYNC where the platform has it: on macOS fsync alone can
+    leave the data in the drive's cache."""
+    os.fsync(fd)
+    full = getattr(fcntl, "F_FULLFSYNC", None)
+    if full is not None:
+        with contextlib.suppress(OSError):  # unsupported, e.g. on network filesystems
+            fcntl.fcntl(fd, full)
+
+
+def _sync_directory(directory: Path) -> None:
+    fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        _sync(fd)
+    finally:
+        os.close(fd)
+
+
+def _replace(path: Path, data: bytes) -> None:
+    """Replace ``path`` so that, even after a crash, it holds either the previous revision or
+    this one, complete. The temporary file never outlives a failure."""
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    replaced = False
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+                     0o666)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            _sync(handle.fileno())
+        _sync_directory(path.parent)
+        os.replace(temporary, path)
+        replaced = True
+        _sync_directory(path.parent)
+    except BaseException as exc:
+        if not replaced:
+            with contextlib.suppress(OSError):
+                temporary.unlink()
+        if not isinstance(exc, OSError):
+            raise
+        state = ("the new revision is in place but may not survive a crash" if replaced
+                 else "the previous revision is unchanged")
+        raise MigrationError(f"{path}: unable to write the migration record durably ({exc}); "
+                             f"{state}") from exc
 
 
 def latest(record: dict, *modes: str) -> dict | None:
