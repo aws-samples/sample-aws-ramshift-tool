@@ -5,8 +5,10 @@ import hashlib
 import json
 import re
 import urllib.request
+from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any
+from functools import lru_cache
+from typing import Any, NamedTuple
 
 import yaml
 from botocore.exceptions import ClientError
@@ -167,10 +169,13 @@ def policy_sha256(policy: Any) -> str:
 
 
 def _facets(policy: dict) -> dict[str, set[str]]:
+    """Literal values per effect, pooled across statements (no binding)."""
     facets: dict[str, set[str]] = {
         "actions": set(), "not_actions": set(), "resources": set(),
         "not_resources": set(), "conditions": set(), "principals": set()}
     for statement in policy.get("Statement", []):
+        if not isinstance(statement, dict):
+            continue  # reported by the statement-level analysis as unanalyzed
         effect = statement.get("Effect", "?")
         for key, facet in (("Action", "actions"), ("NotAction", "not_actions"),
                            ("Resource", "resources"), ("NotResource", "not_resources")):
@@ -185,9 +190,358 @@ def _facets(policy: dict) -> dict[str, set[str]]:
     return facets
 
 
+# Statement-level comparison. Facets pool values per effect, so they cannot say
+# which resources or conditions an action carried. Here each statement is split
+# into single-action atoms that keep the statement's resource scope, condition
+# and principal, and every (effect, action) is compared by the bindings that
+# apply to it before and after. Coverage is only ever proven, never assumed: a
+# wildcard, NotAction or NotResource the other version does not provably cover
+# is a difference. The analysis can report a change that is not one; it never
+# reports a broadening as unchanged.
+class _Binding(NamedTuple):
+    """What one atom applies to, apart from its action."""
+    resource: tuple    # ("Resource", glob) | ("NotResource", globs) | ("Unspecified", None)
+    condition: tuple   # ((operator, lower-case key, frozenset of values), ...); () = none
+    principal: tuple   # ("Principal"|"NotPrincipal", ((type, value), ...)) | ("Unspecified", None)
+    condition_text: str
+    principal_text: str
+
+
+_STATEMENT_KEYS = frozenset({"Effect", "Action", "NotAction", "Resource", "NotResource",
+                             "Condition", "Principal", "NotPrincipal"})
+# Operators whose values are alternatives (fewer values is stricter) and negated
+# operators whose values are exclusions (more values is stricter). Any other
+# operator is implied only by itself with identical values.
+_ANY_OF_OPERATORS = frozenset({
+    "StringEquals", "StringEqualsIgnoreCase", "StringLike", "NumericEquals",
+    "NumericLessThan", "NumericLessThanEquals", "NumericGreaterThan",
+    "NumericGreaterThanEquals", "DateEquals", "DateLessThan", "DateLessThanEquals",
+    "DateGreaterThan", "DateGreaterThanEquals", "Bool", "BinaryEquals", "IpAddress",
+    "ArnEquals", "ArnLike", "Null"})
+_NONE_OF_OPERATORS = frozenset({
+    "StringNotEquals", "StringNotEqualsIgnoreCase", "StringNotLike", "NumericNotEquals",
+    "DateNotEquals", "NotIpAddress", "ArnNotEquals", "ArnNotLike"})
+_UNANALYZED = "(unanalyzed statements)"
+
+
+def _compact(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+@lru_cache(maxsize=8192)
+def _glob_contains(outer: str, inner: str) -> bool:
+    """Every string glob ``inner`` matches is matched by glob ``outer`` (sound)."""
+    size = len(inner)
+    below = [j == size for j in range(size + 1)]
+    for symbol in reversed(outer):
+        row = [False] * (size + 1)
+        for j in range(size, -1, -1):
+            if symbol == "*":
+                row[j] = below[j] or (j < size and row[j + 1])
+            elif j < size and inner[j] != "*" and (symbol == "?" or inner[j] == symbol):
+                row[j] = below[j + 1]
+        below = row
+    return below[0]
+
+
+@lru_cache(maxsize=8192)
+def _glob_intersects(first: str, second: str) -> bool:
+    """Some string matches both globs; case-folded, '*' spans any character."""
+    first, second = first.lower(), second.lower()
+    seen: set[tuple[int, int]] = set()
+    pending = [(0, 0)]
+    while pending:
+        state = pending.pop()
+        if state in seen:
+            continue
+        seen.add(state)
+        i, j = state
+        if i == len(first) and j == len(second):
+            return True
+        a = first[i] if i < len(first) else None
+        b = second[j] if j < len(second) else None
+        if a == "*":
+            pending.append((i + 1, j))
+        if b == "*":
+            pending.append((i, j + 1))
+        if a is not None and b is not None and (a in "*?" or b in "*?" or a == b):
+            pending.append((i if a == "*" else i + 1, j if b == "*" else j + 1))
+    return False
+
+
+def _all_stars(pattern: str) -> bool:
+    return bool(pattern) and not pattern.strip("*")
+
+
+@lru_cache(maxsize=8192)
+def _pattern_contains(outer: str, inner: str, fold: bool) -> bool:
+    """Containment checked per ':' segment, which holds whether or not a
+    wildcard may span segments; IAM action names are case-insensitive."""
+    if fold:
+        outer, inner = outer.lower(), inner.lower()
+    if _all_stars(outer):
+        return True
+    outer_parts, inner_parts = outer.split(":"), inner.split(":")
+    return len(outer_parts) == len(inner_parts) and all(
+        _glob_contains(o, i) for o, i in zip(outer_parts, inner_parts))
+
+
+def _disjoint(pattern: str, excluded: tuple[str, ...]) -> bool:
+    return not any(_glob_intersects(pattern, other) for other in excluded)
+
+
+@lru_cache(maxsize=8192)
+def _action_covers(outer: tuple, inner: tuple) -> bool:
+    """Every action ``inner`` selects is selected by ``outer``."""
+    (outer_kind, outer_value), (inner_kind, inner_value) = outer, inner
+    if outer_kind == "Action":
+        return _pattern_contains(outer_value, inner_value, True) if inner_kind == "Action" \
+            else _all_stars(outer_value)
+    if inner_kind == "Action":
+        return _disjoint(inner_value, outer_value)
+    # NotAction covers NotAction when it excludes no more than the other one.
+    return all(any(_pattern_contains(i, o, True) for i in inner_value) for o in outer_value)
+
+
+def _resource_covers(outer: tuple, inner: tuple) -> bool:
+    """Every resource ``inner`` applies to is one ``outer`` applies to. A missing
+    Resource element means the share's own resources: only '*' covers them."""
+    (outer_kind, outer_value), (inner_kind, inner_value) = outer, inner
+    if outer_kind == "Unspecified":
+        return inner_kind == "Unspecified"
+    if outer_kind == "Resource":
+        return _pattern_contains(outer_value, inner_value, False) if inner_kind == "Resource" \
+            else _all_stars(outer_value)
+    if inner_kind == "Resource":
+        return _disjoint(inner_value, outer_value)
+    if inner_kind == "NotResource":
+        return all(any(_pattern_contains(i, o, False) for i in inner_value) for o in outer_value)
+    return False
+
+
+def _base_operator(operator: str) -> str:
+    for prefix in ("ForAllValues:", "ForAnyValue:"):
+        if operator.startswith(prefix):
+            operator = operator[len(prefix):]
+    return operator[:-len("IfExists")] if operator.endswith("IfExists") else operator
+
+
+def _condition_implies(strong: tuple, weak: tuple) -> bool:
+    """Every request that meets ``strong`` also meets ``weak`` (sound, not complete)."""
+    for operator, key, values in weak:
+        base = _base_operator(operator)
+        if not any(other_operator == operator and other_key == key and (
+                other_values == values
+                or (base in _ANY_OF_OPERATORS and other_values <= values)
+                or (base in _NONE_OF_OPERATORS and other_values >= values))
+                for other_operator, other_key, other_values in strong):
+            return False
+    return True
+
+
+def _principal_covers(outer: tuple, inner: tuple) -> bool:
+    (outer_kind, outer_value), (inner_kind, inner_value) = outer, inner
+    if outer_kind == "Principal" and ("*", "*") in outer_value:
+        return True
+    if outer_kind != inner_kind:
+        return False
+    if outer_kind == "Unspecified":
+        return True
+    if outer_kind == "Principal":
+        return all(p in outer_value or (p[0], "*") in outer_value for p in inner_value)
+    return set(outer_value) <= set(inner_value)    # NotPrincipal: excluding more is narrower
+
+
+def _binding_covers(outer: _Binding, inner: _Binding) -> bool:
+    return _resource_covers(outer.resource, inner.resource) and \
+        _condition_implies(inner.condition, outer.condition) and \
+        _principal_covers(outer.principal, inner.principal)
+
+
+def _strings(value: Any) -> tuple[str, ...] | None:
+    if isinstance(value, list) and value and all(isinstance(v, str) for v in value):
+        return tuple(sorted(set(value)))
+    return None
+
+
+def _principal_pairs(value: Any) -> tuple | None:
+    listed = _strings(value)
+    if listed is not None:                                   # "Principal": "*"
+        return tuple(("*", v) for v in listed)
+    if isinstance(value, dict) and value and all(_strings(v) is not None for v in value.values()):
+        return tuple(sorted((kind, v) for kind, values in value.items() for v in set(values)))
+    return None
+
+
+def _statement_parts(statement: Any) -> tuple[str, list[tuple], list[_Binding]] | None:
+    """(effect, action specs, bindings) of one normalized statement; None when
+    its shape is outside what this analysis evaluates."""
+    if not isinstance(statement, dict) or statement.get("Effect") not in ("Allow", "Deny") or \
+            set(statement) - _STATEMENT_KEYS or \
+            ("Action" in statement) == ("NotAction" in statement) or \
+            {"Resource", "NotResource"} <= set(statement) or \
+            {"Principal", "NotPrincipal"} <= set(statement):
+        return None
+    action_key = "Action" if "Action" in statement else "NotAction"
+    actions = _strings(statement[action_key])
+    if actions is None:
+        return None
+    specs = [(action_key, a) for a in actions] if action_key == "Action" \
+        else [(action_key, actions)]
+    scopes: list[tuple] = [("Unspecified", None)]
+    for resource_key in ("Resource", "NotResource"):
+        if resource_key in statement:
+            values = _strings(statement[resource_key])
+            if values is None:
+                return None
+            scopes = [(resource_key, v) for v in values] if resource_key == "Resource" \
+                else [(resource_key, values)]
+    condition = statement.get("Condition", {})
+    if not isinstance(condition, dict) or not all(
+            isinstance(operator, str) and isinstance(block, dict) and all(
+                isinstance(key, str) and isinstance(values, list) for key, values in block.items())
+            for operator, block in condition.items()):
+        return None
+    clauses = tuple(sorted(
+        ((operator, key.lower(), frozenset(_compact(v) for v in values))
+         for operator, block in condition.items() for key, values in block.items()),
+        key=lambda clause: (clause[0], clause[1], sorted(clause[2]))))
+    principal: tuple = ("Unspecified", None)
+    principal_text = ""
+    for principal_key in ("Principal", "NotPrincipal"):
+        if principal_key in statement:
+            pairs = _principal_pairs(statement[principal_key])
+            if pairs is None:
+                return None
+            principal = (principal_key, pairs)
+            principal_text = _compact(statement[principal_key])
+    condition_text = _compact(condition) if condition else ""
+    return statement["Effect"], specs, [
+        _Binding(scope, clauses, principal, condition_text, principal_text) for scope in scopes]
+
+
+def _access_model(policy: dict) -> tuple[dict, dict]:
+    """Per effect, action spec -> bindings; plus the statements left unanalyzed."""
+    grants: dict[str, dict[tuple, set[_Binding]]] = defaultdict(lambda: defaultdict(set))
+    unanalyzed: dict[str, set[str]] = defaultdict(set)
+    for statement in policy.get("Statement", []):
+        parts = _statement_parts(statement)
+        if parts is None:
+            effect = statement.get("Effect") if isinstance(statement, dict) else None
+            unanalyzed[effect if isinstance(effect, str) else "?"].add(
+                "statement " + _compact(statement))
+            continue
+        effect, specs, bindings = parts
+        for spec in specs:
+            grants[effect][spec].update(bindings)
+    return grants, unanalyzed
+
+
+def _action_label(spec: tuple) -> str:
+    kind, value = spec
+    return value if kind == "Action" else f"NotAction [{', '.join(value)}]"
+
+
+def _binding_texts(applicable: list[tuple[_Binding, str]]) -> list[str]:
+    """'on <resources> unconditionally|when <condition>[ for <principal>][ via <action>]'."""
+    scopes: dict[tuple, set[str]] = defaultdict(set)
+    for binding, via in applicable:
+        kind, value = binding.resource
+        if kind == "Unspecified":
+            scope = "the shared resources"
+        elif kind == "Resource":
+            scope = value
+        else:
+            scope = f"NotResource [{', '.join(value)}]"
+        key = (binding.condition_text, binding.principal[0], binding.principal_text, via)
+        scopes[key].add(scope)
+    texts = []
+    for (condition, principal_kind, principal, via), names in scopes.items():
+        text = f"on {' or '.join(sorted(names))} " + (
+            f"when {condition}" if condition else "unconditionally")
+        if principal:
+            text += f" for {principal_kind} {principal}"
+        texts.append(text + (f" via {via}" if via else ""))
+    return sorted(texts)
+
+
+def _access_status(more: bool, less: bool) -> str:
+    return "CHANGED" if more and less else "BROADENED" if more else \
+        "NARROWED" if less else "UNCHANGED"
+
+
+def _access_changes(old: dict, new: dict) -> list[dict]:
+    """One entry per (effect, action): the bindings that apply to it before and
+    after, and whether access is BROADENED, NARROWED, CHANGED or UNCHANGED."""
+    (old_grants, old_other), (new_grants, new_other) = _access_model(old), _access_model(new)
+
+    def applicable(grants: dict, spec: tuple) -> list[tuple[_Binding, str]]:
+        # Bindings of every statement action that includes all of ``spec``.
+        return [(binding, "" if other == spec else _action_label(other))
+                for other, bindings in grants.items() if _action_covers(other, spec)
+                for binding in bindings]
+    entries = []
+    for effect in sorted(set(old_grants) | set(new_grants)):
+        prior, current = old_grants.get(effect, {}), new_grants.get(effect, {})
+        for spec in sorted(set(prior) | set(current), key=lambda s: (_action_label(s), s[0])):
+            before, after = applicable(prior, spec), applicable(current, spec)
+            gained = any(not any(_binding_covers(o, n) for o, _ in before) for n, _ in after)
+            lost = any(not any(_binding_covers(n, o) for n, _ in after) for o, _ in before)
+            # A Deny that applies to less grants more, and one that applies to more grants less.
+            more, less = (lost, gained) if effect == "Deny" else (gained, lost)
+            entries.append({"effect": effect, "action": _action_label(spec),
+                            "status": _access_status(more, less),
+                            "before": _binding_texts(before), "after": _binding_texts(after)})
+    for effect in sorted(set(old_other) | set(new_other)):
+        before, after = sorted(old_other.get(effect, ())), sorted(new_other.get(effect, ()))
+        # Compared verbatim: a statement outside the analysis may grant anything.
+        entries.append({"effect": effect, "action": _UNANALYZED,
+                        "status": "UNCHANGED" if before == after else "CHANGED",
+                        "before": before, "after": after})
+    return entries
+
+
+def _access_label(entry: dict) -> str:
+    label = f"{entry.get('effect')} {entry.get('action')}"
+    status = entry.get("status")
+    if entry.get("effect") != "Deny" or status == "UNCHANGED":
+        return label
+    note = {"BROADENED": "deny weakened" if entry.get("after") else "deny removed",
+            "NARROWED": "deny strengthened" if entry.get("before") else "deny added"}.get(
+                status, "deny changed")
+    return f"{label} ({note})"
+
+
+def _access_summary(access: list[dict]) -> str:
+    """'grants more: ...' and/or 'grants less: ...', or 'no semantic change'.
+    CHANGED counts both ways; an unknown status counts as granting more."""
+    more = [_access_label(e) for e in access if e.get("status") not in ("UNCHANGED", "NARROWED")]
+    less = [_access_label(e) for e in access if e.get("status") in ("NARROWED", "CHANGED")]
+    return "; ".join(f"grants {direction}: {', '.join(labels)}"
+                     for direction, labels in (("more", more), ("less", less)) if labels) \
+        or "no semantic change"
+
+
+def _access_line(entry: dict) -> str:
+    action = str(entry.get("action"))
+    absent = "not denied" if entry.get("effect") == "Deny" else "not granted"
+    if action == _UNANALYZED:
+        absent = "none"
+    elif "*" in action or "?" in action or action.startswith("NotAction "):
+        absent += " as a whole"
+
+    def side(texts: Any) -> str:
+        return " or ".join(map(str, texts)) if texts else absent
+    return (f"{entry.get('status')} {entry.get('effect')} {action}: "
+            f"before {side(entry.get('before'))}; after {side(entry.get('after'))}")
+
+
 def policy_difference(before: Any, after: Any) -> dict:
     """What a managed-permission version change grants or withdraws.
 
+    ``access`` keeps statement binding: per (effect, action), the resources and
+    conditions it applies to before and after and whether access is BROADENED,
+    NARROWED, CHANGED or UNCHANGED; ``summary`` states the overall direction.
     Facets are per effect so an added Deny is never shown as an added grant;
     the exact added/removed statements are kept for statement-level review.
     """
@@ -203,6 +557,8 @@ def policy_difference(before: Any, after: Any) -> dict:
     old_s, new_s = statements(old), statements(new)
     result["statements_added"] = [new_s[k] for k in sorted(set(new_s) - set(old_s))]
     result["statements_removed"] = [old_s[k] for k in sorted(set(old_s) - set(new_s))]
+    result["access"] = _access_changes(old, new)
+    result["summary"] = _access_summary(result["access"])
     return result
 
 
@@ -231,14 +587,34 @@ def approved_change(change: dict) -> dict:
 
 
 def describe_difference(difference: dict) -> list[str]:
-    """Operator-facing lines for a permission comparison; empty facets omitted."""
-    lines = []
-    for facet in ("actions", "not_actions", "resources", "not_resources",
-                  "conditions", "principals"):
-        for verb in ("added", "removed"):
-            for value in difference.get(f"{facet}_{verb}", []):
-                lines.append(f"{facet.replace('_', '-')} {verb}: {value}")
-    return lines or ["no facet-level difference; statements differ only in structure"]
+    """Operator-facing lines for a permission comparison.
+
+    The first line states the direction: ``grants more: ...`` and/or ``grants
+    less: ...``, or ``no semantic change``. Then one line per (effect, action)
+    whose access changed, with what it applies to before and after, the
+    unchanged ones, and the per-effect facets (empty facets omitted).
+    """
+    facets = [f"{facet.replace('_', '-')} {verb}: {value}"
+              for facet in ("actions", "not_actions", "resources", "not_resources",
+                            "conditions", "principals")
+              for verb in ("added", "removed")
+              for value in difference.get(f"{facet}_{verb}", [])]
+    access = difference.get("access")
+    if not isinstance(access, list) or not all(isinstance(e, dict) for e in access):
+        # Recorded without the statement-level analysis: bindings are unknown.
+        return ["grants more: not ruled out; this comparison has no statement-level "
+                "analysis, re-run plan --record before approving", *facets]
+    lines = [_access_summary(access)]
+    lines += [_access_line(e) for e in access if e.get("status") != "UNCHANGED"]
+    unchanged = [_access_label(e) for e in access if e.get("status") == "UNCHANGED"]
+    if unchanged:
+        lines.append("unchanged access: " + ", ".join(unchanged))
+    lines += facets
+    if lines[0] == "no semantic change" and not facets and (
+            difference.get("statements_added") or difference.get("statements_removed")):
+        lines.append("statements differ only in structure; every action keeps the same "
+                     "resources and conditions")
+    return lines
 
 
 def permission_snapshot(ram: Any, arn: str, version: str | None = None) -> dict:

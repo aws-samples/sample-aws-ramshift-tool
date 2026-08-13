@@ -1287,7 +1287,9 @@ NARROWER = {"Version": "2012-10-17", "Statement": [{
 def test_tgw_v2_to_v3_comparison_shows_only_client_vpn_endpoint():
     difference = policy_difference(TGW_V2, TGW_V3)
     assert difference["actions_added"] == ["Allow ec2:CreateClientVpnEndpoint"]
-    assert describe_difference(difference) == ["actions added: Allow ec2:CreateClientVpnEndpoint"]
+    lines = describe_difference(difference)
+    assert lines[0] == "grants more: Allow ec2:CreateClientVpnEndpoint"
+    assert lines[-1] == "actions added: Allow ec2:CreateClientVpnEndpoint"
     assert policy_sha256(TGW_V2) != policy_sha256(TGW_V3)
     assert policy_sha256(TGW_V3) == policy_sha256({"Statement": [TGW_V3]})  # shape-independent
 
@@ -1496,3 +1498,355 @@ def test_stationary_owner_with_unrelated_consumers_only_excludes_them(clients):
                        migrating_owners=set()).inspect(OWNER, REGION)
     assert not result.blocked and result.groups[0].consumers == (CONSUMER,)
     assert any("unrelated consumers outside migration population" in e for e in result.excluded)
+
+
+# ---------------------------------------------------------------------------
+# Statement-level permission comparison: bindings, wildcards, Deny
+# ---------------------------------------------------------------------------
+ORG = {"StringEquals": {"aws:PrincipalOrgID": "o-abc123"}}
+ORG_TEXT = '{"StringEquals":{"aws:PrincipalOrgID":["o-abc123"]}}'
+DESCRIBE, ATTACH = "ec2:DescribeTransitGateways", "ec2:CreateTransitGatewayVpcAttachment"
+ONLY = "arn:aws:a:us-east-1:000000000001:thing/only"
+FACETS = ("actions", "not_actions", "resources", "not_resources", "conditions", "principals")
+STRUCTURE_ONLY = ("statements differ only in structure; every action keeps the same "
+                  "resources and conditions")
+
+
+def allow(action, **extra):
+    return {"Effect": "Allow", "Action": action, **extra}
+
+
+def deny(action, **extra):
+    return {"Effect": "Deny", "Action": action, **extra}
+
+
+def access(before, after):
+    """{(effect, action): status} for every (effect, action) the comparison reports."""
+    return {(e["effect"], e["action"]): e["status"]
+            for e in policy_difference(before, after)["access"]}
+
+
+def changes(before, after):
+    return {k: v for k, v in access(before, after).items() if v != "UNCHANGED"}
+
+
+def comparison(before, after):
+    return describe_difference(policy_difference(before, after))
+
+
+def test_real_tgw_v2_to_v3_reports_exactly_client_vpn_endpoint_as_a_broadening():
+    v3 = LIVE_PERMISSIONS[TGW][2]                         # GetPermission's live v3 text
+    v2 = json.dumps({"Effect": "Allow", "Action": [
+        a for a in json.loads(v3)["Action"] if a != "ec2:CreateClientVpnEndpoint"]})
+    assert (policy_sha256(v2), policy_sha256(v3)) == (policy_sha256(TGW_V2), policy_sha256(TGW_V3))
+    difference = policy_difference(v2, v3)
+    assert changes(v2, v3) == {("Allow", "ec2:CreateClientVpnEndpoint"): "BROADENED"}
+    assert difference["summary"] == "grants more: Allow ec2:CreateClientVpnEndpoint"
+    assert describe_difference(difference) == [
+        "grants more: Allow ec2:CreateClientVpnEndpoint",
+        "BROADENED Allow ec2:CreateClientVpnEndpoint: before not granted; "
+        "after on the shared resources unconditionally",
+        "unchanged access: Allow ec2:CreateTransitGatewayVpcAttachment, "
+        "Allow ec2:DeleteTransitGatewayVpcAttachment, Allow ec2:DescribeTransitGateways, "
+        "Allow ec2:ModifyTransitGatewayVpcAttachment, Allow network-firewall:CreateFirewall",
+        "actions added: Allow ec2:CreateClientVpnEndpoint"]
+
+
+def test_discovery_blocker_and_recorded_change_lead_with_the_direction(clients):
+    cs, stubs = clients
+    stub_changed_share(stubs)
+    result = inspect_with(cs, [])
+    change, = result.permission_changes
+    assert change["difference"]["summary"] == \
+        "grants more: Allow route53resolver:AssociateResolverRule"
+    assert (f"{PERMISSION} v1->v2 (grants more: Allow route53resolver:AssociateResolverRule, "
+            "BROADENED Allow route53resolver:AssociateResolverRule: before not granted; "
+            "after on * unconditionally, ") in result.blocked[0]
+
+
+def test_dropped_condition_is_shown_as_a_broadening_with_both_bindings():
+    before = [allow([DESCRIBE], Condition=ORG), allow([ATTACH], Condition=ORG)]
+    after = [allow([DESCRIBE], Condition=ORG), allow([ATTACH])]
+    assert comparison(before, after) == [
+        f"grants more: Allow {ATTACH}",
+        f"BROADENED Allow {ATTACH}: before on the shared resources when {ORG_TEXT}; "
+        "after on the shared resources unconditionally",
+        f"unchanged access: Allow {DESCRIBE}"]
+
+
+@pytest.mark.parametrize("before,after,expected", [
+    # The second statement drops the organization condition.
+    ([allow([DESCRIBE], Condition=ORG), allow([ATTACH], Condition=ORG)],
+     [allow([DESCRIBE], Condition=ORG), allow([ATTACH])], {("Allow", ATTACH): "BROADENED"}),
+    # An action moves out of its conditioned statement into an unconditioned one.
+    (allow([DESCRIBE, ATTACH], Condition=ORG),
+     [allow([DESCRIBE], Condition=ORG), allow([ATTACH])], {("Allow", ATTACH): "BROADENED"}),
+    # An unconditioned twin joins the conditioned statement.
+    (allow("a:X", Condition=ORG), [allow("a:X", Condition=ORG), allow("a:X")],
+     {("Allow", "a:X"): "BROADENED"}),
+    # The condition moves from a:Write to a:Read.
+    ([allow("a:Write", Condition=ORG), allow("a:Read")],
+     [allow("a:Read", Condition=ORG), allow("a:Write")],
+     {("Allow", "a:Write"): "BROADENED", ("Allow", "a:Read"): "NARROWED"}),
+])
+def test_moved_conditions_are_compared_per_action_not_reported_as_structure(
+        before, after, expected):
+    difference = policy_difference(before, after)
+    assert policy_sha256(before) != policy_sha256(after)
+    # Pooled facets cannot see these changes at all.
+    assert not any(difference[f"{facet}_{verb}"] for facet in FACETS for verb in ("added", "removed"))
+    assert changes(before, after) == expected
+    lines = describe_difference(difference)
+    assert lines[0].startswith("grants more: ")
+    assert not any("structure" in line or "no facet-level" in line for line in lines)
+
+
+def test_resource_widening_for_one_action_is_a_broadening_not_a_removal():
+    before = [allow("a:Read", Resource="*"), allow("a:Write", Resource=ONLY)]
+    after = allow(["a:Read", "a:Write"], Resource="*")
+    difference = policy_difference(before, after)
+    assert difference["resources_removed"] == [f"Allow {ONLY}"]    # alone, reads as a narrowing
+    assert changes(before, after) == {("Allow", "a:Write"): "BROADENED"}
+    assert describe_difference(difference) == [
+        "grants more: Allow a:Write",
+        f"BROADENED Allow a:Write: before on {ONLY} unconditionally; after on * unconditionally",
+        "unchanged access: Allow a:Read",
+        f"resources removed: Allow {ONLY}"]
+
+
+@pytest.mark.parametrize("narrow,wide", [
+    (ONLY, "arn:aws:a:us-east-1:000000000001:thing/*"),
+    (ONLY, "arn:aws:a:*:000000000001:thing/only"),
+    ("arn:aws:a:us-east-1:000000000001:thing/*", "*"),
+])
+def test_resource_wildcards_widen_and_narrow_one_action(narrow, wide):
+    assert changes(allow("a:X", Resource=narrow), allow("a:X", Resource=wide)) == {
+        ("Allow", "a:X"): "BROADENED"}
+    assert changes(allow("a:X", Resource=wide), allow("a:X", Resource=narrow)) == {
+        ("Allow", "a:X"): "NARROWED"}
+
+
+@pytest.mark.parametrize("wildcard", ["ec2:*", "*", "ec2:Describe*", "ec2:*TransitGateway*"])
+def test_a_new_wildcard_action_is_a_broadening_and_the_covered_action_stays_granted(wildcard):
+    before, after = allow([DESCRIBE]), allow([wildcard])
+    assert access(before, after) == {("Allow", wildcard): "BROADENED",
+                                     ("Allow", DESCRIBE): "UNCHANGED"}
+    lines = comparison(before, after)
+    assert lines[:3] == [
+        f"grants more: Allow {wildcard}",
+        f"BROADENED Allow {wildcard}: before not granted as a whole; "
+        "after on the shared resources unconditionally",
+        f"unchanged access: Allow {DESCRIBE}"]
+    assert f"actions removed: Allow {DESCRIBE}" in lines          # the facet line is kept
+
+
+def test_not_action_grant_is_a_broadening_although_the_listed_actions_disappear():
+    before = allow([DESCRIBE, ATTACH])
+    after = {"Effect": "Allow", "NotAction": ["ec2:DeleteTransitGateway"]}
+    difference = policy_difference(before, after)
+    assert difference["actions_removed"] == [f"Allow {ATTACH}", f"Allow {DESCRIBE}"]
+    assert changes(before, after) == {
+        ("Allow", "NotAction [ec2:DeleteTransitGateway]"): "BROADENED"}
+    assert describe_difference(difference)[:3] == [
+        "grants more: Allow NotAction [ec2:DeleteTransitGateway]",
+        "BROADENED Allow NotAction [ec2:DeleteTransitGateway]: before not granted as a whole; "
+        "after on the shared resources unconditionally",
+        f"unchanged access: Allow {ATTACH}, Allow {DESCRIBE}"]
+
+
+@pytest.mark.parametrize("before,after,expected", [
+    # A NotAction that excludes less grants more.
+    ({"Effect": "Allow", "NotAction": ["iam:*", "ec2:Delete*"]},
+     {"Effect": "Allow", "NotAction": ["iam:*"]},
+     {("Allow", "NotAction [iam:*]"): "BROADENED",
+      ("Allow", "NotAction [ec2:Delete*, iam:*]"): "UNCHANGED"}),
+    # NotResource replaces one named resource.
+    (allow("a:X", Resource=ONLY),
+     allow("a:X", NotResource="arn:aws:a:us-east-1:000000000001:thing/secret"),
+     {("Allow", "a:X"): "BROADENED"}),
+    # NotResource replaces the share's own resources, which it never provably covers.
+    (allow("a:X"), allow("a:X", NotResource=ONLY), {("Allow", "a:X"): "CHANGED"}),
+])
+def test_not_action_and_not_resource_are_treated_conservatively(before, after, expected):
+    assert access(before, after) == expected
+    assert comparison(before, after)[0].startswith("grants more: ")
+
+
+def test_removing_a_deny_is_a_broadening():
+    granted = allow("ec2:*TransitGateway*")
+    before = [granted, deny("ec2:Delete*")]
+    difference = policy_difference(before, granted)
+    assert difference["actions_removed"] == ["Deny ec2:Delete*"]      # the only facet line
+    assert changes(before, granted) == {("Deny", "ec2:Delete*"): "BROADENED"}
+    assert describe_difference(difference) == [
+        "grants more: Deny ec2:Delete* (deny removed)",
+        "BROADENED Deny ec2:Delete*: before on the shared resources unconditionally; "
+        "after not denied as a whole",
+        "unchanged access: Allow ec2:*TransitGateway*",
+        "actions removed: Deny ec2:Delete*"]
+
+
+@pytest.mark.parametrize("after,expected,first", [
+    # The Deny gains a condition, so it denies less.
+    ([allow("ec2:*"), deny("ec2:Delete*", Condition=ORG)],
+     {("Deny", "ec2:Delete*"): "BROADENED"}, "grants more: Deny ec2:Delete* (deny weakened)"),
+    # The Deny shrinks to one action: ec2:Delete* as a whole is no longer denied.
+    ([allow("ec2:*"), deny("ec2:DeleteTransitGateway")],
+     {("Deny", "ec2:Delete*"): "BROADENED"}, "grants more: Deny ec2:Delete* (deny removed)"),
+    ([allow("ec2:*")], {("Deny", "ec2:Delete*"): "BROADENED"},
+     "grants more: Deny ec2:Delete* (deny removed)"),
+])
+def test_a_deny_that_applies_to_less_grants_more(after, expected, first):
+    before = [allow("ec2:*"), deny("ec2:Delete*")]
+    assert changes(before, after) == expected
+    assert comparison(before, after)[0] == first
+
+
+@pytest.mark.parametrize("condition,status", [
+    (None, "BROADENED"),                                                        # removed
+    ({"StringEquals": {"aws:PrincipalOrgID": ["o-abc123", "o-other"]}}, "BROADENED"),
+    ({"StringLike": {"aws:PrincipalOrgID": "o-*"}}, "CHANGED"),                  # other operator
+    ({"StringEquals": {"aws:PrincipalOrgID": "o-other"}}, "CHANGED"),             # other value
+    ({"StringEqualsIfExists": {"aws:PrincipalOrgID": "o-abc123"}}, "CHANGED"),    # passes if absent
+    ({"StringEquals": {"aws:principalorgid": "o-abc123"}}, "UNCHANGED"),          # key case
+    ({**ORG, "Bool": {"aws:SecureTransport": "true"}}, "NARROWED"),              # one more clause
+])
+def test_allow_condition_changes_are_classified_by_what_they_admit(condition, status):
+    before = allow("a:X", Condition=ORG)
+    after = allow("a:X", **({"Condition": condition} if condition else {}))
+    assert access(before, after) == {("Allow", "a:X"): status}
+    assert comparison(before, after)[0] == {
+        "BROADENED": "grants more: Allow a:X",
+        "CHANGED": "grants more: Allow a:X; grants less: Allow a:X",
+        "NARROWED": "grants less: Allow a:X",
+        "UNCHANGED": "no semantic change"}[status]
+
+
+def test_negated_condition_values_are_exclusions():
+    fewer = allow("a:X", Condition={"StringNotEquals": {"aws:PrincipalOrgID": ["o-x"]}})
+    more = allow("a:X", Condition={"StringNotEquals": {"aws:PrincipalOrgID": ["o-x", "o-y"]}})
+    assert access(fewer, more) == {("Allow", "a:X"): "NARROWED"}
+    assert access(more, fewer) == {("Allow", "a:X"): "BROADENED"}
+
+
+def test_principal_widening_is_a_broadening():
+    one = allow("a:X", Principal={"AWS": f"arn:aws:iam::{CONSUMER}:root"})
+    everyone = allow("a:X", Principal="*")
+    assert access(one, everyone) == {("Allow", "a:X"): "BROADENED"}
+    assert access(everyone, one) == {("Allow", "a:X"): "NARROWED"}
+
+
+def test_reordering_and_sid_changes_are_no_semantic_change():
+    before = {"Version": "2012-10-17", "Id": "first", "Statement": [
+        {"Sid": "Read", "Effect": "Allow", "Action": ["a:Read", "a:List"], "Resource": "*",
+         "Condition": ORG},
+        {"Sid": "Write", "Effect": "Allow", "Action": "a:Write", "Resource": ONLY}]}
+    after = {"Version": "2012-10-17", "Id": "second", "Statement": [
+        {"Sid": "W", "Resource": [ONLY], "Action": ["a:Write"], "Effect": "Allow"},
+        {"Sid": "R", "Condition": {"StringEquals": {"aws:PrincipalOrgID": ["o-abc123"]}},
+         "Action": ["a:List", "a:Read"], "Resource": ["*"], "Effect": "Allow"}]}
+    difference = policy_difference(before, after)
+    assert difference["summary"] == "no semantic change"
+    assert describe_difference(difference) == [
+        "no semantic change", "unchanged access: Allow a:List, Allow a:Read, Allow a:Write"]
+
+
+@pytest.mark.parametrize("after", [
+    # The statement is split per action.
+    [allow("a:Read", Resource="*", Condition=ORG), allow("a:List", Resource="*", Condition=ORG),
+     allow("a:Write", Resource=ONLY)],
+    # A redundant, narrower statement is added.
+    [allow(["a:Read", "a:List"], Resource="*", Condition=ORG), allow("a:Write", Resource=ONLY),
+     allow("a:Read", Resource=ONLY, Condition=ORG)],
+])
+def test_structure_only_changes_are_no_semantic_change(after):
+    before = [allow(["a:Read", "a:List"], Resource="*", Condition=ORG),
+              allow("a:Write", Resource=ONLY)]
+    assert policy_sha256(before) != policy_sha256(after)
+    lines = comparison(before, after)
+    assert (lines[0], lines[-1]) == ("no semantic change", STRUCTURE_ONLY)
+
+
+@pytest.mark.parametrize("before,after", [
+    (allow([DESCRIBE]), allow(["EC2:describeTransitGateways"])),   # action names ignore case
+    (allow(["ec2:*"]), allow(["ec2:*", "ec2:CreateClientVpnEndpoint"])),   # already covered
+])
+def test_equivalent_action_lists_are_no_semantic_change(before, after):
+    assert comparison(before, after)[0] == "no semantic change"
+
+
+@pytest.mark.parametrize("before,after,expected,first", [
+    (TGW_V3, TGW_V2, {("Allow", "ec2:CreateClientVpnEndpoint"): "NARROWED"},
+     "grants less: Allow ec2:CreateClientVpnEndpoint"),
+    (allow("ec2:*"), allow("ec2:Describe*"), {("Allow", "ec2:*"): "NARROWED"},
+     "grants less: Allow ec2:*"),
+    (allow("*"), {"Effect": "Allow", "NotAction": "iam:*"}, {("Allow", "*"): "NARROWED"},
+     "grants less: Allow *"),
+    (allow("a:X", Resource="*"), allow("a:X", Resource=ONLY), {("Allow", "a:X"): "NARROWED"},
+     "grants less: Allow a:X"),
+    (allow("a:X"), allow("a:X", Condition=ORG), {("Allow", "a:X"): "NARROWED"},
+     "grants less: Allow a:X"),
+    (allow("a:X", Condition={"StringEquals": {"aws:PrincipalOrgID": ["o-abc123", "o-other"]}}),
+     allow("a:X", Condition=ORG), {("Allow", "a:X"): "NARROWED"}, "grants less: Allow a:X"),
+    (allow("ec2:*"), [allow("ec2:*"), deny("ec2:Delete*")],
+     {("Deny", "ec2:Delete*"): "NARROWED"}, "grants less: Deny ec2:Delete* (deny added)"),
+    # A Deny that loses its condition denies everywhere.
+    ([allow("ec2:*"), deny("ec2:Delete*", Condition=ORG)], [allow("ec2:*"), deny("ec2:Delete*")],
+     {("Deny", "ec2:Delete*"): "NARROWED"}, "grants less: Deny ec2:Delete* (deny strengthened)"),
+])
+def test_narrowings_are_reported_as_grants_less(before, after, expected, first):
+    assert changes(before, after) == expected
+    assert comparison(before, after)[0] == first
+
+
+def test_mixed_change_lists_what_it_grants_more_and_less():
+    before = {"Statement": [{"Effect": "Allow", "Action": ["a:One", "a:Two"], "Resource": "*",
+                             "Condition": {"StringEquals": {"aws:PrincipalOrgID": "o-first"}}}]}
+    after = {"Statement": [{"Effect": "Allow", "Action": ["a:One"], "Resource": "arn:x",
+                            "Condition": {"StringEquals": {"aws:PrincipalOrgID": "o-other"}}},
+                           {"Effect": "Deny", "Action": ["a:Two"], "Resource": "*"}]}
+    assert access(before, after) == {("Allow", "a:One"): "CHANGED", ("Allow", "a:Two"): "NARROWED",
+                                     ("Deny", "a:Two"): "NARROWED"}
+    assert comparison(before, after)[0] == (
+        "grants more: Allow a:One; grants less: Allow a:One, Allow a:Two, Deny a:Two (deny added)")
+
+
+def test_statements_outside_the_analysis_count_as_possible_broadenings():
+    plain = {"Statement": [allow("a:X")]}
+    odd = {"Statement": [allow("a:X"), {"Effect": "Allow", "Action": "a:Y", "Condition": "o-x"}]}
+    assert access(plain, odd) == {("Allow", "a:X"): "UNCHANGED",
+                                  ("Allow", "(unanalyzed statements)"): "CHANGED"}
+    assert comparison(plain, odd)[0].startswith("grants more: Allow (unanalyzed statements)")
+    assert comparison(odd, odd)[0] == "no semantic change"
+
+
+def test_a_comparison_without_statement_analysis_never_claims_no_difference():
+    # A difference recorded by an earlier tool version has facets only.
+    first = ("grants more: not ruled out; this comparison has no statement-level analysis, "
+             "re-run plan --record before approving")
+    assert describe_difference({"actions_added": [], "statements_added": [allow("a:X")]}) == [first]
+    assert describe_difference({"actions_added": ["Allow a:X"]}) == [
+        first, "actions added: Allow a:X"]
+
+
+def test_statement_analysis_leaves_policy_hashes_and_approval_binding_unchanged():
+    from ram_migration_record import sha256 as record_sha256
+    # Pinned before the statement-level analysis existed; approvals bind these hashes.
+    assert (policy_sha256(TGW_V2), policy_sha256(TGW_V3)) == (
+        "64e8120f3145bc9c1c1e1a7bc2d8e128279857821fabbc992da813be98c778e3",
+        "365d19f67b097460189056474e8d18cdf27c8330f733e28f2ec5a397b74dd08c")
+    change = expected_change()
+    assert (change["from_policy_sha256"], change["to_policy_sha256"]) == (
+        "44ddeb77e186963124f751a3a4f51f4f4017d9adeeaf7c34a424e7250b55a27c",
+        "5a209dca3e4277c7d7b835f1b1aed878897e3da43ce1134cff256444c235fd1f")
+    request, = permission_requests(MIGRATION, [change])
+    assert request["id"] == "pc-7e317668eab8c023"
+    granted = approve_permission_change({"migration_id": MIGRATION, "revision": 0}, request)
+    assert sorted(granted) == [
+        "approval_id", "approved_at", "approved_by", "approved_in_revision", "basis",
+        "difference_sha256", "from_policy_sha256", "from_version", "migration_id",
+        "permission_arn", "resource_type", "shares", "to_policy_sha256", "to_version"]
+    # The approval still hashes the comparison it displayed, now including the summary.
+    assert granted["difference_sha256"] == record_sha256(request["difference"])
+    assert request["difference"]["summary"] == \
+        "grants more: Allow route53resolver:AssociateResolverRule"
