@@ -1196,7 +1196,7 @@ def test_unsettled_or_failed_source_shares_still_block(clients, status):
         live_share(SOURCE, status)]}, {"resourceOwner": "SELF"})
     result = inspect(cs)
     assert not result.groups and not result.excluded
-    assert result.blocked == [f"{SOURCE}: source status {status}"]
+    assert result.blocked == [f"{SOURCE}: owner={OWNER} region={REGION} source status {status}"]
 
 
 @pytest.mark.parametrize("status", [
@@ -1208,7 +1208,7 @@ def test_explicit_owner_side_resource_status_still_blocks(clients, status):
     stub_live_source(stubs, SOURCE, [live_resource(status=status)])
     result = inspect(cs)
     assert not result.groups
-    assert result.blocked == [f"{SOURCE}: {RESOURCE}: resource status {status}"]
+    assert result.blocked == [f"{SOURCE}: owner={OWNER} region={REGION} {RESOURCE}: resource status {status}"]
 
 
 @pytest.mark.parametrize("status", [None, "UNAVAILABLE"])
@@ -1850,3 +1850,175 @@ def test_statement_analysis_leaves_policy_hashes_and_approval_binding_unchanged(
     assert granted["difference_sha256"] == record_sha256(request["difference"])
     assert request["difference"]["summary"] == \
         "grants more: Allow route53resolver:AssociateResolverRule"
+
+
+
+# ---------------------------------------------------------------------------
+# Scale: one run cache for planning reads; rechecks and writes read fresh
+# ---------------------------------------------------------------------------
+from botocore.awsrequest import AWSResponse  # noqa: E402
+from botocore.exceptions import ClientError  # noqa: E402
+
+from ram_migration_common import CONFIG, pages  # noqa: E402
+from ram_migration_discovery import LookupCache  # noqa: E402
+
+
+def stub_shared_stack_shares(stubs, count=2):
+    """Shares from one owning stack with one managed permission: each read once."""
+    arns = [f"{SOURCE}-{index}" for index in range(count)]
+    resources = [f"{RESOURCE}-{index}" for index in range(count)]
+    ram, cfn = stubs["ram"], stubs["cloudformation"]
+    ram.add_response("get_resource_shares", {"resourceShares": [
+        {"resourceShareArn": arn, "owningAccountId": OWNER, "status": "ACTIVE", "tags": []}
+        for arn in arns]}, {"resourceOwner": "SELF"})
+    template = {"Resources": {f"Share{index}": {"Type": "AWS::RAM::ResourceShare",
+                                                "Properties": {"Principals": [CONSUMER]}}
+                              for index in range(count)}}
+    for index, (arn, resource_arn) in enumerate(zip(arns, resources)):
+        ram.add_response("list_resources", {"resources": [resource(resource_arn)]},
+                         {"resourceOwner": "SELF", "resourceShareArns": [arn]})
+        ram.add_response("get_resource_share_associations", {"resourceShareAssociations": [
+            association(CONSUMER, "PRINCIPAL", share=arn)]},
+            {"associationType": "PRINCIPAL", "resourceShareArns": [arn]})
+        cfn.add_response("describe_stack_resources", {"StackResources": [{
+            "StackId": STACK_ID, "StackName": "offline", "LogicalResourceId": f"Share{index}",
+            "PhysicalResourceId": arn, "ResourceType": "AWS::RAM::ResourceShare",
+            "Timestamp": "2026-10-13T00:00:00Z", "ResourceStatus": "CREATE_COMPLETE"}]},
+            {"PhysicalResourceId": arn})
+        cfn.add_response("describe_stacks", {"Stacks": [stack_info()]}, {"StackName": STACK_ID})
+        if index == 0:
+            cfn.add_response("get_template", {"TemplateBody": json.dumps(template)},
+                             {"StackName": STACK_ID, "TemplateStage": "Processed"})
+        ram.add_response("list_resource_share_permissions", {"permissions": [{
+            "arn": PERMISSION, "version": "2", "resourceType": KIND, "defaultVersion": True}]},
+            {"resourceShareArn": arn})
+        if index == 0:
+            ram.add_response("get_permission", {"permission": permission()},
+                             {"permissionArn": PERMISSION})
+    return resources
+
+
+def test_run_cache_reads_each_permission_and_owning_template_once(clients):
+    cs, stubs = clients
+    resources = stub_shared_stack_shares(stubs)
+    cache = LookupCache()
+    result = Discovery(OfflineRouter(cs), {CONSUMER}, MIGRATION, {}, {KIND.lower(): True},
+                       cache=cache).inspect(OWNER, REGION)
+    assert not result.blocked
+    g, = result.groups
+    assert set(g.resources) == set(resources) and g.source_stacks == [STACK_ID]
+    for fresh in (False, True):  # stack preflight always rereads the current default
+        no_stack(stubs["cloudformation"])
+        stubs["ram"].add_response("get_permission", {"permission": permission()},
+                                  {"permissionArn": PERMISSION})
+        Stacks(OfflineRouter(cs), MIGRATION, cache=cache).prepare(OWNER, REGION, [g], fresh=fresh)
+
+
+def test_default_permission_drift_after_discovery_blocks_plan_preflight_and_recheck(clients):
+    cs, stubs = clients
+    stub_changed_share(stubs)
+    cache = LookupCache()
+    result = Discovery(OfflineRouter(cs), {CONSUMER}, MIGRATION, {}, {KIND.lower(): True},
+                       approved_changes=[approval()], cache=cache).inspect(OWNER, REGION)
+    g, = result.groups
+    # SetDefaultPermissionVersion after discovery; the cache still holds discovery's read.
+    stub_revalidation(stubs, default_policy=TGW_V3)
+    with pytest.raises(MigrationError, match="permission changed since approval"):
+        revalidate_change(Api(cs["ram"]), g.permission_changes[0])
+    for fresh in (False, True):  # the plan-time preflight, then the post-confirmation recheck
+        no_stack(stubs["cloudformation"])
+        stubs["ram"].add_response("get_permission", {"permission": permission(policy=TGW_V3)},
+                                  {"permissionArn": PERMISSION})
+        with pytest.raises(MigrationError, match="managed permission changed since plan approval"):
+            Stacks(OfflineRouter(cs), MIGRATION, cache=cache).prepare(OWNER, REGION, [g],
+                                                                     fresh=fresh)
+
+
+def test_repeated_apply_of_an_up_to_date_stack_writes_nothing(clients):
+    cs, stubs = clients
+    g = group(approved=True)
+    body = json.dumps(template_for([g], MIGRATION))
+    cfn, name = stubs["cloudformation"], stack_name(MIGRATION, OWNER, REGION)
+    read = {"StackName": STACK_ID, "TemplateStage": "Processed"}
+    stacks = Stacks(OfflineRouter(cs), MIGRATION, cache=LookupCache())
+    cfn.add_response("describe_stacks", {"Stacks": [stack_info()]}, {"StackName": name})
+    stubs["ram"].add_response("get_permission", {"permission": permission()},
+                              {"permissionArn": PERMISSION})
+    cfn.add_response("get_template", {"TemplateBody": body}, read)
+    stacks.prepare(OWNER, REGION, [g])  # planning reads the template once ...
+    stacks._template(OWNER, REGION, stack_info())  # ... and reuses it for that stack version
+    cfn.add_response("describe_stacks", {"Stacks": [stack_info()]}, {"StackName": name})
+    stubs["ram"].add_response("get_permission", {"permission": permission()},
+                              {"permissionArn": PERMISSION})
+    cfn.add_response("get_template", {"TemplateBody": body}, read)  # prepare: fresh
+    cfn.add_response("get_template", {"TemplateBody": body}, read)  # apply: fresh
+    assert stacks.apply(OWNER, REGION, [g]) == name  # strict stubs: no change set at all
+
+
+def stack_resource(logical, arn):
+    return {"LogicalResourceId": logical, "PhysicalResourceId": arn,
+            "ResourceType": "AWS::RAM::ResourceShare", "ResourceStatus": "CREATE_COMPLETE",
+            "LastUpdatedTimestamp": "2026-10-14T00:00:00Z"}
+
+
+def test_an_updated_stack_misses_the_template_cache_so_readback_sees_its_resources(clients):
+    """A StackId survives updates: another writer's update must never be checked against
+    the template planning cached, or readback reports false ownership failures."""
+    cs, stubs = clients
+    first = group(approved=True)
+    second = group(resources={f"{RESOURCE}-2": KIND}, consumers=(OTHER,), approved=True)
+    cfn, name = stubs["cloudformation"], stack_name(MIGRATION, OWNER, REGION)
+    read = {"StackName": STACK_ID, "TemplateStage": "Processed"}
+    stacks = Stacks(OfflineRouter(cs), MIGRATION, cache=LookupCache())
+    cfn.add_response("get_template", {"TemplateBody": json.dumps(template_for([first], MIGRATION))},
+                     read)
+    for _ in range(2):  # one GetTemplate per stack version
+        assert list(stacks._template(OWNER, REGION, stack_info())["Resources"]) == [first.logical_id]
+    updated = {**stack_info("UPDATE_COMPLETE"), "LastUpdatedTime": "2026-10-14T00:00:00Z"}
+    arns = {first.logical_id: TEMP, second.logical_id: f"{TEMP}-2"}
+    cfn.add_response("describe_stacks", {"Stacks": [updated]}, {"StackName": name})
+    cfn.add_response("get_template", {"TemplateBody": json.dumps(
+        template_for([first, second], MIGRATION))}, read)
+    cfn.add_response("list_stack_resources", {"StackResourceSummaries": [
+        stack_resource(logical, arn) for logical, arn in arns.items()]}, {"StackName": STACK_ID})
+    for g in (first, second):
+        arn = arns[g.logical_id]
+        stubs["ram"].add_response("get_resource_shares", {"resourceShares": [
+            dict(migration_share(g), resourceShareArn=arn)]},
+            {"resourceOwner": "SELF", "resourceShareArns": [arn]})
+    assert set(stacks.shares(OWNER, REGION)) == set(arns)
+
+
+class RawBody:
+    def __init__(self, body):
+        self.body = body
+
+    def stream(self, **_kwargs):
+        yield self.body
+
+
+@pytest.mark.parametrize("code", ["Throttling", "TooManyRequestsException"])
+def test_sdk_retries_throttled_reads_with_a_bounded_attempt_count(monkeypatch, code):
+    """Discovery reads rely on the SDK's adaptive retries, which are bounded."""
+    sent, delays, throttled = [], [], [2]
+
+    def send(_endpoint, request):
+        sent.append(request.url)
+        if len(sent) <= throttled[0]:
+            error = json.dumps({"__type": code, "message": "Rate exceeded"}).encode()
+            return AWSResponse(request.url, 400, {"x-amzn-ErrorType": code}, RawBody(error))
+        return AWSResponse(request.url, 200, {}, RawBody(b'{"resourceShares": []}'))
+    monkeypatch.setattr("botocore.endpoint.Endpoint._send", send)
+    monkeypatch.setattr("botocore.endpoint.time.sleep", delays.append)
+    monkeypatch.setattr("botocore.retries.adaptive.ClientRateLimiter.on_sending_request",
+                        lambda *_args, **_kwargs: None)
+    client = botocore.session.get_session().create_client(
+        "ram", region_name=REGION, config=CONFIG.merge(Config(signature_version=UNSIGNED)))
+    assert pages(Api(client), "get_resource_shares", "resourceShares", resourceOwner="SELF") == []
+    assert len(sent) == 3 and len(delays) == 2 and all(0 <= d <= 20 for d in delays)
+    sent.clear()
+    throttled[0] = 99
+    with pytest.raises(ClientError) as raised:
+        pages(Api(client), "get_resource_shares", "resourceShares", resourceOwner="SELF")
+    assert raised.value.response["Error"]["Code"] == code
+    assert len(sent) == 9  # the initial attempt plus CONFIG's 8 retries, then fail closed

@@ -1,14 +1,17 @@
 """Read-only inventory and conservative entitlement planning."""
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
+import threading
 import urllib.request
 from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, NamedTuple
+from typing import Any, Callable, NamedTuple
 
 import yaml
 from botocore.exceptions import ClientError
@@ -106,6 +109,76 @@ def _intrinsic(loader, tag, node):
 
 
 CfnLoader.add_multi_constructor("!", _intrinsic)
+
+
+class LookupCache:
+    """Explicit per-run memo of read-only lookups that repeat across shares.
+
+    Keys name the account and Region of the read. Concurrent callers of one key
+    share a single read, failures are never kept, and every caller receives its
+    own copy. Planning reads through it; revalidation, the post-confirmation
+    recheck and every write path read fresh by not passing it.
+    """
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: dict[tuple, Future] = {}
+
+    def get(self, key: tuple, load: Callable[[], Any]) -> Any:
+        with self._lock:
+            entry = self._entries.get(key)
+            loading = entry is None
+            if loading:
+                entry = self._entries[key] = Future()
+        if loading:
+            try:
+                entry.set_result(load())
+            except BaseException as exc:
+                with self._lock:
+                    if self._entries.get(key) is entry:
+                        del self._entries[key]
+                entry.set_exception(exc)
+        return copy.deepcopy(entry.result())
+
+    def discard(self, key: tuple) -> None:
+        with self._lock:
+            self._entries.pop(key, None)
+
+
+def lookup(cache: LookupCache | None, key: tuple, load: Callable[[], Any]) -> Any:
+    return load() if cache is None else cache.get(key, load)
+
+
+def template_key(account: str, region: str, stack: dict) -> tuple | None:
+    """One template version. A StackId survives updates, so the key also carries when
+    the stack last changed and its status, from the same DescribeStacks as the caller's
+    parameters and resources; None when the description cannot identify the version."""
+    version = stack.get("LastUpdatedTime") or stack.get("CreationTime")
+    if version is None:
+        return None
+    return ("template", account, region, stack["StackId"], version, stack.get("StackStatus"))
+
+
+def read_template(cache: LookupCache | None, account: str, region: str, cfn: Any,
+                  stack: dict) -> dict:
+    """GetTemplate (processed) by StackId, parsed; through the run cache if given and
+    the stack's version is known, otherwise read fresh."""
+    def load():
+        body = cfn.get_template(StackName=stack["StackId"],
+                                TemplateStage="Processed")["TemplateBody"]
+        return yaml.load(body, Loader=CfnLoader) if isinstance(body, str) else body
+    key = template_key(account, region, stack)
+    return lookup(cache if key is not None else None, key, load)
+
+
+def failure_text(exc: Exception) -> str:
+    """error_text plus the API operation, which every runtime denial must name (FR-09)."""
+    operation = f"operation={exc.operation_name} " if isinstance(exc, ClientError) else ""
+    return operation + error_text(exc)
+
+
+def share_blocker(owner: str, region: str, arn: str, exc: Exception) -> str:
+    """A source share's blocker names its owner and Region, and the operation of an API error."""
+    return f"{arn}: owner={owner} region={region} {failure_text(exc)}"
 
 
 @dataclass
@@ -641,12 +714,18 @@ def permission_snapshot(ram: Any, arn: str, version: str | None = None) -> dict:
             "DefaultVersion": permission.get("defaultVersion") is True}
 
 
+def cached_permission(cache: LookupCache | None, account: str, region: str, ram: Any,
+                      arn: str, version: str | None = None) -> dict:
+    return lookup(cache, ("permission", account, region, arn, version),
+                  lambda: permission_snapshot(ram, arn, version))
+
+
 def revalidate_change(ram: Any, change: dict) -> None:
     """Re-read both sides of an approved change just before any write.
 
     The original share must still attach the approved version, and the current
     default must still be the approved version with the approved policy. Any
-    drift voids the approval; a renewed approval is required.
+    drift voids the approval; a renewed approval is required. Never cached.
     """
     attached = [p for p in pages(ram, "list_resource_share_permissions", "permissions",
                                  resourceShareArn=change["share"])
@@ -741,14 +820,18 @@ class Discovery:
     def __init__(self, router: Router, consumers: set[str], migration: str,
                  overrides: dict, capabilities: dict[str, bool],
                  approved_changes: list[dict] | None = None,
-                 migrating_owners: set[str] | None = None):
+                 migrating_owners: set[str] | None = None,
+                 share_workers: int = 1, cache: LookupCache | None = None):
         for consumer in consumers:
             account_id(consumer)
+        if type(share_workers) is not int or not 1 <= share_workers <= 16:
+            raise MigrationError("share_workers must be an integer between 1 and 16")
         self.router, self.consumers, self.migration = router, consumers, migration
         self.overrides, self.capabilities = overrides, capabilities
         # Approvals come only from this migration's record; see ram_migration_record.
         self.approved_changes = list(approved_changes or [])
         self.migrating_owners = set(migrating_owners or ())
+        self.share_workers, self.cache = share_workers, cache
 
     def _org(self, owner: str):
         member = self.router.client(owner, "organizations", "us-east-1")
@@ -776,8 +859,7 @@ class Discovery:
         if match.get("ResourceType") != "AWS::RAM::ResourceShare":
             raise MigrationError(f"{share}: owning resource is not a native RAM share")
         stack = cfn.describe_stacks(StackName=match["StackId"])["Stacks"][0]
-        body = cfn.get_template(StackName=stack["StackId"], TemplateStage="Processed")["TemplateBody"]
-        template = yaml.load(body, Loader=CfnLoader) if isinstance(body, str) else body
+        template = read_template(self.cache, owner, region, cfn, stack)
         parameters = {k: v.get("Default") for k, v in template.get("Parameters", {}).items()
                       if "Default" in v}
         parameters.update({p["ParameterKey"]: p.get("ResolvedValue", p.get("ParameterValue"))
@@ -850,185 +932,219 @@ class Discovery:
             return descend(components[-1])
         raise MigrationError(f"Unsupported account-level principal conversion: {principal}")
 
+    def _members(self, owner: str) -> set[str]:
+        org, _ = self._org(owner)
+        return {a["Id"] for a in pages(org, "list_accounts", "Accounts")
+                if a.get("State", a.get("Status")) == "ACTIVE"}
+
     def inspect(self, owner: str, region: str) -> Plan:
+        """Shares are inspected concurrently (share_workers) and merged in share-ARN
+        order, so the plan never depends on completion order."""
         account_id(owner)
         plan = Plan(self.migration)
         ram = self.router.client(owner, "ram", region)
         try:
             shares = pages(ram, "get_resource_shares", "resourceShares", resourceOwner="SELF")
         except Exception as exc:
-            plan.blocked.append(f"{owner}/{region}: {error_text(exc)}")
+            plan.blocked.append(f"owner={owner} region={region} phase=discovery {failure_text(exc)}")
             return plan
-        active_members: set[str] | None = None
-        for share in shares:
-            arn = share["resourceShareArn"]
-            try:
-                if share.get("owningAccountId") != owner:
-                    raise MigrationError("Source share owner does not match the inspected account")
-                # RAM keeps listing deleted shares for a while; DELETED is terminal and
-                # grants nothing to replicate. DELETING/PENDING/FAILED still block below.
-                if share.get("status") == "DELETED":
-                    plan.excluded.append(f"{arn}: deleted share (status DELETED)")
-                    continue
-                if self._migration_owned(owner, region, share):
-                    plan.existing.append(share)
-                    continue
-                if share["status"] != "ACTIVE":
-                    raise MigrationError(f"source status {share['status']}")
-                resources = pages(ram, "list_resources", "resources", resourceOwner="SELF",
-                                  resourceShareArns=[arn])
-                if not resources:
-                    plan.excluded.append(f"{arn}: empty share")
-                    continue
-                associations = pages(ram, "get_resource_share_associations",
-                                     "resourceShareAssociations", associationType="PRINCIPAL",
-                                     resourceShareArns=[arn])
-                observed = flatten([r["associatedEntity"] for r in associations])
-                live = [r["associatedEntity"] for r in associations
-                        if r["status"] in ("ASSOCIATED", "ASSOCIATING")]
-                explicit = self.overrides.get(arn)
-                source_stacks = []
-                source = self._stack_source(owner, region, arn)
-                configured = []
-                if source is not None:
-                    source_stacks = [source[0]["StackId"]]
-                    _, _, resource, template, parameters, pseudo = source
-                    if "Principals" not in resource.get("Properties", {}):
-                        raise MigrationError("Owning template has no intended principals")
-                    configured = flatten(resolve(resource["Properties"]["Principals"],
-                                                 parameters, template, pseudo))
-                original = sorted(set(configured + live))
-                validate_principal_scopes(sorted(set(configured + observed)), ram.meta.partition)
-                scope_evidence = configured or observed
-                service_only = bool(scope_evidence) and all(
-                    SERVICE_PRINCIPAL.fullmatch(p) for p in scope_evidence)
-                if configured and all(SERVICE_PRINCIPAL.fullmatch(p) for p in configured) and \
-                        any(not SERVICE_PRINCIPAL.fullmatch(p) for p in live):
-                    raise MigrationError("Service-only template conflicts with live account principals")
-                if explicit is not None:
-                    principals = flatten(explicit)
-                    for principal in principals:
-                        account_id(principal)
-                    if service_only and principals:
-                        raise MigrationError("Principal-map override cannot broaden a "
-                                             "service-principal-only share to account-wide access")
-                else:
-                    principals = original
-                if not principals:
-                    if explicit is not None:
-                        plan.excluded.append(f"{arn}: explicitly approved empty consumer inventory")
-                        continue
-                    raise MigrationError("Original account-facing consumers are unresolved; "
-                                         "provide a principal-map override")
-                if all(SERVICE_PRINCIPAL.fullmatch(p) for p in principals):
-                    plan.excluded.append(f"{arn}: service-principal-only share")
-                    continue
-                consumers: set[str] = set()
-                for principal in principals:
-                    consumers.update(self._expand(owner, principal, partition=ram.meta.partition))
-                # Historical OU membership cannot be guessed after account departure.
-                if explicit is None and any(":ou/" in p or ":organization/" in p for p in principals):
-                    if active_members is None:
-                        org, _ = self._org(owner)
-                        active_members = {
-                            a["Id"] for a in pages(org, "list_accounts", "Accounts")
-                            if a.get("State", a.get("Status")) == "ACTIVE"}
-                    direct = {
-                        account for p in principals
-                        if (account := direct_account_principal(p, ram.meta.partition)) is not None}
-                    unresolved = self.consumers - active_members - direct - {owner}
-                    if unresolved:
-                        raise MigrationError("Provide principal-map override to resolve historical "
-                                             f"organization/OU membership for {sorted(unresolved)}")
-                    outside_scope = (self.consumers & active_members) - consumers - {owner}
-                    if outside_scope:
-                        plan.excluded.append(
-                            f"{arn}: selected active source-organization consumers outside "
-                            f"this principal scope: {sorted(outside_scope)}")
-                unrelated = consumers - self.consumers - {owner}
-                if unrelated and owner in self.migrating_owners:
-                    # A stationary consumer of a migrating owner loses access when the owner
-                    # leaves; bridging that direction is not supported (requirements §10).
-                    raise MigrationError(
-                        f"migrating owner {owner} shares with stationary consumers "
-                        f"{sorted(unrelated)}; their access ends when the owner leaves its "
-                        "organization and owner-migration continuity is not supported by this "
-                        "tool version")
-                if unrelated:
-                    plan.excluded.append(
-                        f"{arn}: unrelated consumers outside migration population: {sorted(unrelated)}")
-                consumers &= self.consumers
-                consumers.discard(owner)
-                if not consumers:
-                    plan.excluded.append(f"{arn}: no selected consumers")
-                    continue
-                permission_map: dict[str, str] = {}
-                snapshots: dict[str, dict] = {}
-                changes: list[dict] = []
-                for permission in pages(ram, "list_resource_share_permissions", "permissions",
-                                        resourceShareArn=arn):
-                    default = permission_snapshot(ram, permission["arn"])
-                    if not default["DefaultVersion"]:
-                        raise MigrationError("GetPermission did not return the current default version")
-                    kind = permission["resourceType"]
-                    if kind in permission_map or default["ResourceType"] != kind:
-                        raise MigrationError(f"{kind}: ambiguous managed permission mapping")
-                    if not permission.get("version"):
-                        raise MigrationError(f"{kind}: attached managed permission version missing")
-                    if default["Version"] != permission["version"]:
-                        prior = permission_snapshot(ram, permission["arn"], permission["version"])
-                        if prior["ResourceType"] != kind:
-                            raise MigrationError(f"Non-default permission type differs: {permission['arn']}")
-                        if prior["Policy"] != default["Policy"]:
-                            # AWS attaches only the current default version, so the temporary
-                            # share cannot reproduce the original grant. Never pin or bypass:
-                            # the difference needs an approval bound to this exact change.
-                            change = permission_change(owner, region, arn, prior, default)
-                            approval = approval_for(self.approved_changes, self.migration, change)
-                            change["status"] = "APPROVED" if approval else "APPROVAL_REQUIRED"
-                            if approval:
-                                change["approval_id"] = approval["approval_id"]
-                            changes.append(change)
-                    permission_map[kind] = permission["arn"]
-                    snapshots[kind] = default
-                plan.permission_changes.extend(changes)
-                pending = [c for c in changes if c["status"] == "APPROVAL_REQUIRED"]
-                if pending:
-                    raise MigrationError(
-                        "Non-default permission differs from the current default and requires "
-                        "approval: " + "; ".join(
-                            f"{c['permission_arn']} v{c['from_version']}->v{c['to_version']} "
-                            f"({', '.join(describe_difference(c['difference']))})" for c in pending)
-                        + ". Record this plan with --record, review it, then run approve")
-                available: dict[str, str] = {}
-                for resource in resources:
-                    resource_arn, kind = resource["arn"], resource["type"]
-                    # Owner-side (SELF) listings omit status; an explicit non-AVAILABLE
-                    # status still blocks.
-                    if resource.get("status", "AVAILABLE") != "AVAILABLE":
-                        raise MigrationError(f"{resource_arn}: resource status {resource.get('status')}")
-                    if resource_arn.split(":")[4] != owner:
-                        raise MigrationError(f"Cannot re-share resource owned by another account: {resource_arn}")
-                    if self.capabilities.get(kind.lower()) is not True:
-                        raise MigrationError(f"{kind}: unsupported or unverified external-sharing capability")
-                    if kind not in permission_map:
-                        raise MigrationError(f"{kind}: source managed permission missing")
-                    available[resource_arn] = kind
-                kinds = set(available.values())
-                if set(permission_map) != kinds:
-                    raise MigrationError("Source permissions do not exactly match its resource types")
-                group = ApprovedGroup(owner, region, tuple(sorted(consumers)),
-                                      permission_map, available, [arn], snapshots, source_stacks,
-                                      permission_changes=[approved_change(c) for c in changes])
-                prior_group = next((g for g in plan.groups if g.key == group.key), None)
-                if prior_group is not None:
-                    if prior_group.permission_snapshots != snapshots:
-                        raise MigrationError("Permission approval changed during discovery")
-                    prior_group.source_stacks = sorted(set(prior_group.source_stacks + source_stacks))
-                    if any(a in prior_group.resources and prior_group.resources[a] != k
-                           for a, k in available.items()):
-                        raise MigrationError("Conflicting RAM types for the same source resource")
-                plan.merge(Plan(self.migration, groups=[group]))
-            except Exception as exc:
-                plan.blocked.append(f"{arn}: {error_text(exc)}")
+        arns = [share["resourceShareArn"] for share in shares]
+        members = LookupCache()  # one active-membership read per inspection
+
+        def one(share: dict) -> tuple[Plan, ApprovedGroup | None]:
+            return self._inspect_share(owner, region, ram, share, members)
+        if self.share_workers > 1 and len(shares) > 1:
+            with ThreadPoolExecutor(max_workers=min(self.share_workers, len(shares))) as executor:
+                results = list(executor.map(one, shares))
+        else:
+            results = [one(share) for share in shares]
+        for arn, (part, group) in sorted(zip(arns, results), key=lambda pair: pair[0]):
+            self._merge(plan, owner, region, arn, part, group)
         return plan
+
+    def _merge(self, plan: Plan, owner: str, region: str, arn: str, part: Plan,
+               group: ApprovedGroup | None) -> None:
+        plan.excluded.extend(part.excluded)
+        plan.existing.extend(part.existing)
+        plan.permission_changes.extend(part.permission_changes)
+        plan.blocked.extend(part.blocked)
+        if group is None:
+            return
+        try:
+            prior_group = next((g for g in plan.groups if g.key == group.key), None)
+            if prior_group is not None:
+                if prior_group.permission_snapshots != group.permission_snapshots:
+                    raise MigrationError("Permission approval changed during discovery")
+                prior_group.source_stacks = sorted(set(prior_group.source_stacks
+                                                       + group.source_stacks))
+                if any(a in prior_group.resources and prior_group.resources[a] != k
+                       for a, k in group.resources.items()):
+                    raise MigrationError("Conflicting RAM types for the same source resource")
+            plan.merge(Plan(self.migration, groups=[group]))
+        except Exception as exc:
+            plan.blocked.append(share_blocker(owner, region, arn, exc))
+
+    def _inspect_share(self, owner: str, region: str, ram: Any, share: dict,
+                       members: LookupCache) -> tuple[Plan, ApprovedGroup | None]:
+        """One source share's exclusions, evidence and group, merged later by ARN."""
+        part = Plan(self.migration)
+        arn = share["resourceShareArn"]
+        try:
+            if share.get("owningAccountId") != owner:
+                raise MigrationError("Source share owner does not match the inspected account")
+            # RAM keeps listing deleted shares for a while; DELETED is terminal and
+            # grants nothing to replicate. DELETING/PENDING/FAILED still block below.
+            if share.get("status") == "DELETED":
+                part.excluded.append(f"{arn}: deleted share (status DELETED)")
+                return part, None
+            if self._migration_owned(owner, region, share):
+                part.existing.append(share)
+                return part, None
+            if share["status"] != "ACTIVE":
+                raise MigrationError(f"source status {share['status']}")
+            resources = pages(ram, "list_resources", "resources", resourceOwner="SELF",
+                              resourceShareArns=[arn])
+            if not resources:
+                part.excluded.append(f"{arn}: empty share")
+                return part, None
+            associations = pages(ram, "get_resource_share_associations",
+                                 "resourceShareAssociations", associationType="PRINCIPAL",
+                                 resourceShareArns=[arn])
+            observed = flatten([r["associatedEntity"] for r in associations])
+            live = [r["associatedEntity"] for r in associations
+                    if r["status"] in ("ASSOCIATED", "ASSOCIATING")]
+            explicit = self.overrides.get(arn)
+            source_stacks = []
+            source = self._stack_source(owner, region, arn)
+            configured = []
+            if source is not None:
+                source_stacks = [source[0]["StackId"]]
+                _, _, resource, template, parameters, pseudo = source
+                if "Principals" not in resource.get("Properties", {}):
+                    raise MigrationError("Owning template has no intended principals")
+                configured = flatten(resolve(resource["Properties"]["Principals"],
+                                             parameters, template, pseudo))
+            original = sorted(set(configured + live))
+            validate_principal_scopes(sorted(set(configured + observed)), ram.meta.partition)
+            scope_evidence = configured or observed
+            service_only = bool(scope_evidence) and all(
+                SERVICE_PRINCIPAL.fullmatch(p) for p in scope_evidence)
+            if configured and all(SERVICE_PRINCIPAL.fullmatch(p) for p in configured) and \
+                    any(not SERVICE_PRINCIPAL.fullmatch(p) for p in live):
+                raise MigrationError("Service-only template conflicts with live account principals")
+            if explicit is not None:
+                principals = flatten(explicit)
+                for principal in principals:
+                    account_id(principal)
+                if service_only and principals:
+                    raise MigrationError("Principal-map override cannot broaden a "
+                                         "service-principal-only share to account-wide access")
+            else:
+                principals = original
+            if not principals:
+                if explicit is not None:
+                    part.excluded.append(f"{arn}: explicitly approved empty consumer inventory")
+                    return part, None
+                raise MigrationError("Original account-facing consumers are unresolved; "
+                                     "provide a principal-map override")
+            if all(SERVICE_PRINCIPAL.fullmatch(p) for p in principals):
+                part.excluded.append(f"{arn}: service-principal-only share")
+                return part, None
+            consumers: set[str] = set()
+            for principal in principals:
+                consumers.update(self._expand(owner, principal, partition=ram.meta.partition))
+            # Historical OU membership cannot be guessed after account departure.
+            if explicit is None and any(":ou/" in p or ":organization/" in p for p in principals):
+                active_members = members.get(("active", owner), lambda: self._members(owner))
+                direct = {
+                    account for p in principals
+                    if (account := direct_account_principal(p, ram.meta.partition)) is not None}
+                unresolved = self.consumers - active_members - direct - {owner}
+                if unresolved:
+                    raise MigrationError("Provide principal-map override to resolve historical "
+                                         f"organization/OU membership for {sorted(unresolved)}")
+                outside_scope = (self.consumers & active_members) - consumers - {owner}
+                if outside_scope:
+                    part.excluded.append(
+                        f"{arn}: selected active source-organization consumers outside "
+                        f"this principal scope: {sorted(outside_scope)}")
+            unrelated = consumers - self.consumers - {owner}
+            if unrelated and owner in self.migrating_owners:
+                # A stationary consumer of a migrating owner loses access when the owner
+                # leaves; bridging that direction is not supported (requirements §10).
+                raise MigrationError(
+                    f"migrating owner {owner} shares with stationary consumers "
+                    f"{sorted(unrelated)}; their access ends when the owner leaves its "
+                    "organization and owner-migration continuity is not supported by this "
+                    "tool version")
+            if unrelated:
+                part.excluded.append(
+                    f"{arn}: unrelated consumers outside migration population: {sorted(unrelated)}")
+            consumers &= self.consumers
+            consumers.discard(owner)
+            if not consumers:
+                part.excluded.append(f"{arn}: no selected consumers")
+                return part, None
+            permission_map: dict[str, str] = {}
+            snapshots: dict[str, dict] = {}
+            changes: list[dict] = []
+            for permission in pages(ram, "list_resource_share_permissions", "permissions",
+                                    resourceShareArn=arn):
+                default = cached_permission(self.cache, owner, region, ram, permission["arn"])
+                if not default["DefaultVersion"]:
+                    raise MigrationError("GetPermission did not return the current default version")
+                kind = permission["resourceType"]
+                if kind in permission_map or default["ResourceType"] != kind:
+                    raise MigrationError(f"{kind}: ambiguous managed permission mapping")
+                if not permission.get("version"):
+                    raise MigrationError(f"{kind}: attached managed permission version missing")
+                if default["Version"] != permission["version"]:
+                    prior = cached_permission(self.cache, owner, region, ram, permission["arn"],
+                                              permission["version"])
+                    if prior["ResourceType"] != kind:
+                        raise MigrationError(f"Non-default permission type differs: {permission['arn']}")
+                    if prior["Policy"] != default["Policy"]:
+                        # AWS attaches only the current default version, so the temporary
+                        # share cannot reproduce the original grant. Never pin or bypass:
+                        # the difference needs an approval bound to this exact change.
+                        change = permission_change(owner, region, arn, prior, default)
+                        approval = approval_for(self.approved_changes, self.migration, change)
+                        change["status"] = "APPROVED" if approval else "APPROVAL_REQUIRED"
+                        if approval:
+                            change["approval_id"] = approval["approval_id"]
+                        changes.append(change)
+                permission_map[kind] = permission["arn"]
+                snapshots[kind] = default
+            part.permission_changes.extend(changes)
+            pending = [c for c in changes if c["status"] == "APPROVAL_REQUIRED"]
+            if pending:
+                raise MigrationError(
+                    "Non-default permission differs from the current default and requires "
+                    "approval: " + "; ".join(
+                        f"{c['permission_arn']} v{c['from_version']}->v{c['to_version']} "
+                        f"({', '.join(describe_difference(c['difference']))})" for c in pending)
+                    + ". Record this plan with --record, review it, then run approve")
+            available: dict[str, str] = {}
+            for resource in resources:
+                resource_arn, kind = resource["arn"], resource["type"]
+                # Owner-side (SELF) listings omit status; an explicit non-AVAILABLE
+                # status still blocks.
+                if resource.get("status", "AVAILABLE") != "AVAILABLE":
+                    raise MigrationError(f"{resource_arn}: resource status {resource.get('status')}")
+                if resource_arn.split(":")[4] != owner:
+                    raise MigrationError(f"Cannot re-share resource owned by another account: {resource_arn}")
+                if self.capabilities.get(kind.lower()) is not True:
+                    raise MigrationError(f"{kind}: unsupported or unverified external-sharing capability")
+                if kind not in permission_map:
+                    raise MigrationError(f"{kind}: source managed permission missing")
+                available[resource_arn] = kind
+            kinds = set(available.values())
+            if set(permission_map) != kinds:
+                raise MigrationError("Source permissions do not exactly match its resource types")
+            group = ApprovedGroup(owner, region, tuple(sorted(consumers)),
+                                  permission_map, available, [arn], snapshots, source_stacks,
+                                  permission_changes=[approved_change(c) for c in changes])
+            return part, group
+        except Exception as exc:
+            part.blocked.append(share_blocker(owner, region, arn, exc))
+            return part, None

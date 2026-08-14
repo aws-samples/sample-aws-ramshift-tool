@@ -255,6 +255,7 @@ class Harness:
         self.share_states = {}
         self.share_reads = Counter()
         self.prepare_counts = Counter()
+        self.prepare_fresh = []           # (owner, region, fresh) per prepare call
         self.drift = set()
         self.invitations = defaultdict(list)
         self.principal_states = defaultdict(lambda: ["ASSOCIATED"])
@@ -330,8 +331,8 @@ class Harness:
                 return plan
 
         class LocalStacks:
-            def __init__(self, router, migration, timeout):
-                self.router, self.migration = router, migration
+            def __init__(self, router, migration, timeout, cache=None):
+                self.router, self.migration, self.cache = router, migration, cache
                 harness.calls.append(("stacks-inputs", timeout))
 
             def existing(self, owner, region):
@@ -342,9 +343,10 @@ class Harness:
                 harness.calls.append(("persisted", owner, region))
                 return copy.deepcopy(harness.stored[owner, region])
 
-            def prepare(self, owner, region, groups):
+            def prepare(self, owner, region, groups, fresh=False):
                 key = owner, region
                 harness.calls.append(("prepare", owner, region))
+                harness.prepare_fresh.append((owner, region, fresh))
                 harness.prepare_counts[key] += 1
                 if key in harness.prepare_errors:
                     raise harness.prepare_errors[key]
@@ -357,6 +359,8 @@ class Harness:
                 harness.calls.append(("apply", owner, region))
                 if (owner, region) in harness.apply_errors:
                     raise harness.apply_errors[owner, region]
+                if harness.stored.get((owner, region)) == groups:
+                    return "local-migration-stack"  # like Stacks.apply: nothing new to write
                 self.router.client(owner, "cloudformation", region, write=True).create_change_set()
                 harness.stored[owner, region] = copy.deepcopy(groups)
                 for g in groups:

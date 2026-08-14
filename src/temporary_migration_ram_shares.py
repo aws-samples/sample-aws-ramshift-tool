@@ -19,7 +19,7 @@ import re
 import sys
 import threading
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,7 +35,8 @@ from ram_migration_common import (
     error_text, pages, timestamp,
 )
 from ram_migration_discovery import (
-    Discovery, describe_difference, external_catalog, revalidate_change,
+    Discovery, LookupCache, describe_difference, external_catalog, failure_text,
+    revalidate_change,
 )
 from ram_migration_record import (
     APPLICABLE, add_drops, approval_for, approve_owner_scope, approve_permission_change,
@@ -62,15 +63,17 @@ TRANSIENT_CODES = {
 }
 
 
-def failure_text(exc: Exception) -> str:
-    operation = f"operation={exc.operation_name} " if isinstance(exc, ClientError) else ""
-    return operation + error_text(exc)
-
-
 def bounded_integer(value: str) -> int:
     number = int(value)
     if not 1 <= number <= 64:
         raise argparse.ArgumentTypeError("use an integer between 1 and 64")
+    return number
+
+
+def share_worker_count(value: str) -> int:
+    number = int(value)
+    if not 1 <= number <= 16:
+        raise argparse.ArgumentTypeError("use an integer between 1 and 16")
     return number
 
 
@@ -127,6 +130,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--account-workers", type=bounded_integer, default=4)
     parser.add_argument("--region-workers", type=bounded_integer, default=4,
                         help="maximum regional workers per active account")
+    parser.add_argument("--share-workers", type=share_worker_count, default=4,
+                        help="maximum concurrent share inspections per owner Region during "
+                             "discovery (1-16); results merge in share-ARN order")
     parser.add_argument("--timeout", type=positive_number, default=1800,
                         help="seconds per stack operation or invitation/verification polling task")
     parser.add_argument("--retry-limit", "--retries", type=bounded_integer, default=20,
@@ -180,6 +186,9 @@ class Options:
     capabilities: dict[str, bool] | None
     monitor_config: dict
     known_enabled_regions: dict[str, set[str]] = field(default_factory=dict)
+    # Set by apply when its write gate opens: reads back, through a closed gate, the
+    # temporary shares the run created and returns the record update for them.
+    interrupt_readback: Callable[[], Callable[[dict], Any]] | None = None
 
 
 MIGRATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
@@ -309,12 +318,41 @@ class WriteGate:
 
 
 class Reporter:
-    def __init__(self):
-        self.lock = threading.Lock()
+    lock = threading.Lock()  # one console: every reporter, worker and interrupt notice
 
     def emit(self, message: str) -> None:
         with self.lock:
             print(message, flush=True)
+
+
+class Progress:
+    """Per-account completion and elapsed time for one long phase."""
+    def __init__(self, report: Reporter, stage: str, scopes: dict[str, list[str]]):
+        self.report, self.stage = report, stage
+        self.totals = {account: len(set(units)) for account, units in scopes.items()}
+        self.done: Counter = Counter()
+        self.lock = threading.Lock()
+        self.started = time.monotonic()
+        if self.totals:
+            report.emit(f"phase=progress stage={stage} status=STARTED accounts={len(self.totals)} "
+                        f"tasks={sum(self.totals.values())}")
+
+    def advance(self, account: str, detail: str = "") -> None:
+        with self.lock:
+            self.done[account] += 1
+            self.report.emit(
+                f"phase=progress stage={self.stage} account={account} "
+                f"done={self.done[account]}/{self.totals[account]} "
+                f"overall={sum(self.done.values())}/{sum(self.totals.values())} "
+                f"elapsed_seconds={time.monotonic() - self.started:.1f}{detail}")
+
+    def observed(self, observation: Any) -> None:
+        """One collect() call observes every account at once."""
+        items, gaps = value(observation, "items"), value(observation, "gaps")
+        for account in sorted(self.totals):
+            found = sum((item.get("consumer") or item.get("owner")) == account for item in items)
+            missing = sum(gap.get("account") == account for gap in gaps)
+            self.advance(account, f" items={found} gaps={missing}")
 
 
 @dataclass
@@ -326,12 +364,39 @@ class Outcome:
 
 
 def fanout(scopes: dict[str, list[str]], callback: Callable[[str, str], Any],
-           account_workers: int, region_workers: int) -> list[Outcome]:
-    """At most account_workers accounts and region_workers tasks per account."""
+           account_workers: int, region_workers: int,
+           progress: Progress | None = None,
+           notify: Callable[[str], None] | None = None) -> list[Outcome]:
+    """At most account_workers accounts and region_workers tasks per account.
+
+    An interrupt starts no further task; tasks already running finish, and what
+    they changed is retained, before the interrupt propagates. Every interrupt,
+    repeated ones included, is acknowledged at once with the tasks still running."""
+    stop = threading.Event()
+    running, lock = [0], threading.Lock()
+    notify = notify or Reporter().emit
+
+    def task(account: str, region: str) -> Any:
+        if stop.is_set():
+            raise MigrationError("not started: the run was interrupted")
+        with lock:
+            running[0] += 1
+        try:
+            return callback(account, region)
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                stop.set()
+            raise
+        finally:
+            with lock:
+                running[0] -= 1
+            if progress is not None:
+                progress.advance(account)
+
     def one_account(account: str) -> list[Outcome]:
         output = []
         with ThreadPoolExecutor(max_workers=region_workers) as executor:
-            futures = {executor.submit(callback, account, region): region
+            futures = {executor.submit(task, account, region): region
                        for region in sorted(set(scopes[account]))}
             for future in as_completed(futures):
                 region = futures[future]
@@ -343,14 +408,31 @@ def fanout(scopes: dict[str, list[str]], callback: Callable[[str, str], Any],
 
     output: list[Outcome] = []
     with ThreadPoolExecutor(max_workers=account_workers) as executor:
-        futures = [executor.submit(one_account, account) for account in sorted(scopes)]
-        for future in as_completed(futures):
-            output.extend(future.result())
+        try:
+            futures = [executor.submit(one_account, account) for account in sorted(scopes)]
+            for future in as_completed(futures):
+                output.extend(future.result())
+        except BaseException as exc:
+            stop.set()
+            interrupt = isinstance(exc, KeyboardInterrupt)
+            while True:
+                try:
+                    if interrupt:
+                        with lock:
+                            count = running[0]
+                        notify(f"status=INTERRUPTING no new tasks start; waiting for {count} "
+                               "running tasks to finish; their changes are retained")
+                    executor.shutdown(wait=True, cancel_futures=True)
+                    break
+                except KeyboardInterrupt:
+                    interrupt = True
+            raise
     return sorted(output, key=lambda row: (row.account, row.region))
 
 
-def scoped_fanout(scopes, callback, opts: Options):
-    return fanout(scopes, callback, opts.args.account_workers, opts.args.region_workers)
+def scoped_fanout(scopes, callback, opts: Options, progress: Progress | None = None):
+    return fanout(scopes, callback, opts.args.account_workers, opts.args.region_workers,
+                  progress)
 
 
 def authenticate(router: Router, accounts: set[str], opts: Options, report: Reporter) -> list[str]:
@@ -496,7 +578,7 @@ def received_inventory(router: WriteGate, opts: Options, report: Reporter) -> Re
                 result.blocked.append(f"{context} status=BLOCKED {failure_text(exc)}")
         return result
 
-    for row in scoped_fanout(scopes, inspect, opts):
+    for row in scoped_fanout(scopes, inspect, opts, Progress(report, "received-inventory", scopes)):
         if row.error:
             audit.blocked.append(f"account={row.account} region={row.region} "
                                  f"phase=received-audit status=BLOCKED {row.error}")
@@ -631,8 +713,9 @@ def classify_received(audit: ReceivedAudit, plan: Plan, proven: dict, owner_scop
             f"({types or 'pending share'}) through {len(evidence['shares'] | evidence['pending_shares'])} "
             f"shares in {','.join(sorted(evidence['regions']))} to migrating accounts "
             f"{','.join(sorted(evidence['consumers']))} ({evidence['observations']} observations). "
-            f"Approve the proposed owner list, then re-run plan with an explicit profile/role mapping for "
-            f"{owner}. Received resources cannot be re-shared by the receiving account")
+            f"Record this plan with --record and approve the proposed owner list, then re-run plan "
+            f"with an explicit profile/role mapping for {owner}. Received resources cannot be "
+            "re-shared by the receiving account")
     return {owner: {"consumers": sorted(e["consumers"]), "regions": sorted(e["regions"]),
                     "shares": sorted(e["shares"]), "pending_shares": sorted(e["pending_shares"]),
                     "resource_types": dict(sorted(e["resource_types"].items())),
@@ -764,10 +847,19 @@ def describe_item(item: dict) -> str:
     return f"kind={item['kind']} " + " ".join(fields)
 
 
+def group_accounts(groups: list) -> dict[str, list[str]]:
+    """Every owner and consumer an observation of these groups covers."""
+    accounts = {value(g, "owner") for g in groups} | \
+        {consumer for g in groups for consumer in value(g, "consumers")}
+    return {account: ["observation"] for account in sorted(accounts)}
+
+
 def observe(router: Any, groups: list, temporary: frozenset[str], opts: Options,
             report: Reporter, phase: str) -> Any:
+    progress = Progress(report, f"observation:{phase}", group_accounts(groups))
     observation = verifier().collect(router, groups, temporary_shares=temporary,
                                      workers=opts.args.region_workers)
+    progress.observed(observation)
     for item in sorted(value(observation, "items"), key=lambda row: row["key"]):
         report.emit(f"phase={phase} {describe_item(item)}")
     for gap in value(observation, "gaps"):
@@ -825,6 +917,10 @@ def scoped_items(items: list[dict], groups: list) -> list[dict]:
         item.get("consumer") is None or (item.get("consumer"), item.get("resource_arn")) in pairs)]
 
 
+RECORDED_LOSS = ("the recorded baseline is never replaced - restore it or start a new "
+                 "migration record")
+
+
 def baseline_check(record: dict | None, observation: Any, groups: list) -> tuple[list[str], Any]:
     """Pre-write: capture problems if no baseline exists, else losses against it."""
     baseline = (record or {}).get("baseline")
@@ -833,9 +929,8 @@ def baseline_check(record: dict | None, observation: Any, groups: list) -> tuple
     comparison = verifier().compare(scoped_items(baseline["items"], groups), observation)
     status = value(comparison, "status")
     if status == "LOSS":
-        return [f"phase=baseline status=BLOCKED original {loss['reason']}: {loss['key']}; the "
-                "recorded baseline is never replaced - restore it or start a new migration record"
-                for loss in losses(comparison)], comparison
+        return [f"phase=baseline status=BLOCKED original {loss['reason']}: {loss['key']}; "
+                f"{RECORDED_LOSS}" for loss in losses(comparison)], comparison
     if status != "INTACT":
         return [f"phase=baseline status=BLOCKED observation gap {gap.get('collector')} "
                 f"{gap.get('account')} {gap.get('region')} {gap.get('reason')}"
@@ -1263,9 +1358,10 @@ def run_approve(opts: Options, ask: Callable[[str], str], report: Reporter) -> i
     return 0 if complete else 2
 
 
-def summary(plan: Plan, report: Reporter, status: str, *, created: int = 0, reused: int = 0,
-            accepted: int = 0, reused_invitations: int = 0, failures: int = 0,
-            comparison: Any = None, unassociated: int = 0, sharing: str | None = None,
+def summary(plan: Plan, report: Reporter, status: str, *, mode: str, recorded: bool,
+            created: int = 0, reused: int = 0, accepted: int = 0,
+            reused_invitations: int = 0, failures: int = 0, comparison: Any = None,
+            unassociated: int = 0, sharing: str | None = None,
             migration: str | None = None) -> None:
     resources = {arn for group in plan.groups for arn in group.resources}
     entitlements = {(group.owner, group.region, arn, consumer, group.permissions[kind])
@@ -1293,6 +1389,195 @@ def summary(plan: Plan, report: Reporter, status: str, *, created: int = 0, reus
     if unassociated:
         report.emit("Resolver rules without an association had none before migration; "
                     "no association repair was performed.")
+    report_blockers(plan, report, status, mode=mode, recorded=recorded)
+
+
+# Display order, then the next action per run: "unrecorded" is plan without --record
+# and "*" any other mode; a mode with neither uses "other". {rerun} repeats this run and
+# {replan} produces a new reviewed plan.
+BLOCKER_ACTIONS = {
+    "permission-approval-required": {
+        "unrecorded":
+            "re-run plan with --record <path> to record the permission-change requests, review "
+            "each managed-permission comparison, run approve with that --record and type its "
+            "APPROVE token, then re-run plan --record",
+        "plan":
+            "review each managed-permission comparison, run approve with the same --record and "
+            "type its APPROVE token, then re-run plan --record; a drifted approval needs a new "
+            "plan and approval",
+        "apply":
+            "a managed permission changed after the reviewed plan, which voids its approval: "
+            "run plan with the same --record, review the new comparison, run approve and type "
+            "its APPROVE token, re-run plan --record, then re-run apply",
+    },
+    "owner-outside-approved-scope": {
+        "unrecorded":
+            "re-run plan with --record <path> to record the proposed owners, run approve with "
+            "that --record and type the APPROVE-OWNERS token, then re-run plan --record with a "
+            "--profile-map or --role-map entry for each owner",
+        "plan":
+            "run approve with the same --record and type the APPROVE-OWNERS token for the "
+            "proposed owners, then re-run plan --record with a --profile-map or --role-map entry "
+            "for each owner",
+        "apply":
+            "owners outside the reviewed scope now provide received resources: run plan with "
+            "the same --record, run approve and type the APPROVE-OWNERS token, re-run plan "
+            "--record with a --profile-map or --role-map entry for each owner, review it, then "
+            "re-run apply",
+    },
+    "received-dependency-not-covered": {
+        "*": "no planned temporary share covers these received resources: check the owner's "
+             "discovery exclusions, supply --principal-map for the original share if the "
+             "consumer is an intended principal, then {replan}",
+    },
+    "configuration": {
+        "*": "each named share needs explicit input: a --principal-map entry listing the "
+             "intended account IDs resolves unresolved or historical consumers; a resource type "
+             "is shared only where the AWS external-sharing catalog supports it and "
+             "--capabilities can only restrict that, so plan an unsupported type's continuity "
+             "separately; then {replan}",
+    },
+    "authentication": {
+        "*": "refresh or supply credentials for each named account (aws sso login, --sso-role, "
+             "--account-map, --profile-map or --role-map), then {rerun}; expired tokens are "
+             "not retried",
+    },
+    "region-scope": {
+        "plan": "make every Region resolvable: allow ec2:DescribeRegions for the named accounts "
+                "or add the missing Regions to --regions, then re-run plan --record",
+        "apply": "allow ec2:DescribeRegions for the named accounts, then re-run apply with the "
+                 "same --record; a dependency in a Region outside the reviewed scope needs plan "
+                 "--record with that Region in --regions and a review before apply",
+        "verify": "allow ec2:DescribeRegions for the named accounts or omit "
+                  "--scan-enabled-regions (verify takes its Regions from the record), then "
+                  "re-run verify with the same --record",
+    },
+    "discovery-api-error": {
+        "*": "resolve each named API error (operation and request ID are shown; for throttling "
+             "lower {workers}), then {rerun}",
+    },
+    "baseline-loss": {
+        "*": "each loss against the recorded baseline is now a permanent failure drop in this "
+             "record: restoring the original access does not clear it and complete will refuse "
+             "this record, so restore the original access and start a new migration record "
+             "(new --migration-id and --record) instead of resuming apply with this one",
+    },
+    "baseline-capture": {
+        "*": "the original state must be completely observable and stable before apply writes: "
+             "restore it or grant the collectors read access, then re-run apply with the same "
+             "--record; a recorded baseline is never replaced",
+    },
+    "reviewed-record-mismatch": {
+        "apply": "the reviewed plan no longer matches this run: re-run plan with the same "
+                 "--record using this tool version, review the new PLANNED revision, then re-run "
+                 "apply, which resumes from the shares the record already holds",
+        "verify": "the record and its migration stacks disagree: an apply that stopped before "
+                  "recording its shares is resumed by apply with the same --record while its "
+                  "reviewed plan still matches; then re-run verify with the same --record",
+    },
+    "other": {"*": "resolve each blocker listed above, then {rerun}"},
+}
+RERUN = {"plan": "re-run plan --record", "apply": "re-run apply with the same --record",
+         "verify": "re-run verify with the same --record"}
+REPLAN = {"plan": "re-run plan --record",
+          "apply": "run plan with the same --record, review the new PLANNED revision, then "
+                   "re-run apply",
+          "verify": "re-run verify with the same --record"}
+WORKERS = {"plan": "--share-workers, --region-workers or --account-workers",
+           "apply": "--share-workers, --region-workers or --account-workers",
+           "verify": "--region-workers or --account-workers"}
+# First match wins: credentials are named as such in any phase, phase-specific
+# categories come next, and an API failure (operation or request ID) is never
+# taken for an approval or configuration need.
+BLOCKER_PATTERNS = (
+    ("authentication", re.compile(
+        r"phase=authentication|ExpiredToken|InvalidClientTokenId|UnrecognizedClientException"
+        r"|security token included in the request is (?:expired|invalid)"
+        r"|SSO (?:session|token|login)|token has expired|unable to locate credentials",
+        re.IGNORECASE)),
+    ("region-scope", re.compile(
+        r"phase=(?:regions|received-regions) |Region is outside the selected discovery scope"
+        r"|outside the explicit owner/Region scope")),
+    ("baseline-loss", re.compile(r"phase=baseline status=BLOCKED original .*"
+                                 + re.escape(RECORDED_LOSS))),
+    ("baseline-capture", re.compile(r"phase=baseline ")),
+    ("owner-outside-approved-scope", re.compile(r"phase=owner-scope ")),
+    ("reviewed-record-mismatch", re.compile(
+        r"phase=reviewed-record |plan changed; run plan/apply")),
+    ("discovery-api-error", re.compile(r"operation=\w+|\(request [^)]*\)")),
+    ("permission-approval-required", re.compile(
+        r"requires approval|changed since (?:plan )?approval|approval \S+ no longer covers")),
+    ("received-dependency-not-covered", re.compile(r"not covered by any planned temporary share")),
+    ("configuration", re.compile(
+        r"external-sharing capability|provide (?:a )?principal-map override", re.IGNORECASE)),
+)
+SHARE_ARN = re.compile(r"arn:[\w-]+:ram:[\w-]*:\d{12}:resource-share/[\w.-]+")
+RESOURCE_ARN = re.compile(r"arn:[\w-]+:(?!ram:|iam:|sts:|cloudformation:|organizations:)"
+                          r"[\w-]+:[\w-]*:\d{12}:[^\s,;)]+")
+ACCOUNT_FIELD = re.compile(r"\b(account|consumer|owner)=(\d{12})\b")
+# Which count each account field feeds. account= names the receiving migrating
+# account, except that a credential failure is per account whatever its role and a
+# baseline collector gap may name an owner.
+COUNTED_AS = {"account": "consumers", "consumer": "consumers", "owner": "owners"}
+CATEGORY_COUNTED_AS = {
+    "authentication": {"account": "accounts", "consumer": "accounts", "owner": "accounts"},
+    "baseline-capture": {"account": "accounts", "consumer": "consumers", "owner": "owners"},
+}
+OWNER_EVIDENCE = re.compile(r"phase=owner-scope owner=(\d{12}) .*? provides (\d+) unique "
+                            r"received resources .*? through (\d+) shares .*?\((\d+) observations\)")
+
+
+def blocker_category(reason: str) -> str:
+    return next((name for name, pattern in BLOCKER_PATTERNS if pattern.search(reason)), "other")
+
+
+def blocker_action(category: str, mode: str, recorded: bool) -> str:
+    actions = BLOCKER_ACTIONS[category]
+    context = "unrecorded" if mode == "plan" and not recorded else mode
+    text = actions.get(context) or actions.get(mode) or actions.get("*") or \
+        BLOCKER_ACTIONS["other"]["*"]
+    return text.format(rerun=RERUN[mode], replan=REPLAN[mode], workers=WORKERS[mode])
+
+
+def report_blockers(plan: Plan, report: Reporter, status: str, *, mode: str,
+                    recorded: bool) -> None:
+    """A blocked run ends with its blockers grouped by category, counted, and the
+    next action for each, for this mode and whether the run used a record."""
+    if status != "BLOCKED" or not plan.blocked:
+        return
+    grouped: dict[str, list[str]] = defaultdict(list)
+    for reason in plan.blocked:
+        grouped[blocker_category(reason)].append(reason)
+    report.emit(f"phase=blocker-summary status=BLOCKED blockers={len(plan.blocked)} "
+                f"categories={len(grouped)}")
+    for category in BLOCKER_ACTIONS:
+        reasons = grouped.get(category)
+        if not reasons:
+            continue
+        text = " ".join(reasons)
+        fields = [f"blockers={len(reasons)}"]
+        if category == "owner-outside-approved-scope":
+            # One blocker per proposed owner; its evidence carries the unique counts.
+            evidence = {match[1]: match.groups()[1:] for match in
+                        map(OWNER_EVIDENCE.search, reasons) if match}
+            fields.append(f"owners={len(evidence)}")
+            fields += [f"{name}={sum(int(row[index]) for row in evidence.values())}"
+                       for name, index in (("shares", 1), ("resources", 0), ("observations", 2))]
+        else:
+            counts: dict[str, set[str]] = {
+                "shares": set(SHARE_ARN.findall(text)),
+                "resources": {arn.rstrip(":.") for arn in RESOURCE_ARN.findall(text)},
+                "accounts": set(), "consumers": set(), "owners": set()}
+            roles = CATEGORY_COUNTED_AS.get(category, COUNTED_AS)
+            for name, account in ACCOUNT_FIELD.findall(text):
+                counts[roles[name]].add(account)
+            fields += [f"{name}={len(found)}" for name, found in counts.items() if found]
+        if category == "permission-approval-required":
+            pending = [c for c in plan.permission_changes if c.get("status") == "APPROVAL_REQUIRED"]
+            if pending:
+                fields.append(f"approvals={len(permission_requests(plan.migration, pending))}")
+        report.emit(f"phase=blocker-summary category={category} {' '.join(fields)} "
+                    f"next_action={blocker_action(category, mode, recorded)}")
 
 
 def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report: Reporter) -> int:
@@ -1317,6 +1602,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
     scope = account_scope(opts)
     scope["approved_owner_scope"] = sorted(approved_owner_scope)
     approvals = record["approvals"]["permission_changes"] if record else []
+    run = {"mode": args.mode, "recorded": record is not None}  # selects each next action
 
     def note(status: str, mutate: Callable[[dict], Any] = lambda _record: None,
              **details: Any) -> None:
@@ -1331,7 +1617,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
             report.emit("For unmapped accounts, supply explicit --sso-role or an "
                         "--account-map/--profile-map/--role-map.")
         print_plan(plan, {}, report)
-        summary(plan, report, "BLOCKED")
+        summary(plan, report, "BLOCKED", **run)
         if args.mode == "plan" and record is not None:
             update_record(args.record, plan.migration,
                           lambda current: current.update(record_plan(
@@ -1348,11 +1634,14 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
     scopes, failures = region_scopes(gate, opts, report, dependency_regions(received)
                                      if received is not None else recorded_regions)
     plan.blocked.extend(failures)
-    stacks = Stacks(gate, plan.migration, timeout=args.timeout)
+    # One explicit cache for this run's planning reads; rechecks and writes read fresh.
+    cache = LookupCache()
+    stacks = Stacks(gate, plan.migration, timeout=args.timeout, cache=cache)
     if not callable(getattr(stacks, "persisted_groups", None)):
         raise MigrationError("Stacks.persisted_groups(owner, region) is required for stored-scope verification")
     persisted: set[str] = set()
     persisted_groups: dict[tuple[str, str], list[Group]] = {}
+    unread: set[tuple[str, str]] = set()  # owner Regions whose stored plan could not be read
     def load_persisted(owner, region):
         if stacks.existing(owner, region) is None:
             return []
@@ -1361,6 +1650,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         return groups
     for row in scoped_fanout(scopes, load_persisted, opts):
         if row.error:
+            unread.add((row.account, row.region))
             plan.blocked.append(f"owner={row.account} region={row.region} phase=stored-plan {row.error}")
         else:
             if row.value:
@@ -1375,7 +1665,8 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         report.emit(f"phase=plan capability_provenance={json.dumps(capability_provenance, sort_keys=True)}")
         discovery = Discovery(gate, set(opts.consumers), plan.migration, opts.principals, capabilities,
                               approved_changes=approvals,
-                              migrating_owners=set(scope["migrating_owners"]))
+                              migrating_owners=set(scope["migrating_owners"]),
+                              share_workers=args.share_workers, cache=cache)
         def inspect(owner, region):
             report.emit(f"owner={owner} region={region} phase=discovery status=STARTED")
             result = discovery.inspect(owner, region)
@@ -1383,7 +1674,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
             if any(set(group.consumers) - set(opts.consumers) for group in result.groups):
                 raise MigrationError("Discovery returned consumers outside the approved population")
             return result
-        for row in scoped_fanout(scopes, inspect, opts):
+        for row in scoped_fanout(scopes, inspect, opts, Progress(report, "discovery", scopes)):
             if row.error:
                 plan.blocked.append(f"owner={row.account} region={row.region} phase=discovery {row.error}")
             else:
@@ -1403,7 +1694,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
     if args.mode != "verify":
         for row in scoped_fanout(group_scopes,
                                  lambda owner, region: stacks.prepare(owner, region, grouped[owner, region]),
-                                 opts):
+                                 opts, Progress(report, "prepare", group_scopes)):
             if row.error:
                 plan.blocked.append(f"owner={row.account} region={row.region} phase=stack-preflight {row.error}")
             else:
@@ -1417,7 +1708,9 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         if problem:
             plan.blocked.append(f"phase=reviewed-record {problem}")
     if args.mode == "verify" and record is not None:
-        recorded = {(s["owner"], s["region"], s["logical_id"]) for s in record.get("shares", [])}
+        # An unreadable stored plan is already a blocker; its shares are not missing.
+        recorded = {(s["owner"], s["region"], s["logical_id"]) for s in record.get("shares", [])
+                    if (s["owner"], s["region"]) not in unread}
         stored = {(g.owner, g.region, g.logical_id) for g in plan.groups}
         plan.blocked += [f"phase=reviewed-record recorded temporary share {owner}/{region}/{logical} "
                          "is missing from its migration stack" for owner, region, logical
@@ -1469,16 +1762,16 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         if args.mode == "verify":
             for reason in plan.blocked:
                 report.emit(f"phase=verification status=BLOCKED {reason}")
-        summary(plan, report, "BLOCKED")
+        summary(plan, report, "BLOCKED", **run)
         note("BLOCKED", lambda current: add_drops(current, pending_drops),
              blockers=list(plan.blocked), drops=len(pending_drops))
         return 1
     if args.mode == "plan":
-        summary(plan, report, "PLANNED")
+        summary(plan, report, "PLANNED", **run)
         return 0
     if not plan.groups:
         report.emit("status=INCOMPLETE No stored/planned migration entitlements found in the requested scope")
-        summary(plan, report, "INCOMPLETE", failures=1)
+        summary(plan, report, "INCOMPLETE", failures=1, **run)
         note("INCOMPLETE", failures=["no stored or planned migration entitlements"])
         return 1
 
@@ -1496,8 +1789,9 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         # Recheck every template before opening the gate, so a newly visible
         # blocker in any Region prevents writes to every Region.
         for row in scoped_fanout(group_scopes,
-                                 lambda owner, region: stacks.prepare(owner, region, grouped[owner, region]),
-                                 opts):
+                                 lambda owner, region: stacks.prepare(
+                                     owner, region, grouped[owner, region], fresh=True),
+                                 opts, Progress(report, "prepare-recheck", group_scopes)):
             if row.error:
                 plan.blocked.append(f"{row.account}/{row.region}: post-confirmation preflight {row.error}")
             elif digest(row.value[0]) != digest(prepared[row.account, row.region][0]):
@@ -1537,7 +1831,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         if plan.blocked:
             for reason in plan.blocked:
                 report.emit(f"phase=preflight status=BLOCKED {reason}")
-            summary(plan, report, "BLOCKED")
+            summary(plan, report, "BLOCKED", **run)
             note("BLOCKED", lambda current: add_drops(current, pending_drops),
                  blockers=list(plan.blocked), phase="post-confirmation", drops=len(pending_drops))
             return 1
@@ -1550,6 +1844,24 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                  baseline_complete=captured["complete"])
             report.emit(f"phase=baseline status=CAPTURED items={len(captured['items'])} "
                         f"complete={str(captured['complete']).lower()} revision={record['revision']}")
+
+        def created_shares() -> Callable[[dict], Any]:
+            """After an interrupt: read back, through a closed gate, what this run created."""
+            gate.open = False
+            reader = Stacks(WriteGate(router), plan.migration, timeout=args.timeout)
+
+            def read(owner, region):
+                return {} if reader.existing(owner, region) is None else reader.shares(owner, region)
+            found: dict[tuple[str, str], dict] = {}
+            for row in scoped_fanout(group_scopes, read, opts):
+                if row.error:
+                    report.emit(f"owner={row.account} region={row.region} phase=interrupted-readback "
+                                f"status=INCOMPLETE {row.error}")
+                else:
+                    found[row.account, row.region] = row.value
+            return lambda current: current.update(shares=share_records(
+                current.get("shares", []), plan.groups, found, plan.migration))
+        opts.interrupt_readback = created_shares
         gate.open = True
         for row in scoped_fanout(group_scopes,
                                  lambda owner, region: stacks.apply(owner, region, grouped[owner, region]),
@@ -1664,7 +1976,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         status = status_now if sharing_status == "SHARING_READY" else sharing_status
         code = 0 if status in ("MIGRATION_VALIDATED", "PENDING_MIGRATION") else \
             3 if status == "INCONCLUSIVE" else 1
-    summary(plan, report, status, created=created, reused=reused,
+    summary(plan, report, status, **run, created=created, reused=reused,
             accepted=accepted_count, reused_invitations=reused_invitations, failures=len(failures),
             comparison=comparison, unassociated=len(unassociated),
             sharing=sharing_status, migration=status_now)
@@ -1879,8 +2191,45 @@ def run_complete(router: Router, opts: Options, ask: Callable[[str], str], repor
     return 0
 
 
+INTERRUPTED_NEXT = {
+    "apply": "existing temporary shares are retained; re-run apply with this record to resume",
+    "verify": "verify made no AWS changes; re-run verify with this record",
+}
+
+
+def record_interruption(args: argparse.Namespace | None, report: Reporter,
+                        opts: Options | None = None) -> None:
+    """An interrupted apply or verify is history in its record, when one exists. An
+    apply interrupted after its write gate opened also records the temporary shares
+    it created, which verify and complete take their scope from."""
+    if args is None or args.mode not in ("apply", "verify") or not args.record or \
+            not args.migration_id or not Path(args.record).exists():
+        return
+    mutate: Callable[[dict], Any] = lambda _current: None
+    readback = opts.interrupt_readback if opts is not None and args.mode == "apply" else None
+    if readback is not None:
+        report.emit("phase=record status=INTERRUPTING reading back the temporary shares this "
+                    "run created")
+        try:
+            mutate = readback()
+        except KeyboardInterrupt:
+            report.emit("phase=record status=INCOMPLETE share readback interrupted; resume apply "
+                        "with this record to record the shares it created")
+        except Exception as exc:
+            report.emit(f"phase=record status=INCOMPLETE share readback {failure_text(exc)}")
+    try:
+        record = update_record(args.record, args.migration_id, mutate, mode=args.mode,
+                               status="INTERRUPTED", retained=INTERRUPTED_NEXT[args.mode])
+        report.emit(f"phase=record status=INTERRUPTED record={args.record} "
+                    f"revision={record['revision']} recorded_shares={len(record.get('shares', []))} "
+                    f"next_action={INTERRUPTED_NEXT[args.mode]}")
+    except Exception as exc:
+        report.emit(f"phase=record status=NOT_RECORDED {failure_text(exc)}")
+
+
 def main(argv: list[str] | None = None, *, input_fn: Callable[[str], str] | None = None) -> int:
     report = Reporter()
+    args = opts = None
     try:
         args = build_parser().parse_args(argv)
         ask = input_fn if input_fn is not None else input
@@ -1907,6 +2256,7 @@ def main(argv: list[str] | None = None, *, input_fn: Callable[[str], str] | None
         return run_shares(router, opts, ask, report)
     except KeyboardInterrupt:
         report.emit("status=INCOMPLETE Interrupted; existing temporary shares are retained")
+        record_interruption(args, report, opts)
         return 130
     except (MigrationError, OSError, ValueError, EOFError, BotoCoreError, ClientError) as exc:
         report.emit(f"status=BLOCKED {failure_text(exc)}")

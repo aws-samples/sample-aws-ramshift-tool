@@ -5,13 +5,15 @@ import copy
 import json
 import time
 
-import yaml
 from botocore.exceptions import ClientError
 
 from ram_migration_common import (
     PURPOSE, Group, MigrationError, Router, account_id, digest, managed, pages, tags,
 )
-from ram_migration_discovery import ApprovedGroup, CfnLoader, permission_snapshot, policy_semantics
+from ram_migration_discovery import (
+    ApprovedGroup, LookupCache, cached_permission, permission_snapshot, policy_semantics,
+    read_template,
+)
 
 
 def stack_name(migration: str, owner: str, region: str) -> str:
@@ -294,8 +296,12 @@ def validate_changes(changes: list[dict], proposed: dict, previous: dict | None)
 
 
 class Stacks:
-    def __init__(self, router: Router, migration: str, timeout: int = 1800):
+    def __init__(self, router: Router, migration: str, timeout: int = 1800,
+                 cache: LookupCache | None = None):
         self.router, self.migration, self.timeout = router, migration, timeout
+        # Planning reads of version-pinned permissions and of templates (keyed by stack
+        # version) may share the run's cache; fresh=True and writes bypass it.
+        self.cache = cache
 
     def existing(self, owner: str, region: str):
         cfn = self.router.client(owner, "cloudformation", region)
@@ -314,10 +320,9 @@ class Stacks:
             raise MigrationError(f"Migration stack owner does not match {owner}")
         return stack
 
-    def _template(self, owner: str, region: str, stack: dict) -> dict:
-        body = self.router.client(owner, "cloudformation", region).get_template(
-            StackName=stack["StackId"], TemplateStage="Processed")["TemplateBody"]
-        template = yaml.load(body, Loader=CfnLoader) if isinstance(body, str) else body
+    def _template(self, owner: str, region: str, stack: dict, *, fresh: bool = False) -> dict:
+        template = read_template(None if fresh else self.cache, owner, region,
+                                 self.router.client(owner, "cloudformation", region), stack)
         _validate_template(template, self.migration, owner)
         for logical, item in template["Resources"].items():
             if item["Metadata"]["OwnerRegion"] != region:
@@ -326,22 +331,28 @@ class Stacks:
                 raise MigrationError(f"{logical}: existing permission approval missing; reconcile explicitly")
         return template
 
-    def prepare(self, owner: str, region: str, groups: list[Group]) -> tuple[dict, dict | None]:
+    def prepare(self, owner: str, region: str, groups: list[Group], *,
+                fresh: bool = False) -> tuple[dict, dict | None]:
+        """The current default of every permission is always reread, so approval evidence
+        is compared with AWS, never with discovery's cached read of it. fresh=True also
+        rereads the template: the post-confirmation recheck and apply never rely on
+        what planning read earlier."""
         old = self.existing(owner, region)
         if any(g.owner != owner or g.region != region for g in groups):
             raise MigrationError("Migration group does not belong to the selected owner/Region")
-        fresh = template_for(groups, self.migration)
+        proposed = template_for(groups, self.migration)
         if old is not None and old["StackStatus"] not in ("CREATE_COMPLETE", "UPDATE_COMPLETE"):
             raise MigrationError(
                 f"{old['StackStatus']}: existing migration stack cannot be retried automatically; "
                 "inspect and explicitly reconcile the failed/pending operation. "
                 "Successful partial resources remain retained; do not delete the stack.")
         ram = self.router.client(owner, "ram", region)
+        defaults = LookupCache()  # read fresh, once per permission for this preflight
         for group in groups:
-            metadata = fresh["Resources"][group.logical_id]["Metadata"]
+            metadata = proposed["Resources"][group.logical_id]["Metadata"]
             snapshots = metadata["PermissionSnapshots"]
             for kind, arn in group.permissions.items():
-                current = permission_snapshot(ram, arn)
+                current = cached_permission(defaults, owner, region, ram, arn)
                 if current["ResourceType"] != kind or not current["DefaultVersion"]:
                     raise MigrationError(f"{arn}: permission resource type/default version differs")
                 approved = snapshots.get(kind)
@@ -350,9 +361,9 @@ class Stacks:
                     raise MigrationError(f"{arn}: managed permission changed since plan approval")
                 snapshots[kind] = current
         if old is None:
-            return fresh, old
-        previous = self._template(owner, region, old)
-        return additive_template(previous, fresh, self.migration), old
+            return proposed, old
+        previous = self._template(owner, region, old, fresh=fresh)
+        return additive_template(previous, proposed, self.migration), old
 
     def persisted_groups(self, owner: str, region: str) -> list[Group]:
         """Recover the approved entitlement matrix from its owning CFN template."""
@@ -373,7 +384,8 @@ class Stacks:
                 if len(matches) != 1:
                     raise MigrationError(f"{logical}: ambiguous approved permission ARN")
                 approved = matches[0]
-                current = permission_snapshot(ram, arn, approved["Version"])
+                current = cached_permission(self.cache, owner, region, ram, arn,
+                                            approved["Version"])
                 kind = current["ResourceType"]
                 if approved.get("ResourceType") != kind or \
                         policy_semantics(approved["Policy"]) != current["Policy"] or kind in permissions:
@@ -402,13 +414,15 @@ class Stacks:
         return groups
 
     def apply(self, owner: str, region: str, groups: list[Group]) -> str:
-        body, old = self.prepare(owner, region, groups)
+        body, old = self.prepare(owner, region, groups, fresh=True)
         text = json.dumps(body, sort_keys=True)
         if len(text.encode()) > 51200:
             raise MigrationError("Migration template exceeds inline CFN limit; split the scope explicitly")
-        cfn = self.router.client(owner, "cloudformation", region, write=True)
-        previous = self._template(owner, region, old) if old is not None else None
+        previous = self._template(owner, region, old, fresh=True) if old is not None else None
         name = stack_name(self.migration, owner, region)
+        if previous is not None and body == previous:
+            return name  # every planned entitlement is already deployed: nothing to write
+        cfn = self.router.client(owner, "cloudformation", region, write=True)
         change_name = "ram-" + digest(body) + "-" + str(time.time_ns())
         changes = cfn.create_change_set(
             StackName=name, ChangeSetName=change_name, ChangeSetType="UPDATE" if old else "CREATE",
@@ -456,7 +470,7 @@ class Stacks:
         stack = self.existing(owner, region)
         if stack is None:
             return "ABSENT"
-        template = self._template(owner, region, stack)
+        template = self._template(owner, region, stack, fresh=True)
         reader = self.router.client(owner, "cloudformation", region)
         ram = self.router.client(owner, "ram", region)
         for row in pages(reader, "list_stack_resources", "StackResourceSummaries",
