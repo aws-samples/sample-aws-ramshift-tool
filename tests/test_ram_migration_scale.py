@@ -775,9 +775,11 @@ def test_interrupted_apply_exits_130_keeps_created_shares_and_records_history(
     output = capsys.readouterr().out
     assert "created_shares=2 reused_shares=1" in output and "status=SHARING_READY" in output
     assert len(record_module.load(migration_record, MIGRATION)["shares"]) == 3
+    # Each completed stack is recorded at once; an unchanged, recorded stack is not again.
     assert history(migration_record) == [
-        ("plan", "PLANNED"), ("apply", "BASELINE_CAPTURED"), ("apply", "INTERRUPTED"),
-        ("verify", "PENDING_MIGRATION"), ("apply", "SHARING_READY")]
+        ("plan", "PLANNED"), ("apply", "BASELINE_CAPTURED"), ("apply", "STACK_COMPLETE"),
+        ("apply", "INTERRUPTED"), ("verify", "PENDING_MIGRATION"), ("apply", "STARTED"),
+        ("apply", "STACK_COMPLETE"), ("apply", "STACK_COMPLETE"), ("apply", "SHARING_READY")]
 
 
 def test_an_interrupted_share_readback_still_records_the_interruption(
@@ -802,7 +804,9 @@ def test_an_interrupted_share_readback_still_records_the_interruption(
     output = capsys.readouterr().out
     assert "phase=record status=INCOMPLETE share readback interrupted" in output
     record = record_module.load(migration_record, MIGRATION)
-    assert record["shares"] == [] and history(migration_record)[-1] == ("apply", "INTERRUPTED")
+    # The stack that completed before the interrupt was recorded when it completed.
+    assert [share["owner"] for share in record["shares"]] == [OWNER]
+    assert history(migration_record)[-2:] == [("apply", "STACK_COMPLETE"), ("apply", "INTERRUPTED")]
 
 
 def test_interrupted_verify_records_verify_as_its_resume_step(harness, capsys, migration_record):

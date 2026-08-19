@@ -1941,15 +1941,15 @@ def test_repeated_apply_of_an_up_to_date_stack_writes_nothing(clients):
     cfn, name = stubs["cloudformation"], stack_name(MIGRATION, OWNER, REGION)
     read = {"StackName": STACK_ID, "TemplateStage": "Processed"}
     stacks = Stacks(OfflineRouter(cs), MIGRATION, cache=LookupCache())
+    # The share exists, so it is checked against the version it keeps, not the default.
+    attached = {"permissionArn": PERMISSION, "permissionVersion": 2}
     cfn.add_response("describe_stacks", {"Stacks": [stack_info()]}, {"StackName": name})
-    stubs["ram"].add_response("get_permission", {"permission": permission()},
-                              {"permissionArn": PERMISSION})
     cfn.add_response("get_template", {"TemplateBody": body}, read)
+    stubs["ram"].add_response("get_permission", {"permission": permission()}, attached)
     stacks.prepare(OWNER, REGION, [g])  # planning reads the template once ...
     stacks._template(OWNER, REGION, stack_info())  # ... and reuses it for that stack version
     cfn.add_response("describe_stacks", {"Stacks": [stack_info()]}, {"StackName": name})
-    stubs["ram"].add_response("get_permission", {"permission": permission()},
-                              {"permissionArn": PERMISSION})
+    stubs["ram"].add_response("get_permission", {"permission": permission()}, attached)
     cfn.add_response("get_template", {"TemplateBody": body}, read)  # prepare: fresh
     cfn.add_response("get_template", {"TemplateBody": body}, read)  # apply: fresh
     assert stacks.apply(OWNER, REGION, [g]) == name  # strict stubs: no change set at all
@@ -2022,3 +2022,227 @@ def test_sdk_retries_throttled_reads_with_a_bounded_attempt_count(monkeypatch, c
         pages(Api(client), "get_resource_shares", "resourceShares", resourceOwner="SELF")
     assert raised.value.response["Error"]["Code"] == code
     assert len(sent) == 9  # the initial attempt plus CONFIG's 8 retries, then fail closed
+
+
+# ---------------------------------------------------------------------------
+# Existing temporary shares keep their version; overrides never hide a migrating
+# owner's stationary consumers; stack change evidence is self-consistent
+# ---------------------------------------------------------------------------
+BROADER = {"Version": "2012-10-17", "Statement": [{
+    "Effect": "Allow", "Action": ["route53resolver:GetResolverRule",
+                                "route53resolver:AssociateResolverRule",
+                                "route53resolver:DisassociateResolverRule"], "Resource": "*"}]}
+
+
+def kept(version="2", policy=None):
+    """What an existing temporary share's template records that it attaches."""
+    return {"Arn": PERMISSION, "Version": version, "ResourceType": KIND,
+            "Policy": policy_semantics(policy or POLICY), "DefaultVersion": True}
+
+
+def stub_attached_share(stubs, attached="2", default="3", default_policy=None):
+    """One source share for CONSUMER attaching ``attached``; the default is ``default``."""
+    ram = stubs["ram"]
+    ram.add_response("get_resource_shares", {"resourceShares": [
+        {"resourceShareArn": SOURCE, "owningAccountId": OWNER, "status": "ACTIVE", "tags": []}]},
+        {"resourceOwner": "SELF"})
+    ram.add_response("list_resources", {"resources": [resource()]},
+                     {"resourceOwner": "SELF", "resourceShareArns": [SOURCE]})
+    ram.add_response("get_resource_share_associations", {"resourceShareAssociations": [
+        association(CONSUMER, "PRINCIPAL", share=SOURCE)]},
+        {"associationType": "PRINCIPAL", "resourceShareArns": [SOURCE]})
+    no_stack(stubs["cloudformation"], physical=True)
+    ram.add_response("list_resource_share_permissions", {"permissions": [{
+        "arn": PERMISSION, "version": attached, "resourceType": KIND,
+        "defaultVersion": attached == default}]}, {"resourceShareArn": SOURCE})
+    ram.add_response("get_permission", {"permission": permission(default, default_policy or BROADER)},
+                     {"permissionArn": PERMISSION})
+
+
+def stub_version(stubs, version, policy):
+    stubs["ram"].add_response("get_permission", {"permission": permission(
+        version, policy, default=False)}, {"permissionArn": PERMISSION,
+                                           "permissionVersion": int(version)})
+
+
+def discover_with(clients, deployed=None, approvals=None):
+    cs, _ = clients
+    return Discovery(OfflineRouter(cs), {CONSUMER}, MIGRATION, {}, {KIND.lower(): True},
+                     approved_changes=approvals, deployed=deployed).inspect(OWNER, REGION)
+
+
+def test_a_newer_default_is_not_a_change_to_an_existing_temporary_share(clients):
+    """Finding 3: the original and the temporary share both attach v2; AWS publishes v3."""
+    _, stubs = clients
+    stub_attached_share(stubs, attached="2", default="3")
+    result = discover_with(clients, deployed={group().key: {KIND: kept("2")}})
+    assert not result.blocked and not result.permission_changes
+    g, = result.groups
+    assert g.key == group().key and g.permission_snapshots == {KIND: kept("2")}
+    assert not g.permission_changes
+    note, = result.notes  # reported explicitly, without an approval request or a blocker
+    assert f"{SOURCE}: owner={OWNER} region={REGION} permission={PERMISSION} " \
+           "status=DEFAULT_CHANGED" in note
+    assert f"existing temporary share {g.logical_id} keeps version 2" in note
+    assert "the current default is version 3 and the original share attaches version 2" in note
+    assert "needs no approval" in note
+
+
+def test_a_new_share_still_needs_approval_for_a_newer_default(clients):
+    """Control for finding 3: nothing is deployed, so a new share would receive v3."""
+    _, stubs = clients
+    stub_attached_share(stubs, attached="2", default="3")
+    stub_version(stubs, "2", POLICY)
+    result = discover_with(clients)
+    assert not result.groups and not result.notes
+    assert result.blocked[0].startswith(f"{SOURCE}: owner={OWNER} region={REGION} Non-default "
+                                        "permission differs from the current default and "
+                                        "requires approval")
+    change, = result.permission_changes
+    assert (change["from_version"], change["to_version"], change["status"]) == (
+        "2", "3", "APPROVAL_REQUIRED")
+    assert change["applies_to"] == "new temporary share (receives the current default)"
+
+
+def test_an_original_upgraded_past_its_temporary_share_is_compared_with_the_kept_version(clients):
+    """The owner moved the original to v3 after its temporary share was created at v2: the
+    temporary share cannot reproduce it, so the exact v3 -> v2 difference needs approval."""
+    _, stubs = clients
+    stub_attached_share(stubs, attached="3", default="3")
+    stub_version(stubs, "3", BROADER)
+    result = discover_with(clients, deployed={group().key: {KIND: kept("2")}})
+    assert not result.groups
+    logical = group().logical_id
+    assert f"Attached permission differs from the version its existing temporary share {logical} " \
+           "keeps and requires approval" in result.blocked[0]
+    assert f"{PERMISSION} v3->v2 (grants less: " in result.blocked[0]
+    change, = result.permission_changes
+    assert (change["from_version"], change["to_version"]) == ("3", "2")
+    assert change["to_policy_sha256"] == policy_sha256(POLICY)
+    assert change["applies_to"] == f"existing temporary share {logical} (keeps version 2)"
+    # The bound approval admits it onto the existing share, which keeps v2.
+    stub_attached_share(stubs, attached="3", default="3")
+    stub_version(stubs, "3", BROADER)
+    granted = approval(changes=[change])
+    approved = discover_with(clients, deployed={group().key: {KIND: kept("2")}}, approvals=[granted])
+    g, = approved.groups
+    assert g.permission_snapshots == {KIND: kept("2")}
+    row, = g.permission_changes
+    assert (row["approval_id"], row["from_version"], row["to_version"]) == (
+        granted["approval_id"], "3", "2")
+
+
+def existing_stack(stubs, groups):
+    cfn = stubs["cloudformation"]
+    cfn.add_response("describe_stacks", {"Stacks": [stack_info()]},
+                     {"StackName": stack_name(MIGRATION, OWNER, REGION)})
+    cfn.add_response("get_template", {"TemplateBody": json.dumps(template_for(groups, MIGRATION))},
+                     {"StackName": STACK_ID, "TemplateStage": "Processed"})
+
+
+def test_preflight_checks_an_existing_share_against_its_kept_version_not_the_default(clients):
+    """Finding 3: prepare no longer reports 'changed since plan approval' for a deployed
+    share whose version is no longer the default; it rereads that version instead."""
+    cs, stubs = clients
+    g = group(approved=True)              # the deployed snapshot is v2
+    existing_stack(stubs, [g])
+    stub_version(stubs, "2", POLICY)      # never the current default
+    body, old = Stacks(OfflineRouter(cs), MIGRATION).prepare(OWNER, REGION, [g], fresh=True)
+    assert body == template_for([g], MIGRATION) and old["StackId"] == STACK_ID
+    stale = group(approved=True)
+    stale.permission_snapshots = {KIND: kept("3", BROADER)}
+    existing_stack(stubs, [g])
+    with pytest.raises(MigrationError, match=r"permission evidence differs from existing "
+                                             r"temporary share .*keeps version 2"):
+        Stacks(OfflineRouter(cs), MIGRATION).prepare(OWNER, REGION, [stale], fresh=True)
+
+
+def existing_change():
+    prior = {"Arn": PERMISSION, "Version": "3", "ResourceType": KIND,
+             "Policy": policy_semantics(BROADER), "DefaultVersion": True}
+    change = permission_change(OWNER, REGION, SOURCE, prior, kept("2"))
+    return {**{k: change[k] for k in (
+        "share", "permission_arn", "resource_type", "from_version", "to_version",
+        "from_policy_sha256", "to_policy_sha256")}, "approval_id": "pc-existing"}
+
+
+def stub_existing_revalidation(stubs, attached="3", kept_policy=None):
+    stubs["ram"].add_response("list_resource_share_permissions", {"permissions": [{
+        "arn": PERMISSION, "version": attached, "resourceType": KIND, "defaultVersion": True}]},
+        {"resourceShareArn": SOURCE})
+    if attached != "3":
+        return
+    stub_version(stubs, "3", BROADER)
+    stub_version(stubs, "2", kept_policy or POLICY)
+
+
+def test_revalidation_of_a_change_onto_an_existing_share_reads_its_kept_version(clients):
+    cs, stubs = clients
+    stub_existing_revalidation(stubs)     # the current default is not read at all
+    revalidate_change(Api(cs["ram"]), existing_change(), existing=kept("2"))
+
+
+@pytest.mark.parametrize("drift,message", [
+    ({"attached": "4"}, "attached permission version changed since approval pc-existing"),
+    ({"kept_policy": BROADER}, "permission changed since approval pc-existing"),
+    ({"existing": "3"}, "permission changed since approval pc-existing"),
+])
+def test_revalidation_onto_an_existing_share_voids_the_approval_on_any_drift(clients, drift, message):
+    cs, stubs = clients
+    existing = kept(drift.pop("existing", "2"))
+    stub_existing_revalidation(stubs, **drift)
+    with pytest.raises(MigrationError, match=message) as raised:
+        revalidate_change(Api(cs["ram"]), existing_change(), existing=existing)
+    assert "re-run plan --record, review it and approve any request it shows" in str(raised.value)
+
+
+@pytest.mark.parametrize("live,configured", [
+    ([CONSUMER, OTHER], None),            # the stationary consumer holds the share now
+    ([CONSUMER], [CONSUMER, OTHER]),      # the owning template configures it
+])
+def test_a_principal_map_override_never_hides_a_migrating_owners_stationary_consumers(
+        clients, live, configured):
+    """Finding 16: the override lists only the migrating consumer."""
+    cs, stubs = clients
+    if configured is None:
+        stub_discovery(stubs, principals={SOURCE: live}, read_permissions=False)
+    else:
+        stub_original_principals(stubs, live, configured)
+    result = Discovery(OfflineRouter(cs), {CONSUMER, OWNER}, MIGRATION, {SOURCE: [CONSUMER]},
+                       {KIND.lower(): True}, migrating_owners={OWNER}).inspect(OWNER, REGION)
+    assert not result.groups and not result.excluded
+    reason, = result.blocked
+    assert f"migrating owner {OWNER} shares with stationary consumers ['{OTHER}']" in reason
+    assert "a principal-map override does not remove the share's live or owning-template " \
+           "principals from this check" in reason
+
+
+def test_change_evidence_must_end_at_the_recorded_snapshot_and_be_a_real_change():
+    """Finding 6: ToPolicySha256 is checked against the permission snapshot."""
+    g = approved_group(approval())
+    template = template_for([g], MIGRATION)
+    _validate_template(template, MIGRATION)
+    for key, value in (("ToPolicySha256", "f" * 64), ("FromVersion", "2")):
+        tampered = copy.deepcopy(template)
+        tampered["Resources"][g.logical_id]["Metadata"]["PermissionChanges"][0][key] = value
+        with pytest.raises(MigrationError, match="permission-change approval metadata"):
+            _validate_template(tampered, MIGRATION)
+
+
+def test_a_later_change_of_the_same_share_is_recorded_beside_the_first():
+    """An original that moves to another version after its temporary share exists needs a
+    second, separately approved change; the first stays as evidence."""
+    first = approved_group(approval())
+    old = template_for([first], MIGRATION)
+    later = copy.deepcopy(first)
+    later.permission_changes = [dict(first.permission_changes[0], from_version="3",
+                                     from_policy_sha256="e" * 64, approval_id="pc-later")]
+    merged = additive_template(old, template_for([later], MIGRATION), MIGRATION)
+    rows = merged["Resources"][first.logical_id]["Metadata"]["PermissionChanges"]
+    assert [(row["FromVersion"], row["ApprovalId"]) for row in rows] == [
+        ("1", first.permission_changes[0]["approval_id"]), ("3", "pc-later")]
+    _validate_template(merged, MIGRATION)
+    duplicate = copy.deepcopy(merged)
+    duplicate["Resources"][first.logical_id]["Metadata"]["PermissionChanges"].append(rows[0])
+    with pytest.raises(MigrationError, match="duplicate permission-change approval metadata"):
+        _validate_template(duplicate, MIGRATION)

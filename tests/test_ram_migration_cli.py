@@ -81,9 +81,14 @@ class LocalClients:
         return {"Regions": self.harness.enabled_regions[self.account]}
 
     def get_resource_shares(self, **kwargs):
+        key = self.account, self.region
+        if kwargs["resourceOwner"] == "SELF":   # what a migrating account owns itself
+            self.harness.calls.append(("owned-shares", self.account, self.region, kwargs))
+            if key in self.harness.owned_errors:
+                raise self.harness.owned_errors[key]
+            return {"resourceShares": copy.deepcopy(self.harness.owned_shares[key])}
         assert kwargs["resourceOwner"] == "OTHER-ACCOUNTS"
         self.harness.calls.append(("received-shares", self.account, self.region, kwargs))
-        key = self.account, self.region
         if key in self.harness.received_errors:
             raise self.harness.received_errors[key]
         pages = self.harness.received_share_pages.get(key)
@@ -267,6 +272,8 @@ class Harness:
         self.received_share_pages = {}
         self.received_resource_pages = {}
         self.received_errors = {}
+        self.owned_shares = defaultdict(list)    # (account, region) -> shares it owns
+        self.owned_errors = {}
         self.region_errors = {}
         self.enabled_regions = defaultdict(lambda: [
             {"RegionName": HOME, "OptInStatus": "opt-in-not-required"},
@@ -451,7 +458,8 @@ def harness(monkeypatch):
 
 
 CURRENT = {}
-_UNSNAPSHOTTED = {"router"}
+# Rewritten by every run; the discovery kwargs hold the run cache, which holds a lock.
+_UNSNAPSHOTTED = {"router", "discovery_kwargs"}
 
 
 @pytest.fixture(autouse=True)
@@ -1465,7 +1473,8 @@ def with_record(argv, path):
 @pytest.fixture
 def revalidations(monkeypatch):
     seen = []
-    monkeypatch.setattr(cli, "revalidate_change", lambda client, change: seen.append(change))
+    monkeypatch.setattr(cli, "revalidate_change",
+                        lambda client, change, existing=None: seen.append(change))
     return seen
 
 
@@ -1538,7 +1547,10 @@ def test_approved_change_is_revalidated_then_applied_and_recorded(harness, capsy
     record = record_module.load(migration_record, MIGRATION)
     assert [(h["mode"], h["status"]) for h in record["history"]] == [
         ("plan", "BLOCKED"), ("approve", "APPROVED"), ("plan", "PLANNED"),
-        ("apply", "BASELINE_CAPTURED"), ("apply", "SHARING_READY")]
+        ("apply", "BASELINE_CAPTURED"), ("apply", "STACK_COMPLETE"), ("apply", "SHARING_READY")]
+    # Every apply entry names the reviewed plan it consumed.
+    assert {(h["plan_revision"], h["plan_digest"]) for h in record["history"]
+            if h["mode"] == "apply"} == {(3, record["plan"]["digest"])}
     share, = record["shares"]
     assert share["share_arn"].startswith(f"arn:aws:ram:{REGION}:{OWNER}:resource-share/temporary-")
 
@@ -1547,7 +1559,7 @@ def test_permission_drift_after_approval_blocks_every_write(harness, capsys, mig
                                                             monkeypatch):
     plan_and_approve(harness, migration_record, capsys)
 
-    def drifted(_client, change):
+    def drifted(_client, change, existing=None):
         raise cli.MigrationError(f"{change['permission_arn']}: permission changed since approval")
     monkeypatch.setattr(cli, "revalidate_change", drifted)
     assert main(with_record(args("apply"), migration_record), input_fn=harness.confirm) == 1
@@ -2080,11 +2092,22 @@ def test_verify_reads_every_recorded_region_including_consumer_dependency_region
     assert not any(call[0] in ("discovery", "received-shares") for call in harness.calls)
 
 
+def baseline_without(path, consumer):
+    """A record from a release whose apply could add a consumer after the baseline was
+    captured: the baseline has no organization and no items for that consumer."""
+    baseline = read_record(path)["baseline"]
+    rewrite(path, baseline=dict(
+        baseline, items=[i for i in baseline["items"] if i.get("consumer") != consumer],
+        consumer_organizations={c: o for c, o in baseline["consumer_organizations"].items()
+                                if c != consumer}))
+
+
 def test_consumer_without_a_baseline_organization_is_never_validated(harness, capsys, migration_record):
-    applied(harness, migration_record)  # the recorded baseline covers CONSUMER only
     harness.source[OWNER, REGION].append(group(consumer=OTHER_CONSUMER))
-    record = applied(harness, migration_record, args(consumers=f"{CONSUMER},{OTHER_CONSUMER}"))
-    assert record["baseline"]["consumer_organizations"] == {CONSUMER: "o-sourceorg01"}
+    applied(harness, migration_record, args(consumers=f"{CONSUMER},{OTHER_CONSUMER}"))
+    baseline_without(migration_record, OTHER_CONSUMER)
+    assert read_record(migration_record)["baseline"]["consumer_organizations"] == {
+        CONSUMER: "o-sourceorg01"}
     harness.organizations[CONSUMER] = "o-destination1"  # OTHER_CONSUMER never left
     capsys.readouterr()
     assert main(mode_args("verify", migration_record)) == 3
@@ -2398,9 +2421,9 @@ def test_complete_refuses_a_record_without_temporary_shares(harness, capsys, mig
 
 
 def test_complete_refuses_a_consumer_the_baseline_never_covered(harness, capsys, migration_record):
-    applied(harness, migration_record)
     harness.source[OWNER, REGION].append(group(consumer=OTHER_CONSUMER))
     applied(harness, migration_record, args(consumers=f"{CONSUMER},{OTHER_CONSUMER}"))
+    baseline_without(migration_record, OTHER_CONSUMER)
     capsys.readouterr()
     refused(harness, migration_record, capsys,
             f"consumer {OTHER_CONSUMER} is not covered by the original baseline")
@@ -2593,3 +2616,468 @@ def test_already_complete_record_is_a_no_op(harness, capsys, migration_record):
             f"at={record['completion']['completed_at']}") in capsys.readouterr().out
     assert [call[0] for call in harness.calls] == ["router"]
     assert read_record(migration_record) == record
+
+
+# ---------------------------------------------------------------------------
+# Recorded change history, the locked write gate, per-stack recording, migrating
+# owners found by their shares, Region exclusions, export safety, baseline coverage
+# ---------------------------------------------------------------------------
+from ram_migration_discovery import policy_semantics  # noqa: E402
+
+
+def what_the_real_check_raises_now(monkeypatch):
+    """revalidate_change against an original share that left the approved version."""
+    seen = []
+
+    def revalidate(_client, change, existing=None):
+        seen.append(change)
+        raise MigrationError(f"{change['share']}: attached permission version changed since "
+                             f"approval {change['approval_id']}; re-run plan --record, review it "
+                             "and approve any request it shows")
+    monkeypatch.setattr(cli, "revalidate_change", revalidate)
+    return seen
+
+
+@pytest.mark.parametrize("original", ["upgraded", "deleted"])
+def test_an_applied_permission_change_is_history_and_never_blocks_a_later_apply(
+        harness, capsys, migration_record, revalidations, monkeypatch, original):
+    """Findings 2 and 21: the change was approved and applied, then the owner moved the
+    original share to the default version or deleted it."""
+    request = plan_and_approve(harness, migration_record, capsys)
+    assert main(with_record(args("apply"), migration_record), input_fn=harness.confirm) == 0
+    assert [c["approval_id"] for c in revalidations] == [request["id"]]
+    harness.permission_changes.clear()          # discovery reports no change any more
+    if original == "deleted":
+        harness.source = {}
+    seen = what_the_real_check_raises_now(monkeypatch)
+    assert main(with_record(args(), migration_record)) == 0
+    assert main(["approve", "--record", str(migration_record)],
+                input_fn=lambda _p: pytest.fail("nothing is pending")) == 0
+    harness.calls.clear()
+    capsys.readouterr()
+    assert main(with_record(args("apply"), migration_record), input_fn=harness.confirm) == 0
+    output = capsys.readouterr().out
+    assert (f"share={ORIGINAL_SHARE} phase=permission-revalidation status=ALREADY_APPLIED "
+            f"approval={request['id']}") in output
+    assert "status=SHARING_READY" in summary_line(output)
+    assert seen == [] and not harness.writes()
+
+
+def test_a_new_change_joining_an_existing_share_is_revalidated_against_its_kept_version(
+        harness, capsys, migration_record, monkeypatch):
+    """A second original share joins an existing temporary share and needs an approved
+    change. The change is new, so it is revalidated, against the version the existing
+    share keeps rather than the current default."""
+    kept_v3 = {"Arn": IPAM_PERMISSION, "Version": "3", "ResourceType": IPAM,
+               "Policy": policy_semantics(V3), "DefaultVersion": True}
+    first = ApprovedGroup(OWNER, REGION, (CONSUMER,), {IPAM: IPAM_PERMISSION}, {POOL: IPAM},
+                          [ORIGINAL_SHARE], {IPAM: kept_v3}, [])
+    harness.source[OWNER, REGION] = [first]
+    applied(harness, migration_record)
+    second = ORIGINAL_SHARE + "-second"
+    joining = copy.deepcopy(first)
+    joining.source_shares = [second]            # the same entitlement through another original
+    harness.source[OWNER, REGION] = [first, joining]
+    harness.permission_changes[OWNER, REGION] = [dict(tgw_like_change(), share=second)]
+    assert quietly(with_record(args(), migration_record)) == 1
+    request, = read_record(migration_record)["permission_change_requests"]
+    token = f"APPROVE {MIGRATION} {request['id']}"
+    assert quietly(["approve", "--record", str(migration_record)], lambda _p: token) == 0
+    assert quietly(with_record(args(), migration_record)) == 0
+    seen = []
+    monkeypatch.setattr(cli, "revalidate_change",
+                        lambda _client, change, existing=None: seen.append((change["share"], existing)))
+    capsys.readouterr()
+    assert main(with_record(args("apply"), migration_record), input_fn=harness.confirm) == 0
+    assert seen == [(second, kept_v3)]
+    assert (f"share={second} phase=permission-revalidation status=VERIFIED "
+            f"approval={request['id']}") in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("mode", ["plan", "apply", "verify", "new-record"])
+def test_stack_change_evidence_must_be_approved_by_this_record(
+        harness, capsys, migration_record, revalidations, tmp_path, mode):
+    """Finding 6: a migration stack row naming an approval this record does not hold, or
+    that differs from it, is never trusted, in any mode that reads the stacks."""
+    plan_and_approve(harness, migration_record, capsys)
+    assert main(with_record(args("apply"), migration_record), input_fn=harness.confirm) == 0
+    stored, = harness.stored[OWNER, REGION]
+    approval_id = stored.permission_changes[0]["approval_id"]
+    if mode != "new-record":                     # the stack metadata was edited
+        approval_id = "pc-anything"
+        stored.permission_changes = [dict(stored.permission_changes[0], approval_id=approval_id)]
+    harness.calls.clear()
+    capsys.readouterr()
+    argv = {"plan": with_record(args(), migration_record),
+            "apply": with_record(args("apply"), migration_record),
+            "verify": mode_args("verify", migration_record),
+            "new-record": with_record(args(), tmp_path / "started-again.json")}[mode]
+    assert main(argv, input_fn=lambda _: pytest.fail("blocked before confirmation")) == 1
+    output = capsys.readouterr().out
+    assert (f"phase=approval-evidence owner={OWNER} region={REGION} share={ORIGINAL_SHARE} "
+            f"migration stack share {stored.logical_id} records permission change {approval_id} "
+            f"({IPAM_PERMISSION} v2->v3), which this migration record does not approve") in output
+    assert "category=approval-evidence blockers=1 " in output
+    assert "approvals never transfer between records" in output
+    assert not harness.writes()
+
+
+@pytest.mark.parametrize("concurrent", ["blocked", "identical", "changed"])
+def test_a_plan_recorded_while_apply_waits_for_confirmation_blocks_at_the_write_gate(
+        harness, capsys, migration_record, concurrent):
+    """Finding 7: apply rereads the record under its lock immediately before writing."""
+    assert quietly(with_record(args(), migration_record)) == 0
+
+    def confirm(prompt):                        # a second operator re-plans meanwhile
+        saved = snapshot(harness)
+        if concurrent == "blocked":
+            harness.discovery_errors[OWNER, HOME] = "a blocker the second plan found"
+        elif concurrent == "changed":
+            harness.source[OWNER, REGION].append(pool_group("added", permission=OTHER_PERMISSION))
+        quietly(with_record(args(), migration_record))
+        restore(harness, saved)
+        return harness.confirm(prompt)
+    capsys.readouterr()
+    assert main(with_record(args("apply"), migration_record), input_fn=confirm) == 1
+    output = capsys.readouterr().out
+    assert ("phase=preflight status=BLOCKED phase=reviewed-record the migration record changed "
+            "while this apply waited for confirmation, and nothing was written: ") in output
+    assert "category=reviewed-record-mismatch blockers=1 " in output
+    assert not harness.writes() and not any(call[0] == "apply" for call in harness.calls)
+    record = read_record(migration_record)
+    assert record["baseline"] is None and record["shares"] == []
+    assert [(h["mode"], h["status"]) for h in record["history"]] == [
+        ("plan", "PLANNED"), ("plan", "BLOCKED" if concurrent == "blocked" else "PLANNED"),
+        ("apply", "BLOCKED")]
+    last = record["history"][-1]
+    assert (last["phase"], last["plan_revision"]) == ("write-gate", 1)
+
+
+def test_a_plan_recorded_while_apply_writes_is_kept_and_named_in_its_outcome(
+        harness, capsys, migration_record, monkeypatch):
+    assert quietly(with_record(args(), migration_record)) == 0
+
+    class Stacks(cli.Stacks):
+        def apply(self, owner, region, groups):
+            quietly(with_record(args(), migration_record))  # re-plan while the stack is written
+            return super().apply(owner, region, groups)
+    monkeypatch.setattr(cli, "Stacks", Stacks)
+    capsys.readouterr()
+    assert main(with_record(args("apply"), migration_record), input_fn=harness.confirm) == 0
+    assert ("phase=record status=PLAN_SUPERSEDED plan revision 3 was recorded while this apply "
+            "ran; this apply applied reviewed revision 1 only") in capsys.readouterr().out
+    entry = read_record(migration_record)["verifications"][-1]
+    assert (entry["plan_revision"], entry["plan_superseded_by"]) == (1, 3)
+
+
+def test_each_stack_is_recorded_as_soon_as_it_completes(harness, capsys, migration_record,
+                                                        monkeypatch):
+    """Finding 9: a run killed while a later stack is written keeps the earlier one."""
+    harness.source[OTHER_OWNER, REGION] = [group(owner=OTHER_OWNER)]
+    recorded_before = {}
+
+    class Stacks(cli.Stacks):
+        def apply(self, owner, region, groups):
+            recorded_before[owner] = [s["owner"] for s in read_record(migration_record)["shares"]]
+            return super().apply(owner, region, groups)
+    monkeypatch.setattr(cli, "Stacks", Stacks)
+    argv = args(owners=f"{OWNER},{OTHER_OWNER}") + ["--account-workers", "1"]
+    assert quietly(with_record(argv, migration_record)) == 0
+    capsys.readouterr()
+    assert main(with_record(["apply", *argv], migration_record), input_fn=harness.confirm) == 0
+    assert recorded_before == {OWNER: [], OTHER_OWNER: [OWNER]}
+    assert f"owner={OWNER} region={REGION} phase=record status=STACK_COMPLETE revision=3 " \
+           "stack_shares=1" in capsys.readouterr().out
+    record = read_record(migration_record)
+    assert [h["status"] for h in record["history"]] == [
+        "PLANNED", "BASELINE_CAPTURED", "STACK_COMPLETE", "STACK_COMPLETE", "SHARING_READY"]
+    assert {(h["owner"], h["plan_revision"]) for h in record["history"]
+            if h["status"] == "STACK_COMPLETE"} == {(OWNER, 1), (OTHER_OWNER, 1)}
+
+
+@pytest.mark.parametrize("error,raised", [(MigrationError("collector failed"), None),
+                                          (KeyError("unexpected"), KeyError)])
+def test_a_failure_after_the_write_gate_records_the_outcome_and_the_created_shares(
+        harness, capsys, migration_record, monkeypatch, error, raised):
+    """Findings 9 and 23: a failure that is not an interrupt is recorded too."""
+    real = cli.observe
+
+    def observe(router, groups, temporary, opts, report, phase):
+        if phase == "post-apply":
+            raise error
+        return real(router, groups, temporary, opts, report, phase)
+    monkeypatch.setattr(cli, "observe", observe)
+    assert quietly(with_record(args(), migration_record)) == 0
+    capsys.readouterr()
+    argv = with_record(args("apply"), migration_record)
+    if raised:
+        with pytest.raises(raised):
+            main(argv, input_fn=harness.confirm)
+    else:
+        assert main(argv, input_fn=harness.confirm) == 1
+    output = capsys.readouterr().out
+    text = "collector failed" if raised is None else "KeyError: 'unexpected'"
+    assert f"status=INCOMPLETE {text}; successful temporary shares are retained" in output
+    assert "phase=record status=INCOMPLETE record=" in output
+    record = read_record(migration_record)
+    last = record["history"][-1]
+    assert (last["mode"], last["status"], last["failures"], last["plan_revision"]) == (
+        "apply", "INCOMPLETE", [text], 1)
+    assert "re-run apply with this record to resume" in last["retained"]
+    share, = record["shares"]
+    assert share["share_arn"] == share_arn(harness.stored[OWNER, REGION][0])
+
+
+def test_a_recorded_share_that_differs_from_its_stack_never_discards_the_outcome(
+        harness, capsys, migration_record):
+    """Finding 9: one share-ARN conflict no longer loses the whole apply outcome."""
+    first, second = pool_group("test"), pool_group("second", permission=OTHER_PERMISSION)
+    harness.source[OWNER, REGION] = [first, second]
+    record = applied(harness, migration_record)
+    stale = share_arn(second) + "-before-the-stack-was-recreated"
+    rewrite(migration_record, shares=[dict(entry, share_arn=stale)
+                                      if entry["logical_id"] == second.logical_id else entry
+                                      for entry in record["shares"]])
+    capsys.readouterr()
+    assert main(with_record(args("apply"), migration_record), input_fn=harness.confirm) == 1
+    output = capsys.readouterr().out
+    conflict = (f"{OWNER}/{REGION}/{second.logical_id}: recorded share {stale} differs from "
+                f"{share_arn(second)}; the recorded share is kept, reconcile it explicitly")
+    assert f"status=INCOMPLETE phase=record {conflict}" in output
+    assert f"phase=record status=CONFLICT {conflict}" in output
+    after = read_record(migration_record)
+    assert {e["logical_id"]: e["share_arn"] for e in after["shares"]} == {
+        first.logical_id: share_arn(first), second.logical_id: stale}
+    assert (after["history"][-1]["mode"], after["history"][-1]["status"]) == ("apply", "INCOMPLETE")
+    assert after["verifications"][-1]["mode"] == "apply"
+
+
+def test_a_cancelled_apply_is_recorded_without_writes(harness, capsys, migration_record):
+    """Finding 23: the CANCELLED return is history too."""
+    assert quietly(with_record(args(), migration_record)) == 0
+    assert main(with_record(args("apply"), migration_record), input_fn=lambda _p: "no") == 2
+    last = read_record(migration_record)["history"][-1]
+    assert (last["mode"], last["status"], last["writes"], last["plan_revision"]) == (
+        "apply", "CANCELLED", "none", 1)
+    assert not harness.writes()
+
+
+def owned(harness, account=CONSUMER, region=REGION, suffix="owned", status="ACTIVE"):
+    share = {"resourceShareArn": f"arn:aws:ram:{region}:{account}:resource-share/{suffix}",
+             "owningAccountId": account, "status": status}
+    harness.owned_shares[account, region].append(share)
+    return share
+
+
+def test_a_migrating_account_that_owns_shares_is_inspected_as_a_migrating_owner(
+        harness, capsys, migration_record):
+    """Finding 17: CONSUMER is given only in --consumers, but owns a share."""
+    harness.enabled_regions[CONSUMER].append({"RegionName": "ap-south-1", "OptInStatus": "opted-in"})
+    share = owned(harness, region="ap-south-1")
+    assert main(with_record(args(), migration_record)) == 0
+    output = capsys.readouterr().out
+    assert (f"account={CONSUMER} region=ap-south-1 share={share['resourceShareArn']} "
+            "phase=owned-audit status=OWNED share_status=ACTIVE") in output
+    assert (f"account={CONSUMER} phase=owned-audit status=MIGRATING_OWNER owned_shares=1 "
+            "regions=ap-south-1") in output
+    owned_reads = {(call[1], call[2]) for call in harness.calls if call[0] == "owned-shares"}
+    assert owned_reads == {(CONSUMER, HOME), (CONSUMER, REGION), (CONSUMER, "ap-south-1")}
+    discovered = {(call[1], call[2]) for call in harness.calls if call[0] == "discovery"}
+    assert {(CONSUMER, HOME), (CONSUMER, REGION), (CONSUMER, "ap-south-1")} <= discovered
+    assert harness.discovery_kwargs["migrating_owners"] == {CONSUMER}
+    scope = read_record(migration_record)["scope"]
+    assert scope["migrating_owners"] == scope["detected_owners"] == [CONSUMER]
+    assert scope["migrating_consumers"] == [] and scope["stationary_owners"] == [OWNER]
+    # The migrating-owner rules apply to its shares: here one shares with a stationary account.
+    harness.discovery_errors[CONSUMER, "ap-south-1"] = (
+        f"{share['resourceShareArn']}: owner={CONSUMER} region=ap-south-1 migrating owner "
+        f"{CONSUMER} shares with stationary consumers ['{OTHER_CONSUMER}']")
+    assert main(with_record(args("apply"), migration_record),
+                input_fn=lambda _: pytest.fail("blocked before confirmation")) == 1
+    assert f"migrating owner {CONSUMER} shares with stationary consumers" in capsys.readouterr().out
+    assert not harness.writes()
+
+
+def test_verify_takes_a_detected_migrating_owner_from_the_record(harness, capsys, migration_record):
+    owned(harness)
+    applied(harness, migration_record)
+    for owners, code in ((OWNER, 0), (f"{OWNER},{CONSUMER}", 0), (OTHER_OWNER, 1)):
+        assert quietly(mode_args("verify", migration_record, "--owners", owners)) == code
+
+
+def test_an_owned_share_read_failure_blocks_and_deleted_owned_shares_are_ignored(harness, capsys):
+    owned(harness, status="DELETED")
+    assert main(args()) == 0
+    assert "status=MIGRATING_OWNER" not in capsys.readouterr().out
+    harness.owned_errors[CONSUMER, HOME] = denied("GetResourceShares")
+    assert main(args("apply"), input_fn=lambda _: pytest.fail("blocked before confirmation")) == 1
+    assert (f"account={CONSUMER} region={HOME} phase=owned-audit status=BLOCKED "
+            "operation=GetResourceShares") in capsys.readouterr().out
+    assert not harness.writes()
+
+
+def test_a_migrating_owner_is_inspected_in_every_region_it_has_enabled(harness, capsys):
+    """Finding 18: not only in --regions and where other migrating accounts receive."""
+    harness.enabled_regions[OTHER_OWNER] = [
+        *harness.enabled_regions[CONSUMER], {"RegionName": "ap-south-1", "OptInStatus": "opted-in"},
+        {"RegionName": "eu-west-1", "OptInStatus": "not-opted-in"}]
+    argv = args(owners=f"{OWNER},{OTHER_OWNER}", consumers=f"{CONSUMER},{OTHER_OWNER}") + [
+        "--profile-map", json.dumps({OTHER_OWNER: "other-owner"})]
+    assert main(argv) == 0
+    output = capsys.readouterr().out
+    assert f"owner={OTHER_OWNER} phase=scope regions=ap-south-1,{HOME},{REGION}" in output
+    assert f"owner={OWNER} phase=scope regions={HOME},{REGION}" in output   # stationary owner
+    discovered = {(call[1], call[2]) for call in harness.calls if call[0] == "discovery"}
+    assert (OTHER_OWNER, "ap-south-1") in discovered
+    assert (OTHER_OWNER, "eu-west-1") not in discovered
+
+
+EXCLUSION = ["--exclude-regions", "eu-central-1", "--exclude-reason", "Control Tower Region deny SCP"]
+EXCLUDED = 'excluded_regions=eu-central-1 exclusion_reason="Control Tower Region deny SCP"'
+
+
+def test_an_explicit_reasoned_region_exclusion_bounds_the_audit_and_is_recorded(
+        harness, capsys, migration_record):
+    """Finding 19: RAM reads are denied in a Region the landing zone does not govern."""
+    harness.enabled_regions[CONSUMER].append({"RegionName": "eu-central-1",
+                                              "OptInStatus": "opt-in-not-required"})
+    harness.received_errors[CONSUMER, "eu-central-1"] = denied("GetResourceShares")
+    assert main(with_record(args(), migration_record)) == 1          # never skipped implicitly
+    assert f"account={CONSUMER} region=eu-central-1 phase=received-audit status=BLOCKED" in \
+        capsys.readouterr().out
+    harness.calls.clear()
+    assert main(with_record(args() + EXCLUSION, migration_record)) == 0
+    output = capsys.readouterr().out
+    assert (f"account={CONSUMER} region=eu-central-1 phase=received-regions "
+            'status=EXCLUDED_BY_OPERATOR reason="Control Tower Region deny SCP"') in output
+    assert EXCLUDED in summary_line(output)
+    assert "Regions eu-central-1 were excluded by the operator (Control Tower Region deny SCP)" in output
+    assert not any(call[0] in ("received-shares", "owned-shares", "discovery") and
+                   call[2] == "eu-central-1" for call in harness.calls)
+    record = read_record(migration_record)
+    assert record["scope"]["excluded_regions"] == {"regions": ["eu-central-1"],
+                                                   "reason": "Control Tower Region deny SCP"}
+    assert main(["approve", "--record", str(migration_record)]) == 0
+    assert f"phase=approve scope=REGIONS_EXCLUDED {EXCLUDED}" in capsys.readouterr().out
+    # apply consumes exactly the reviewed exclusion; verify and complete take it from the record
+    assert main(with_record(args("apply"), migration_record),
+                input_fn=lambda _: pytest.fail("the reviewed scope differs")) == 1
+    assert "differ from reviewed plan revision 2" in capsys.readouterr().out
+    assert main(with_record(args("apply") + EXCLUSION, migration_record), input_fn=harness.confirm) == 0
+    assert EXCLUDED in summary_line(capsys.readouterr().out)
+    assert main(mode_args("verify", migration_record)) == 0
+    assert EXCLUDED in summary_line(capsys.readouterr().out)
+    assert main(mode_args("verify", migration_record, "--exclude-regions", "eu-west-3",
+                          "--exclude-reason", "another reason")) == 1
+    assert "--exclude-regions/--exclude-reason differ from the migration record scope" in \
+        capsys.readouterr().out
+    assert main(complete_args(migration_record), input_fn=confirm_complete(harness)) == 0
+    assert f"original baseline intact {EXCLUDED}" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("extra,message", [
+    (["--exclude-regions", "eu-central-1"], "requires --exclude-reason"),
+    (["--exclude-regions", "eu-central-1", "--exclude-reason", "  "], "requires --exclude-reason"),
+    (["--exclude-reason", "SCP"], "--exclude-reason requires --exclude-regions"),
+    (["--exclude-regions", "eu-central-1", "--exclude-reason", "one\ntwo"], "one line"),
+    (["--exclude-regions", HOME, "--exclude-reason", "SCP"], "cannot be excluded"),
+    (["--exclude-regions", REGION, "--exclude-reason", "SCP"], "both requested"),
+    (["--exclude-regions", "not-a-region", "--exclude-reason", "SCP"], "AWS Region names"),
+])
+def test_region_exclusions_need_a_reason_and_are_refused_before_authentication(
+        harness, capsys, extra, message):
+    assert main(args() + extra) == 1
+    assert message in capsys.readouterr().out
+    assert not harness.calls
+
+
+@pytest.mark.parametrize("mode", ["approve", "monitor"])
+def test_region_exclusions_are_refused_where_nothing_is_inspected(harness, capsys,
+                                                                 migration_record, mode):
+    argv = ["approve", "--record", str(migration_record)] if mode == "approve" else [
+        "monitor", "--profile", "explicit-source", "--monitor-config", "{}"]
+    assert main(argv + EXCLUSION) == 1
+    assert "supported only for plan, apply, verify and complete" in capsys.readouterr().out
+    assert not harness.calls
+
+
+@pytest.mark.parametrize("alias", ["same", "relative", "symlink", "hardlink", "lock", "temporary"])
+@pytest.mark.parametrize("mode", ["plan", "apply"])
+def test_the_plan_export_can_never_overwrite_the_record(harness, capsys, migration_record,
+                                                        monkeypatch, alias, mode):
+    """Finding 22: refused before any AWS call, so the record and its history survive."""
+    import os
+    from pathlib import Path
+    assert quietly(with_record(args(), migration_record)) == 0
+    before = migration_record.read_bytes()
+    folder = migration_record.parent
+    if alias == "same":
+        export = migration_record
+    elif alias == "relative":
+        monkeypatch.chdir(folder.parent)
+        export = Path(folder.name) / ".." / folder.name / migration_record.name
+    elif alias == "symlink":
+        export = folder / "export.json"
+        export.symlink_to(migration_record)
+    elif alias == "hardlink":
+        export = folder / "export.json"
+        os.link(migration_record, export)
+    elif alias == "lock":
+        export = folder / f".{migration_record.name}.lock"
+    else:
+        export = folder / f".{migration_record.name}.tmp-4242"
+    harness.calls.clear()
+    argv = with_record(args("apply" if mode == "apply" else None), migration_record)
+    assert main(argv + ["--export-plan", str(export)],
+                input_fn=lambda _: pytest.fail("refused before confirmation")) == 1
+    assert "would overwrite the migration record" in capsys.readouterr().out
+    assert not harness.calls and migration_record.read_bytes() == before
+
+
+@pytest.mark.parametrize("addition", ["consumer", "resource"])
+def test_apply_never_adds_an_entitlement_the_recorded_baseline_does_not_cover(
+        harness, capsys, migration_record, addition):
+    """A re-planned scope may add a consumer, or a resource for a covered consumer; the
+    baseline is never extended, so apply blocks before writing, per entitlement."""
+    record = applied(harness, migration_record)
+    added = POOL + "-added"
+    if addition == "consumer":
+        harness.source[OWNER, REGION].append(group(consumer=OTHER_CONSUMER))
+        argv, consumer, resource = args(consumers=f"{CONSUMER},{OTHER_CONSUMER}"), OTHER_CONSUMER, POOL
+    else:
+        harness.source[OWNER, REGION][0].resources[added] = IPAM
+        argv, consumer, resource = args(), CONSUMER, added
+    assert quietly(with_record(argv, migration_record)) == 0       # the plan itself is valid
+    capsys.readouterr()
+    assert main(with_record(["apply", *argv], migration_record),
+                input_fn=lambda _: pytest.fail("blocked before confirmation")) == 1
+    output = capsys.readouterr().out
+    assert (f"phase=baseline-scope status=BLOCKED owner={OWNER} region={REGION} "
+            f"consumer={consumer} resource={resource}: this entitlement is not in the recorded "
+            f"original baseline (captured in revision {record['baseline']['captured_in_revision']})"
+            ) in output
+    assert (f"consumer {consumer} has no baseline organization" in output) == (addition == "consumer")
+    assert output.count("phase=preflight status=BLOCKED phase=baseline-scope") == 1
+    assert "category=baseline-scope blockers=1 " in output and "new migration record" in output
+    assert not harness.writes() and not any(call[0] == "apply" for call in harness.calls)
+    after = read_record(migration_record)
+    assert after["baseline"] == record["baseline"] and after["shares"] == record["shares"]
+
+
+def test_verify_and_complete_name_an_entitlement_the_baseline_never_covered(
+        harness, capsys, migration_record):
+    """A record from an earlier release: a covered consumer gained an uncovered entitlement."""
+    added = POOL + "-added"
+    harness.source[OWNER, REGION][0].resources[added] = IPAM
+    applied(harness, migration_record)
+    baseline = read_record(migration_record)["baseline"]
+    rewrite(migration_record, baseline=dict(baseline, items=[
+        item for item in baseline["items"] if item.get("resource_arn") != added]))
+    harness.organizations[CONSUMER] = "o-destination1"
+    reason = (f"entitlement owner={OWNER} region={REGION} consumer={CONSUMER} resource={added} "
+              "is not covered by the original baseline")
+    capsys.readouterr()
+    assert main(mode_args("verify", migration_record)) == 3
+    output = capsys.readouterr().out
+    assert "status=INCONCLUSIVE" in summary_line(output) and reason in output
+    refused(harness, migration_record, capsys, reason)

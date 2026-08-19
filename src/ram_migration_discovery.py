@@ -720,26 +720,38 @@ def cached_permission(cache: LookupCache | None, account: str, region: str, ram:
                   lambda: permission_snapshot(ram, arn, version))
 
 
-def revalidate_change(ram: Any, change: dict) -> None:
-    """Re-read both sides of an approved change just before any write.
+RENEW_APPROVAL = "re-run plan --record, review it and approve any request it shows"
 
-    The original share must still attach the approved version, and the current
-    default must still be the approved version with the approved policy. Any
-    drift voids the approval; a renewed approval is required. Never cached.
+
+def revalidate_change(ram: Any, change: dict, existing: dict | None = None) -> None:
+    """Re-read both sides of an approved change that this apply is about to write.
+
+    The original share must still attach the approved version. The other side is
+    what the temporary share attaches: for a new share the current default, which
+    must still be the approved version with the approved policy; for a share
+    already in the migration stack (``existing``, its recorded permission snapshot)
+    the version it keeps. Any drift voids the approval and a renewed approval is
+    required. Never cached. A change already recorded in the migration stack is
+    history and is not revalidated: its share already attaches the approved version.
     """
     attached = [p for p in pages(ram, "list_resource_share_permissions", "permissions",
                                  resourceShareArn=change["share"])
                 if p.get("arn") == change["permission_arn"]]
     if len(attached) != 1 or attached[0].get("version") != change["from_version"]:
         raise MigrationError(f"{change['share']}: attached permission version changed since "
-                             f"approval {change['approval_id']}; re-run plan and approve again")
+                             f"approval {change['approval_id']}; {RENEW_APPROVAL}")
     prior = permission_snapshot(ram, change["permission_arn"], change["from_version"])
-    default = permission_snapshot(ram, change["permission_arn"])
-    if not default["DefaultVersion"] or default["Version"] != change["to_version"] or \
-            policy_sha256(prior["Policy"]) != change["from_policy_sha256"] or \
-            policy_sha256(default["Policy"]) != change["to_policy_sha256"]:
+    if existing is None:
+        target = permission_snapshot(ram, change["permission_arn"])
+        current = target["DefaultVersion"] and target["Version"] == change["to_version"]
+    else:
+        target = permission_snapshot(ram, change["permission_arn"], change["to_version"])
+        current = existing.get("Version") == change["to_version"] and \
+            policy_sha256(existing["Policy"]) == change["to_policy_sha256"]
+    if not current or policy_sha256(prior["Policy"]) != change["from_policy_sha256"] or \
+            policy_sha256(target["Policy"]) != change["to_policy_sha256"]:
         raise MigrationError(f"{change['permission_arn']}: permission changed since approval "
-                             f"{change['approval_id']}; re-run plan and approve again")
+                             f"{change['approval_id']}; {RENEW_APPROVAL}")
 
 
 def resolve(value: Any, parameters: dict, template: dict, pseudo: dict) -> Any:
@@ -821,7 +833,8 @@ class Discovery:
                  overrides: dict, capabilities: dict[str, bool],
                  approved_changes: list[dict] | None = None,
                  migrating_owners: set[str] | None = None,
-                 share_workers: int = 1, cache: LookupCache | None = None):
+                 share_workers: int = 1, cache: LookupCache | None = None,
+                 deployed: dict[str, dict[str, dict]] | None = None):
         for consumer in consumers:
             account_id(consumer)
         if type(share_workers) is not int or not 1 <= share_workers <= 16:
@@ -832,6 +845,11 @@ class Discovery:
         self.approved_changes = list(approved_changes or [])
         self.migrating_owners = set(migrating_owners or ())
         self.share_workers, self.cache = share_workers, cache
+        # Entitlement key -> {resource type: permission snapshot} of each temporary share
+        # already in a migration stack, as recorded in its template. Such a share keeps
+        # the version it was created with, so a source share joining it is compared
+        # with that version, not with the current default.
+        self.deployed = copy.deepcopy(deployed or {})
 
     def _org(self, owner: str):
         member = self.router.client(owner, "organizations", "us-east-1")
@@ -968,6 +986,7 @@ class Discovery:
         plan.existing.extend(part.existing)
         plan.permission_changes.extend(part.permission_changes)
         plan.blocked.extend(part.blocked)
+        plan.notes.extend(part.notes)
         if group is None:
             return
         try:
@@ -1069,14 +1088,25 @@ class Discovery:
                         f"{arn}: selected active source-organization consumers outside "
                         f"this principal scope: {sorted(outside_scope)}")
             unrelated = consumers - self.consumers - {owner}
-            if unrelated and owner in self.migrating_owners:
+            if owner in self.migrating_owners:
                 # A stationary consumer of a migrating owner loses access when the owner
                 # leaves; bridging that direction is not supported (requirements §10).
-                raise MigrationError(
-                    f"migrating owner {owner} shares with stationary consumers "
-                    f"{sorted(unrelated)}; their access ends when the owner leaves its "
-                    "organization and owner-migration continuity is not supported by this "
-                    "tool version")
+                # An override names the intended migrating consumers. It never hides who
+                # holds this share now (live) or is configured to (owning template).
+                at_risk = set(unrelated)
+                if explicit is not None:
+                    for principal in sorted(set(configured) | set(live)):
+                        at_risk.update(self._expand(owner, principal, partition=ram.meta.partition))
+                    at_risk -= self.consumers | {owner}
+                if at_risk:
+                    raise MigrationError(
+                        f"migrating owner {owner} shares with stationary consumers "
+                        f"{sorted(at_risk)}; their access ends when the owner leaves its "
+                        "organization and owner-migration continuity is not supported by this "
+                        "tool version" + ("" if explicit is None else
+                                          "; a principal-map override does not remove the "
+                                          "share's live or owning-template principals from "
+                                          "this check"))
             if unrelated:
                 part.excluded.append(
                     f"{arn}: unrelated consumers outside migration population: {sorted(unrelated)}")
@@ -1086,8 +1116,7 @@ class Discovery:
                 part.excluded.append(f"{arn}: no selected consumers")
                 return part, None
             permission_map: dict[str, str] = {}
-            snapshots: dict[str, dict] = {}
-            changes: list[dict] = []
+            attached: dict[str, tuple[dict, dict]] = {}
             for permission in pages(ram, "list_resource_share_permissions", "permissions",
                                     resourceShareArn=arn):
                 default = cached_permission(self.cache, owner, region, ram, permission["arn"])
@@ -1098,29 +1127,60 @@ class Discovery:
                     raise MigrationError(f"{kind}: ambiguous managed permission mapping")
                 if not permission.get("version"):
                     raise MigrationError(f"{kind}: attached managed permission version missing")
-                if default["Version"] != permission["version"]:
+                permission_map[kind] = permission["arn"]
+                attached[kind] = permission, default
+            # A new temporary share receives the current default version. A temporary
+            # share already in the migration stack keeps the version it was created with,
+            # so a source share that joins it is compared with that version.
+            candidate = Group(owner, region, tuple(sorted(consumers)), permission_map)
+            existing, logical = self.deployed.get(candidate.key), candidate.logical_id
+            snapshots: dict[str, dict] = {}
+            changes: list[dict] = []
+            for kind, (permission, default) in attached.items():
+                target = default
+                if existing is not None:
+                    kept = existing.get(kind)
+                    if not isinstance(kept, dict) or kept.get("Arn") != permission["arn"] or \
+                            not kept.get("Version") or "Policy" not in kept:
+                        raise MigrationError(f"{kind}: permission evidence of existing temporary "
+                                             f"share {logical} is incomplete")
+                    target = copy.deepcopy(kept)
+                    if default["Version"] != target["Version"]:
+                        part.notes.append(
+                            f"{arn}: owner={owner} region={region} permission={permission['arn']} "
+                            f"status=DEFAULT_CHANGED existing temporary share {logical} keeps "
+                            f"version {target['Version']}; the current default is version "
+                            f"{default['Version']} and the original share attaches version "
+                            f"{permission['version']}. Nothing this tool writes attaches the new "
+                            "default to that share, so the default change needs no approval")
+                if target["Version"] != permission["version"]:
                     prior = cached_permission(self.cache, owner, region, ram, permission["arn"],
                                               permission["version"])
                     if prior["ResourceType"] != kind:
                         raise MigrationError(f"Non-default permission type differs: {permission['arn']}")
-                    if prior["Policy"] != default["Policy"]:
-                        # AWS attaches only the current default version, so the temporary
-                        # share cannot reproduce the original grant. Never pin or bypass:
-                        # the difference needs an approval bound to this exact change.
-                        change = permission_change(owner, region, arn, prior, default)
+                    if prior["Policy"] != policy_semantics(target["Policy"]):
+                        # The temporary share cannot reproduce the original grant. Never
+                        # pin or bypass: the difference needs an approval bound to this
+                        # exact change.
+                        change = permission_change(owner, region, arn, prior, target)
+                        change["applies_to"] = (
+                            f"existing temporary share {logical} (keeps version {target['Version']})"
+                            if existing is not None else
+                            "new temporary share (receives the current default)")
                         approval = approval_for(self.approved_changes, self.migration, change)
                         change["status"] = "APPROVED" if approval else "APPROVAL_REQUIRED"
                         if approval:
                             change["approval_id"] = approval["approval_id"]
                         changes.append(change)
-                permission_map[kind] = permission["arn"]
-                snapshots[kind] = default
+                snapshots[kind] = target
             part.permission_changes.extend(changes)
             pending = [c for c in changes if c["status"] == "APPROVAL_REQUIRED"]
             if pending:
+                reason = (f"Attached permission differs from the version its existing temporary "
+                          f"share {logical} keeps" if existing is not None else
+                          "Non-default permission differs from the current default")
                 raise MigrationError(
-                    "Non-default permission differs from the current default and requires "
-                    "approval: " + "; ".join(
+                    f"{reason} and requires approval: " + "; ".join(
                         f"{c['permission_arn']} v{c['from_version']}->v{c['to_version']} "
                         f"({', '.join(describe_difference(c['difference']))})" for c in pending)
                     + ". Record this plan with --record, review it, then run approve")

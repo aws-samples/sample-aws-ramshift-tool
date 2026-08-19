@@ -5,15 +5,19 @@ Plan is the default and cannot request writable clients. With ``--record`` it
 writes a versioned migration record that ``approve``, ``apply`` and ``verify``
 consume. Approve binds explicit approvals to exact permission changes and owner
 scope. Apply requires a PLANNED record revision whose entitlements still match
-live discovery, then opens its write gate only after complete preflight and
-the exact ``APPLY <migration-id>`` reply.
+live discovery, then opens its write gate only after complete preflight, the
+exact ``APPLY <migration-id>`` reply, and a check under the record lock that the
+record still holds that reviewed revision. It records each stack's shares as
+the stack completes, and its outcome even when it fails or is interrupted.
 This tool neither moves accounts nor cleans up shares or Resolver associations.
 """
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib
 import json
+import os
 import random
 import re
 import sys
@@ -31,7 +35,7 @@ from botocore.exceptions import (
 )
 
 from ram_migration_common import (
-    Api, Group, MigrationError, Plan, Router, account_id, check_sdk, digest,
+    Api, Group, MigrationError, Plan, Router, account_id, change_key, check_sdk, digest,
     error_text, pages, timestamp,
 )
 from ram_migration_discovery import (
@@ -39,9 +43,9 @@ from ram_migration_discovery import (
     revalidate_change,
 )
 from ram_migration_record import (
-    APPLICABLE, add_drops, approval_for, approve_owner_scope, approve_permission_change,
-    approved_owners, drop_id, failure_drops, latest, new_record, owner_scope_request,
-    pending_requests, permission_requests, plan_digest, tool_identity,
+    APPLICABLE, CHANGE_FIELDS, add_drops, approval_for, approve_owner_scope,
+    approve_permission_change, approved_owners, drop_id, failure_drops, latest, new_record,
+    owner_scope_request, pending_requests, permission_requests, plan_digest, tool_identity,
 )
 from ram_migration_record import load as load_record
 from ram_migration_record import update as update_record
@@ -114,6 +118,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Regions to inspect; RAM global home us-east-1 is always included")
     parser.add_argument("--scan-enabled-regions", "--discover-regions", action="store_true",
                         help="also discover enabled Regions separately for each owner")
+    parser.add_argument("--exclude-regions", nargs="+", action="append", default=[],
+                        help="enabled Regions explicitly left out of the received-dependency "
+                             "audit, the owned-share check and owner discovery, for example "
+                             "where an SCP denies RAM reads; requires --exclude-reason. Recorded "
+                             "in the record scope and shown in every summary; us-east-1 cannot "
+                             "be excluded")
+    parser.add_argument("--exclude-reason",
+                        help="mandatory reason for --exclude-regions, recorded with them")
     parser.add_argument("--profile", action="append", default=[], help="base profile; repeatable")
     parser.add_argument("--source-profile", help="explicit source base profile")
     parser.add_argument("--destination-profile", help="explicit destination base profile")
@@ -189,9 +201,76 @@ class Options:
     # Set by apply when its write gate opens: reads back, through a closed gate, the
     # temporary shares the run created and returns the record update for them.
     interrupt_readback: Callable[[], Callable[[dict], Any]] | None = None
+    # Regions the operator excluded explicitly, with the mandatory reason.
+    excluded_regions: list[str] = field(default_factory=list)
+    exclusion_reason: str | None = None
+    # Migrating accounts classified as migrating owners because they own RAM shares.
+    detected_owners: list[str] = field(default_factory=list)
+    # The reviewed plan revision and digest an apply consumed at its write gate.
+    applied_plan: dict = field(default_factory=dict)
 
 
 MIGRATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+MAX_REASON = 500
+
+
+def exclusion_scope(opts: Options) -> dict | None:
+    """The record-scope form of an explicit Region exclusion."""
+    if not opts.excluded_regions:
+        return None
+    return {"regions": sorted(set(opts.excluded_regions)), "reason": opts.exclusion_reason}
+
+
+def exclusion_text(excluded: dict | None) -> str:
+    """Appended to every summary line of a run whose scope excludes Regions."""
+    if not excluded:
+        return ""
+    return (f" excluded_regions={','.join(excluded['regions'])} "
+            f"exclusion_reason={json.dumps(excluded['reason'])}")
+
+
+def aliases_record(export: Path, record: Path) -> bool:
+    """Whether writing ``export`` would replace the record, through any path or link,
+    or one of the lock and temporary files written next to it."""
+    export, record = Path(export), Path(record)
+    try:
+        if export.exists() and record.exists() and os.path.samefile(export, record):
+            return True
+    except OSError:
+        pass
+    target = export.resolve()
+    for path in {record.resolve(), record.absolute().parent.resolve() / record.name}:
+        if target == path or target.parent == path.parent and (
+                target.name == f".{path.name}.lock" or target.name.startswith(f".{path.name}.tmp-")):
+            return True
+    return False
+
+
+def excluded_regions(args: argparse.Namespace, regions: list[str]) -> tuple[list[str], str | None]:
+    """An explicit, reasoned Region exclusion; never implied by an error."""
+    excluded = split_values(args.exclude_regions)
+    if not excluded and args.exclude_reason is None:
+        return [], None
+    if args.mode not in ("plan", "apply", "verify", "complete"):
+        raise MigrationError("--exclude-regions is supported only for plan, apply, verify and complete")
+    if not excluded:
+        raise MigrationError("--exclude-reason requires --exclude-regions")
+    if any(not REGION.fullmatch(region) for region in excluded):
+        raise MigrationError("Regions must be AWS Region names")
+    reason = (args.exclude_reason or "").strip()
+    if not reason:
+        raise MigrationError("--exclude-regions requires --exclude-reason: a nonempty reason, "
+                             "recorded with the excluded Regions and shown in every summary")
+    if "\n" in reason or "\r" in reason or len(reason) > MAX_REASON:
+        raise MigrationError(f"--exclude-reason must be one line of at most {MAX_REASON} characters")
+    if RAM_HOME_REGION in excluded:
+        raise MigrationError(f"{RAM_HOME_REGION} is RAM's global home Region and is always "
+                             "inspected; it cannot be excluded")
+    both = sorted(set(excluded) & set(regions))
+    if both:
+        raise MigrationError(f"Regions {','.join(both)} are both requested (--regions) and "
+                             "excluded (--exclude-regions)")
+    return excluded, reason
 
 
 def options(args: argparse.Namespace, ask: Callable[[str], str]) -> Options:
@@ -201,6 +280,7 @@ def options(args: argparse.Namespace, ask: Callable[[str], str]) -> Options:
             raise MigrationError("approve requires --record")
         if args.migration_id and not MIGRATION_ID.fullmatch(args.migration_id):
             raise MigrationError("Supply a valid --migration-id or omit it to use the record's")
+        excluded_regions(args, [])
         return Options(args, [], [], [], [], {}, {}, None, {})
     if args.mode in ("apply", "verify", "complete") and not args.record:
         raise MigrationError(f"{args.mode} requires --record: the reviewed migration record "
@@ -237,6 +317,10 @@ def options(args: argparse.Namespace, ask: Callable[[str], str]) -> Options:
             raise MigrationError("Supply --regions or --scan-enabled-regions")
     if args.export_plan and args.mode not in ("plan", "apply"):
         raise MigrationError("--export-plan is supported only for plan/apply")
+    if args.export_plan and args.record and aliases_record(args.export_plan, args.record):
+        raise MigrationError(f"--export-plan {args.export_plan} would overwrite the migration record "
+                             f"{args.record} or its lock or temporary file; choose another path")
+    excluded, reason = excluded_regions(args, regions)
     if args.monitor_config and args.mode != "monitor":
         raise MigrationError("--monitor-config requires monitor mode")
     if args.mode == "monitor" and not args.monitor_config:
@@ -295,7 +379,8 @@ def options(args: argparse.Namespace, ask: Callable[[str], str]) -> Options:
         capabilities = {key.lower(): value for key, value in capabilities.items()}
     return Options(args, owners, consumers, sorted(set(regions) | {RAM_HOME_REGION}),
                    profiles, mappings, principals, capabilities,
-                   json_object(args.monitor_config, "monitor-config"))
+                   json_object(args.monitor_config, "monitor-config"),
+                   excluded_regions=excluded, exclusion_reason=reason)
 
 
 class WriteGate:
@@ -445,12 +530,25 @@ def authenticate(router: Router, accounts: set[str], opts: Options, report: Repo
 
 
 def region_scopes(router: WriteGate, opts: Options, report: Reporter,
-                  dependencies: dict[str, set[str]] | None = None) -> tuple[dict, list[str]]:
+                  dependencies: dict[str, set[str]] | None = None, *,
+                  exclude: bool = True) -> tuple[dict, list[str]]:
     """Explicit Regions, plus every Region where a migrating account receives
-    this owner's resources (consumer-driven), plus all enabled Regions on request."""
+    this owner's resources (consumer-driven), plus all enabled Regions on request.
+
+    A migrating owner is inspected in every Region it has enabled plus RAM's global
+    home: a share it holds with stationary consumers in any of them is lost when it
+    leaves. Explicitly excluded Regions are never inspected for planning; verify
+    passes exclude=False because it reads every Region its recorded shares are in."""
     dependencies = dependencies or {}
-    scopes = {owner: sorted(set(opts.regions) | dependencies.get(owner, set()))
-              for owner in opts.owners}
+    excluded = set(opts.excluded_regions) if exclude else set()
+    migrating = set(opts.owners) & set(opts.consumers)
+
+    def implied(owner: str, enabled: set[str]) -> set[str]:
+        regions = set(opts.regions) | dependencies.get(owner, set()) | enabled
+        if owner in migrating:
+            regions |= opts.known_enabled_regions.get(owner, set()) | {RAM_HOME_REGION}
+        return regions - excluded
+    scopes = {owner: sorted(implied(owner, set())) for owner in opts.owners}
     failures = []
     if opts.args.scan_enabled_regions:
         def scan(owner, _region):
@@ -459,7 +557,7 @@ def region_scopes(router: WriteGate, opts: Options, report: Reporter,
                        if r.get("OptInStatus") in ("opt-in-not-required", "opted-in")]
             if not enabled:
                 raise MigrationError("No enabled Regions returned; discovery scope is unresolved")
-            return sorted(set(opts.regions + enabled) | dependencies.get(owner, set())), set(enabled)
+            return sorted(implied(owner, set(enabled))), set(enabled)
         for row in scoped_fanout({owner: [RAM_HOME_REGION] for owner in opts.owners}, scan, opts):
             if row.error:
                 failures.append(f"owner={row.account} phase=regions status=BLOCKED {row.error}")
@@ -476,6 +574,8 @@ class ReceivedAudit:
     entries: list[dict] = field(default_factory=list)
     blocked: list[str] = field(default_factory=list)
     excluded: list[str] = field(default_factory=list)
+    # Shares that migrating accounts not given in --owners own themselves (resourceOwner=SELF).
+    owned: list[dict] = field(default_factory=list)
 
     def counts(self) -> dict[str, int]:
         return {
@@ -487,21 +587,24 @@ class ReceivedAudit:
                                        for resource in entry["resources"]}),
             "received_share_observations": len(self.entries),
             "received_resource_observations": sum(len(entry["resources"]) for entry in self.entries),
+            "owned_shares": len(self.owned),
         }
 
     def to_dict(self) -> dict:
         entries = [{k: v for k, v in entry.items() if k != "context"} for entry in self.entries]
         return {"scopes": self.scopes, "counts": self.counts(), "entries": entries,
-                "blocked": self.blocked, "excluded": self.excluded}
+                "owned": self.owned, "blocked": self.blocked, "excluded": self.excluded}
 
 
 def received_scopes(router: WriteGate, opts: Options,
                     report: Reporter) -> tuple[dict[str, list[str]], list[str]]:
     """Consumer-driven: every enabled Region of every migrating account, plus
-    RAM's global home. Stationary owners are not audited: their own received
-    dependencies are not affected by the migration."""
+    RAM's global home, except Regions the operator excluded explicitly with a
+    reason. Stationary owners are not audited: their own received dependencies
+    are not affected by the migration."""
     failures = []
     failed_accounts = set()
+    excluded = set(opts.excluded_regions)
     unresolved = set(opts.consumers) - set(opts.known_enabled_regions)
 
     def enabled(account, _region):
@@ -525,18 +628,43 @@ def received_scopes(router: WriteGate, opts: Options,
         for region in sorted(set(opts.regions) - known - {RAM_HOME_REGION}):
             report.emit(f"account={account} region={region} phase=received-regions "
                         "status=EXCLUDED Region is not enabled in this account")
-        scopes[account] = sorted(known | {RAM_HOME_REGION})
+        for region in sorted(known & excluded):
+            report.emit(f"account={account} region={region} phase=received-regions "
+                        f"status=EXCLUDED_BY_OPERATOR reason={json.dumps(opts.exclusion_reason)} "
+                        "received dependencies and owned shares in this enabled Region are not "
+                        "inspected")
+        scopes[account] = sorted((known | {RAM_HOME_REGION}) - excluded)
     return scopes, failures
 
 
 def received_inventory(router: WriteGate, opts: Options, report: Reporter) -> ReceivedAudit:
-    """Read-only inventory of what the migrating accounts actually receive."""
+    """Read-only inventory of what the migrating accounts actually receive, and of the
+    shares that migrating accounts not given in --owners own themselves."""
     scopes, errors = received_scopes(router, opts, report)
     audit = ReceivedAudit(scopes=scopes, blocked=errors)
+    unlisted = set(opts.consumers) - set(opts.owners)
+
+    def owned_shares(account: str, region: str, ram: Any, result: ReceivedAudit) -> None:
+        """A migrating account that owns a share is a migrating owner (see detect_owners)."""
+        try:
+            shares = pages(ram, "get_resource_shares", "resourceShares", resourceOwner="SELF")
+        except Exception as exc:
+            result.blocked.append(f"account={account} region={region} phase=owned-audit "
+                                  f"status=BLOCKED {failure_text(exc)}")
+            return
+        for share in shares:
+            state = share.get("status", "UNKNOWN")
+            if state == "DELETED":  # terminal; it shares nothing
+                continue
+            result.owned.append({"account": account, "region": region,
+                                 "share": share.get("resourceShareArn", "unknown"),
+                                 "share_status": state})
 
     def inspect(account, region):
         result = ReceivedAudit()
         ram = router.client(account, "ram", region)
+        if account in unlisted:
+            owned_shares(account, region, ram, result)
         shares = pages(ram, "get_resource_shares", "resourceShares", resourceOwner="OTHER-ACCOUNTS")
         for share in shares:
             arn = share.get("resourceShareArn", "unknown")
@@ -584,8 +712,29 @@ def received_inventory(router: WriteGate, opts: Options, report: Reporter) -> Re
                                  f"phase=received-audit status=BLOCKED {row.error}")
         else:
             audit.entries.extend(row.value.entries)
+            audit.owned.extend(row.value.owned)
             audit.blocked.extend(row.value.blocked)
+    audit.owned.sort(key=lambda entry: (entry["account"], entry["region"], entry["share"]))
     return audit
+
+
+def detect_owners(audit: ReceivedAudit, opts: Options, report: Reporter) -> list[str]:
+    """A migrating account that owns RAM shares is a migrating owner whether or not
+    --owners names it: it is inspected as an owner in every audited Region, recorded
+    as a migrating owner, and blocked if it shares with any stationary consumer."""
+    owned: dict[str, list[dict]] = defaultdict(list)
+    for entry in audit.owned:
+        owned[entry["account"]].append(entry)
+    for account, entries in sorted(owned.items()):
+        report.emit(f"account={account} phase=owned-audit status=MIGRATING_OWNER "
+                    f"owned_shares={len(entries)} "
+                    f"regions={','.join(sorted({entry['region'] for entry in entries}))} this "
+                    "migrating account owns RAM shares: it is inspected as a migrating owner in "
+                    "every audited Region, and a share with any stationary consumer blocks")
+    detected = sorted(owned)
+    opts.owners = sorted(set(opts.owners) | set(detected))
+    opts.detected_owners = sorted(set(opts.detected_owners) | set(detected))
+    return detected
 
 
 def dependency_regions(audit: ReceivedAudit | None) -> dict[str, set[str]]:
@@ -736,6 +885,9 @@ def print_received(audit: ReceivedAudit, report: Reporter) -> None:
         report.emit(f"account={account} owner={owner} region={region} phase=received-inventory "
                     f"shares={len(entries)} "
                     f"resources={len({item['arn'] for entry in entries for item in entry['resources']})}")
+    for entry in audit.owned:
+        report.emit(f"account={entry['account']} region={entry['region']} share={entry['share']} "
+                    f"phase=owned-audit status=OWNED share_status={entry['share_status']}")
     report.emit("phase=received-inventory " + " ".join(f"{key}={value}" for key, value in audit.counts().items()))
 
 
@@ -760,6 +912,72 @@ def merge_plan(plan: Plan, addition: Plan) -> None:
     plan.excluded.extend(addition.excluded)
     plan.existing.extend(addition.existing)
     plan.permission_changes.extend(addition.permission_changes)
+    plan.notes.extend(addition.notes)
+
+
+def backing_approval(approvals: list[dict], migration: str, change: dict) -> dict | None:
+    """The record approval a change names, when it approves exactly that change: the
+    same migration, permission, versions and policy hashes, with the share listed."""
+    return next((approval for approval in approvals
+                 if approval.get("approval_id") == change.get("approval_id")
+                 and approval_for([approval], migration, change)), None)
+
+
+def recorded_changes(deployed: dict[tuple[str, str], list[Group]]) -> dict[tuple, dict]:
+    """Permission changes already recorded in the migration stacks: their shares exist
+    and already attach the approved version, so they are history, never rewritten."""
+    return {(group.owner, group.region, group.logical_id, *change_key(change)): change
+            for groups in deployed.values() for group in groups
+            for change in getattr(group, "permission_changes", [])}
+
+
+def evidence_problems(deployed: dict[tuple[str, str], list[Group]], approvals: list[dict],
+                      migration: str) -> list[str]:
+    """Each permission change a migration stack records must be one this record approved."""
+    problems = []
+    for (owner, region, logical, *_key), change in sorted(recorded_changes(deployed).items()):
+        if backing_approval(approvals, migration, change) is None:
+            problems.append(
+                f"phase=approval-evidence owner={owner} region={region} share={change['share']} "
+                f"migration stack share {logical} records permission change "
+                f"{change['approval_id']} ({change['permission_arn']} "
+                f"v{change['from_version']}->v{change['to_version']}), which this migration record "
+                "does not approve with the same versions, policy hashes and share")
+    return problems
+
+
+def entitlement_sites(groups: list) -> set[tuple[str, str, str, str]]:
+    """(owner, region, consumer, resource ARN) of every entitlement these groups grant."""
+    return {(value(g, "owner"), value(g, "region"), consumer, arn) for g in groups
+            for consumer in value(g, "consumers") for arn in value(g, "resources")}
+
+
+def uncovered_entitlements(baseline: dict, groups: list,
+                           known: set | frozenset = frozenset()) -> list[tuple[str, str, str, str]]:
+    """Entitlements, apart from ``known`` ones, with no entitlement item in the baseline."""
+    covered = {(item.get("consumer"), item.get("region"), item.get("resource_arn"))
+               for item in baseline.get("items", []) if item.get("kind") == "entitlement"}
+    return sorted((owner, region, consumer, arn)
+                  for owner, region, consumer, arn in entitlement_sites(groups) - set(known)
+                  if (consumer, region, arn) not in covered)
+
+
+def baseline_scope_problems(baseline: dict, groups: list, deployed: list) -> list[str]:
+    """An apply never writes an entitlement the recorded original baseline does not cover.
+
+    The baseline is captured once, at the first write gate, and never extended or
+    replaced, so an entitlement added by a later plan has no recorded original state:
+    verify could not validate it and complete could not retire it safely."""
+    organizations = baseline.get("consumer_organizations", {})
+    return [f"phase=baseline-scope status=BLOCKED owner={owner} region={region} "
+            f"consumer={consumer} resource={arn}: this entitlement is not in the recorded "
+            f"original baseline (captured in revision {baseline.get('captured_in_revision')})"
+            + ("" if consumer in organizations else
+               f" and consumer {consumer} has no baseline organization")
+            + "; the baseline is never extended or replaced, so this migration record cannot "
+              "add it"
+            for owner, region, consumer, arn in uncovered_entitlements(
+                baseline, groups, entitlement_sites(deployed))]
 
 
 def capabilities_for(opts: Options) -> tuple[dict[str, bool], dict]:
@@ -989,9 +1207,12 @@ def drops_from(comparison: Any, observation: Any, organizations: dict, detected_
     return drops
 
 
-def migration_status(record: dict, comparison: Any | None,
-                     organizations: dict) -> tuple[str, list[str]]:
-    """FAILED > INCONCLUSIVE > PENDING_MIGRATION > MIGRATION_VALIDATED."""
+def migration_status(record: dict, comparison: Any | None, organizations: dict,
+                     groups: list | None = None) -> tuple[str, list[str]]:
+    """FAILED > INCONCLUSIVE > PENDING_MIGRATION > MIGRATION_VALIDATED.
+
+    With ``groups``, an entitlement of a baseline consumer that the baseline does not
+    cover is INCONCLUSIVE too: its original state was never recorded."""
     baseline = record.get("baseline")
     reasons = [f"failure drop {d['kind']} {d['subject']} first absent {d['first_absent_at']}"
                for d in failure_drops(record)]
@@ -1014,6 +1235,10 @@ def migration_status(record: dict, comparison: Any | None,
                for consumer in sorted(before) if consumer not in organizations]
     unknown += [f"{consumer} has no baseline organization; the original baseline does not cover it"
                 for consumer in sorted(set(organizations) - set(before))]
+    unknown += [f"entitlement owner={owner} region={region} consumer={consumer} resource={arn} "
+                "is not covered by the original baseline"
+                for owner, region, consumer, arn in uncovered_entitlements(baseline, groups or [])
+                if consumer in before]
     if unknown:
         return "INCONCLUSIVE", unknown
     staying = sorted(consumer for consumer, org in before.items() if organizations[consumer] == org)
@@ -1033,15 +1258,26 @@ def fill_scope_from_record(opts: Options, record: dict) -> dict[str, set[str]]:
     owners = sorted(set(scope.get("stationary_owners", [])) | set(scope.get("migrating_owners", [])))
     consumers = sorted(set(scope.get("migrating_consumers", [])) | set(scope.get("migrating_owners", [])))
     regions = sorted(set(scope.get("regions", [])) | {RAM_HOME_REGION})
+    detected = sorted(scope.get("detected_owners") or [])
+    excluded = scope.get("excluded_regions") or None
     if not owners or not consumers:
         raise MigrationError("The migration record has no reviewed account scope; run plan --record")
-    for label, given, recorded in (("--owners", opts.owners, owners),
-                                   ("--consumers", opts.consumers, consumers)):
-        if given and sorted(set(given)) != recorded:
-            raise MigrationError(f"{label} differs from the migration record scope {recorded}")
+    # Migrating owners found by their owned shares need not be repeated in --owners.
+    if opts.owners and sorted(set(opts.owners)) not in (owners, sorted(set(owners) - set(detected))):
+        raise MigrationError(f"--owners differs from the migration record scope {owners}")
+    if opts.consumers and sorted(set(opts.consumers)) != consumers:
+        raise MigrationError(f"--consumers differs from the migration record scope {consumers}")
     if opts.args.regions and sorted(set(opts.regions)) != regions:
         raise MigrationError(f"--regions differs from the migration record scope {regions}")
+    if opts.excluded_regions and (excluded is None or
+                                  sorted(set(opts.excluded_regions)) != excluded["regions"] or
+                                  opts.exclusion_reason != excluded["reason"]):
+        raise MigrationError("--exclude-regions/--exclude-reason differ from the migration record "
+                             f"scope {json.dumps(excluded)}")
     opts.owners, opts.consumers, opts.regions = owners, consumers, regions
+    opts.detected_owners = detected
+    opts.excluded_regions = list(excluded["regions"]) if excluded else []
+    opts.exclusion_reason = excluded["reason"] if excluded else None
     located: dict[str, set[str]] = defaultdict(set)
     for row in [*record.get("shares", []), *(record.get("plan") or {}).get("groups", [])]:
         located[row["owner"]].add(row["region"])
@@ -1160,19 +1396,27 @@ def print_plan(plan: Plan, prepared: dict, report: Reporter) -> None:
         report.emit(f"phase=plan status=EXCLUDED {reason}")
     for share in plan.existing:
         report.emit(f"phase=plan status=EXISTING share={share.get('resourceShareArn', 'unknown')}")
+    for note in plan.notes:
+        report.emit(f"phase=plan status=NOTE {note}")
     for reason in plan.blocked:
         report.emit(f"phase=preflight status=BLOCKED {reason}")
 
 
 def account_scope(opts: Options) -> dict:
-    """Explicit account roles; a stationary owner's own dependencies are not at risk."""
+    """Explicit account roles; a stationary owner's own dependencies are not at risk.
+
+    A migrating account that owns RAM shares is a migrating owner even when --owners
+    does not name it (``detected_owners``). Regions the operator excluded, with the
+    reason, are part of the reviewed scope."""
     owners, consumers = set(opts.owners), set(opts.consumers)
     return {
         "migrating_consumers": sorted(consumers - owners),
         "migrating_owners": sorted(owners & consumers),
         "stationary_owners": sorted(owners - consumers),
+        "detected_owners": sorted(set(opts.detected_owners) & owners & consumers),
         "regions": sorted(opts.regions),
         "scan_enabled_regions": bool(opts.args.scan_enabled_regions),
+        "excluded_regions": exclusion_scope(opts),
     }
 
 
@@ -1204,7 +1448,10 @@ def print_permission_changes(plan: Plan, approvals: list[dict], report: Reporter
         for line in describe_difference(request["difference"]):
             report.emit(f"  {line}")
         for share in request["shares"]:
-            report.emit(f"  share={share}")
+            targets = sorted({change["applies_to"] for change in plan.permission_changes
+                              if change["share"] == share and change.get("applies_to")
+                              and all(change[f] == request[f] for f in CHANGE_FIELDS)})
+            report.emit(f"  share={share}" + (f" applies_to={'; '.join(targets)}" if targets else ""))
     return requests
 
 
@@ -1236,6 +1483,7 @@ def record_plan(record: dict, plan: Plan, scope: dict, prepared: dict, received:
                    sorted(plan.groups, key=lambda g: (g.owner, g.region, g.key))],
         "blocked": list(plan.blocked),
         "excluded": list(plan.excluded),
+        "notes": list(plan.notes),
         "existing_shares": sorted({s.get("resourceShareArn", "unknown") for s in plan.existing}),
         "capability_provenance": capability_provenance,
         "received_entitlements": received.to_dict() if received is not None else None,
@@ -1251,24 +1499,36 @@ def record_plan(record: dict, plan: Plan, scope: dict, prepared: dict, received:
 
 
 def share_records(previous: list[dict], groups: list[Group], shares: dict,
-                  migration: str) -> list[dict]:
-    """Created-share identifiers accumulate; a recorded share is never forgotten."""
+                  migration: str, *, verified: bool = True,
+                  conflicts: list[str] | None = None) -> list[dict]:
+    """Created-share identifiers accumulate; a recorded share is never forgotten.
+
+    A stack share whose ARN differs from the recorded one raises, or, with
+    ``conflicts``, is reported there while the recorded entry is kept unchanged, so
+    one conflict never discards the other shares' entries. ``verified=False`` records
+    a share read back from its stack before verification."""
     known = {(r["owner"], r["region"], r["logical_id"]): dict(r) for r in previous}
     for group in groups:
         share = shares.get((group.owner, group.region), {}).get(group.logical_id)
         if not share:
             continue
         key = (group.owner, group.region, group.logical_id)
+        recorded = known.get(key, {}).get("share_arn")
+        if recorded not in (None, share["resourceShareArn"]):
+            problem = (f"{group.owner}/{group.region}/{group.logical_id}: recorded share "
+                       f"{recorded} differs from {share['resourceShareArn']}")
+            if conflicts is None:
+                raise MigrationError(problem)
+            conflicts.append(problem + "; the recorded share is kept, reconcile it explicitly")
+            continue
         entry = known.setdefault(key, {
             "owner": group.owner, "region": group.region, "logical_id": group.logical_id,
             "entitlement_hash": group.key, "stack": stack_name(migration, group.owner, group.region),
             "first_recorded_at": timestamp()})
-        if entry.get("share_arn") not in (None, share["resourceShareArn"]):
-            raise MigrationError(f"{group.owner}/{group.region}/{group.logical_id}: recorded share "
-                                 f"{entry['share_arn']} differs from {share['resourceShareArn']}")
         entry["share_arn"] = share["resourceShareArn"]
         entry["consumers"] = sorted(set(entry.get("consumers", [])) | set(group.consumers))
-        entry["last_verified_at"] = timestamp()
+        if verified:
+            entry["last_verified_at"] = timestamp()
     return [known[k] for k in sorted(known)]
 
 
@@ -1278,6 +1538,10 @@ def run_approve(opts: Options, ask: Callable[[str], str], report: Reporter) -> i
     migration = record["migration_id"]
     if latest(record, "plan") is None:
         raise MigrationError("approve requires a recorded plan; run plan --record first")
+    excluded = (record.get("scope") or {}).get("excluded_regions")
+    if excluded:
+        report.emit(f"migration={migration} phase=approve scope=REGIONS_EXCLUDED"
+                    f"{exclusion_text(excluded)}")
     pending = pending_requests(record)
     owners_request = record.get("owner_scope_request")
     if owners_request and owners_request["id"] in {
@@ -1299,8 +1563,9 @@ def run_approve(opts: Options, ask: Callable[[str], str], report: Reporter) -> i
         for share in request["shares"]:
             report.emit(f"  share={share}")
         report.emit("  The approval covers only temporary migration shares for these source shares "
-                    "in this migration. Original shares are not modified, and AWS attaches only "
-                    "the current default version.")
+                    "in this migration. Original shares are not modified. A new temporary share "
+                    "receives the current default version; a temporary share already in a "
+                    "migration stack keeps the version it was created with.")
         token = f"APPROVE {migration} {request['id']}"
         try:
             reply = ask(f"Type {token} to approve this permission change: ")
@@ -1362,7 +1627,7 @@ def summary(plan: Plan, report: Reporter, status: str, *, mode: str, recorded: b
             created: int = 0, reused: int = 0, accepted: int = 0,
             reused_invitations: int = 0, failures: int = 0, comparison: Any = None,
             unassociated: int = 0, sharing: str | None = None,
-            migration: str | None = None) -> None:
+            migration: str | None = None, excluded: dict | None = None) -> None:
     resources = {arn for group in plan.groups for arn in group.resources}
     entitlements = {(group.owner, group.region, arn, consumer, group.permissions[kind])
                     for group in plan.groups for arn, kind in group.resources.items()
@@ -1383,9 +1648,13 @@ def summary(plan: Plan, report: Reporter, status: str, *, mode: str, recorded: b
                  f"observation_gaps={len(value(comparison, 'gaps'))}")
     if unassociated:
         line += f" unassociated_resolver_rules={unassociated}"
-    report.emit(line)
+    report.emit(line + exclusion_text(excluded))
     report.emit("Sharing status is not live migration acceptance evidence. "
                 "Resource totals cover planned entitlements; excluded inventory is reported separately.")
+    if excluded:
+        report.emit(f"Regions {','.join(excluded['regions'])} were excluded by the operator "
+                    f"({excluded['reason']}): nothing in them was inspected, so this result does "
+                    "not cover them.")
     if unassociated:
         report.emit("Resolver rules without an association had none before migration; "
                     "no association repair was performed.")
@@ -1467,6 +1736,22 @@ BLOCKER_ACTIONS = {
              "restore it or grant the collectors read access, then re-run apply with the same "
              "--record; a recorded baseline is never replaced",
     },
+    "baseline-scope": {
+        "apply": "the recorded original baseline covers only what the first apply observed and "
+                 "is never extended or replaced, so this record cannot add the listed "
+                 "entitlements: plan them under a new migration record (new --migration-id and "
+                 "--record), or re-run plan with the same --record without them, review it, "
+                 "then re-run apply",
+        "*": "an entitlement outside the recorded original baseline cannot be added under this "
+             "migration record: remove it from the scope or plan it under a new migration "
+             "record (new --migration-id and --record), then {rerun}",
+    },
+    "approval-evidence": {
+        "*": "a migration stack records a permission-change approval that this migration record "
+             "does not hold or that differs from it: use the record that approved it "
+             "(approvals never transfer between records), or restore the stack's metadata if "
+             "it was changed outside the tool, then {rerun}",
+    },
     "reviewed-record-mismatch": {
         "apply": "the reviewed plan no longer matches this run: re-run plan with the same "
                  "--record using this tool version, review the new PLANNED revision, then re-run "
@@ -1500,7 +1785,9 @@ BLOCKER_PATTERNS = (
         r"|outside the explicit owner/Region scope")),
     ("baseline-loss", re.compile(r"phase=baseline status=BLOCKED original .*"
                                  + re.escape(RECORDED_LOSS))),
+    ("baseline-scope", re.compile(r"phase=baseline-scope ")),
     ("baseline-capture", re.compile(r"phase=baseline ")),
+    ("approval-evidence", re.compile(r"phase=approval-evidence ")),
     ("owner-outside-approved-scope", re.compile(r"phase=owner-scope ")),
     ("reviewed-record-mismatch", re.compile(
         r"phase=reviewed-record |plan changed; run plan/apply")),
@@ -1580,6 +1867,10 @@ def report_blockers(plan: Plan, report: Reporter, status: str, *, mode: str,
                     f"next_action={blocker_action(category, mode, recorded)}")
 
 
+class ReviewedRecordChanged(MigrationError):
+    """The record no longer holds the reviewed plan this apply confirmed."""
+
+
 def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report: Reporter) -> int:
     gate = WriteGate(router)
     args = opts.args
@@ -1599,18 +1890,24 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         opts.owners = sorted(set(opts.owners) | approved_owner_scope)
         report.emit(f"phase=owner-scope status=APPROVED owners={','.join(added_owners)} "
                     "source=record; supply profile/role mappings for these owners")
-    scope = account_scope(opts)
-    scope["approved_owner_scope"] = sorted(approved_owner_scope)
+
+    def reviewed_scope() -> dict:
+        scope = account_scope(opts)
+        scope["approved_owner_scope"] = sorted(approved_owner_scope)
+        return scope
+    scope = reviewed_scope()
     approvals = record["approvals"]["permission_changes"] if record else []
-    run = {"mode": args.mode, "recorded": record is not None}  # selects each next action
+    # Selects each next action, and puts any Region exclusion on every summary line.
+    run = {"mode": args.mode, "recorded": record is not None, "excluded": exclusion_scope(opts)}
 
     def note(status: str, mutate: Callable[[dict], Any] = lambda _record: None,
              **details: Any) -> None:
-        """Apply/verify outcomes, including blocked and failed runs, are history."""
+        """Apply/verify outcomes, including blocked and failed runs, are history. Once
+        apply has checked its reviewed plan, each entry names the plan it consumed."""
         nonlocal record
         if record is not None and args.mode in ("apply", "verify"):
             record = update_record(args.record, plan.migration, mutate, mode=args.mode,
-                                   status=status, **details)
+                                   status=status, **{**opts.applied_plan, **details})
     plan.blocked.extend(authenticate(router, set(opts.owners + opts.consumers), opts, report))
     if plan.blocked:
         if not args.sso_role and not args.role_name:
@@ -1629,10 +1926,14 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
     received = None
     if args.mode != "verify":
         # Consumer-driven: what the migrating accounts receive decides which owner
-        # Regions must be inspected, so the inventory comes first.
+        # Regions must be inspected, so the inventory comes first. A migrating account
+        # that owns shares is a migrating owner, so it joins the owner scope here.
         received = received_inventory(gate, opts, report)
+        detect_owners(received, opts, report)
+        scope = reviewed_scope()
     scopes, failures = region_scopes(gate, opts, report, dependency_regions(received)
-                                     if received is not None else recorded_regions)
+                                     if received is not None else recorded_regions,
+                                     exclude=args.mode != "verify")
     plan.blocked.extend(failures)
     # One explicit cache for this run's planning reads; rechecks and writes read fresh.
     cache = LookupCache()
@@ -1641,6 +1942,9 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         raise MigrationError("Stacks.persisted_groups(owner, region) is required for stored-scope verification")
     persisted: set[str] = set()
     persisted_groups: dict[tuple[str, str], list[Group]] = {}
+    # Each migration stack's groups exactly as its template records them. Merging
+    # discovery into persisted_groups changes those objects; this copy never changes.
+    deployed: dict[tuple[str, str], list[Group]] = {}
     unread: set[tuple[str, str]] = set()  # owner Regions whose stored plan could not be read
     def load_persisted(owner, region):
         if stacks.existing(owner, region) is None:
@@ -1655,8 +1959,17 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         else:
             if row.value:
                 persisted_groups[row.account, row.region] = row.value
+                deployed[row.account, row.region] = copy.deepcopy(row.value)
             persisted.update(group.key for group in row.value)
             merge_plan(plan, Plan(plan.migration, groups=row.value))
+    if record is not None:
+        # The permission changes a stack records are evidence of what its shares were
+        # created under; this record must hold each approval they name.
+        plan.blocked.extend(evidence_problems(deployed, approvals, plan.migration))
+    # What each existing temporary share attaches, by entitlement key: it keeps the
+    # version it was created with, whatever the current default is.
+    kept = {g.key: g.permission_snapshots for groups in deployed.values() for g in groups
+            if getattr(g, "permission_snapshots", None)}
 
     capability_provenance: dict = {}
     proposed: dict[str, dict] = {}
@@ -1666,7 +1979,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         discovery = Discovery(gate, set(opts.consumers), plan.migration, opts.principals, capabilities,
                               approved_changes=approvals,
                               migrating_owners=set(scope["migrating_owners"]),
-                              share_workers=args.share_workers, cache=cache)
+                              share_workers=args.share_workers, cache=cache, deployed=kept)
         def inspect(owner, region):
             report.emit(f"owner={owner} region={region} phase=discovery status=STARTED")
             result = discovery.inspect(owner, region)
@@ -1707,6 +2020,12 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         problem = reviewed_plan_problem(record, plan, scope)
         if problem:
             plan.blocked.append(f"phase=reviewed-record {problem}")
+        else:
+            opts.applied_plan = {"plan_revision": latest(record, "plan")["revision"],
+                                 "plan_digest": record["plan"]["digest"]}
+        if record.get("baseline") is not None:
+            plan.blocked.extend(baseline_scope_problems(
+                record["baseline"], plan.groups, [g for groups in deployed.values() for g in groups]))
     if args.mode == "verify" and record is not None:
         # An unreadable stored plan is already a blocker; its shares are not missing.
         recorded = {(s["owner"], s["region"], s["logical_id"]) for s in record.get("shares", [])
@@ -1750,6 +2069,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
             exported = plan.to_dict()
             exported["capability_provenance"] = capability_provenance
             exported["received_entitlements"] = received.to_dict()
+            exported["scope"] = scope
             exported["migration_stacks"] = [
                 {"owner": owner, "region": region, "template": body,
                  "existing_stack": old.get("StackId") if old else None}
@@ -1785,6 +2105,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
             reply = ""
         if reply != token:
             report.emit("status=CANCELLED Confirmation did not match; no AWS writes requested")
+            note("CANCELLED", writes="none")
             return 2
         # Recheck every template before opening the gate, so a newly visible
         # blocker in any Region prevents writes to every Region.
@@ -1796,18 +2117,39 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                 plan.blocked.append(f"{row.account}/{row.region}: post-confirmation preflight {row.error}")
             elif digest(row.value[0]) != digest(prepared[row.account, row.region][0]):
                 plan.blocked.append(f"{row.account}/{row.region}: plan changed; run plan/apply again")
-        # An approved permission change is re-read on both sides immediately before
-        # the gate opens; any drift requires a renewed approval.
+        # An approved permission change this apply writes is re-read on both sides
+        # immediately before the gate opens; any drift requires a renewed approval. A
+        # change a migration stack already records is history: its share already
+        # attaches the approved version, its approval was checked against this record
+        # above, and the original share may since have moved on or been deleted.
+        history = recorded_changes(deployed)
         for group in plan.groups:
             for change in getattr(group, "permission_changes", []):
                 try:
-                    if approval_for(approvals, plan.migration, change) is None:
+                    if history.get((group.owner, group.region, group.logical_id,
+                                    *change_key(change))) == change:
+                        report.emit(f"owner={group.owner} region={group.region} share={change['share']} "
+                                    f"phase=permission-revalidation status=ALREADY_APPLIED "
+                                    f"approval={change['approval_id']} migration stack share "
+                                    f"{group.logical_id} already attaches version "
+                                    f"{change['to_version']}; recorded changes are not revalidated")
+                        continue
+                    approval = backing_approval(approvals, plan.migration, change)
+                    if approval is None:
                         raise MigrationError(f"approval {change['approval_id']} no longer covers "
                                              f"{change['share']}")
-                    revalidate_change(gate.client(group.owner, "ram", group.region), change)
+                    target = None
+                    if group.key in persisted:
+                        target = (kept.get(group.key) or {}).get(change["resource_type"])
+                        if target is None:
+                            raise MigrationError(f"{change['share']}: existing temporary share "
+                                                 f"{group.logical_id} records no "
+                                                 f"{change['resource_type']} permission snapshot")
+                    revalidate_change(gate.client(group.owner, "ram", group.region), change,
+                                      existing=target)
                     report.emit(f"owner={group.owner} region={group.region} share={change['share']} "
                                 f"phase=permission-revalidation status=VERIFIED "
-                                f"approval={change['approval_id']}")
+                                f"approval={approval['approval_id']}")
                 except Exception as exc:
                     plan.blocked.append(f"{group.owner}/{group.region}: post-confirmation "
                                         f"permission revalidation {failure_text(exc)}")
@@ -1835,15 +2177,44 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
             note("BLOCKED", lambda current: add_drops(current, pending_drops),
                  blockers=list(plan.blocked), phase="post-confirmation", drops=len(pending_drops))
             return 1
+
+        def open_gate(current: dict) -> None:
+            """Under the record lock, immediately before the first write: the record must
+            still hold the reviewed plan revision this apply confirmed. A plan recorded
+            meanwhile, even an identical one, is reviewed before anything is written."""
+            problem = reviewed_plan_problem(current, plan, scope)
+            entry = latest(current, "plan")
+            if problem is None and entry["revision"] != opts.applied_plan["plan_revision"]:
+                problem = (f"plan revision {entry['revision']} was recorded after the reviewed "
+                           f"revision {opts.applied_plan['plan_revision']}; review it, then re-run "
+                           "apply")
+            if problem is None and captured is not None and current.get("baseline") is not None:
+                problem = "another apply recorded the original baseline; re-run apply"
+            if problem:
+                raise ReviewedRecordChanged("the migration record changed while this apply waited "
+                                            f"for confirmation, and nothing was written: {problem}")
+            if captured is not None:
+                current["baseline"] = dict(captured, captured_in_revision=current["revision"] + 1)
+        gate_details: dict[str, Any] = {"phase": "write-gate", "groups": len(plan.groups),
+                                        "stacks": len(grouped)}
         if captured is not None:
-            def keep_baseline(current: dict) -> None:
-                if current.get("baseline") is not None:
-                    raise MigrationError("A baseline was recorded concurrently; re-run apply")
-                current["baseline"] = captured
-            note("BASELINE_CAPTURED", keep_baseline, baseline_items=len(captured["items"]),
-                 baseline_complete=captured["complete"])
+            gate_details.update(baseline_items=len(captured["items"]),
+                                baseline_complete=captured["complete"])
+        try:
+            record = update_record(args.record, plan.migration, open_gate, mode="apply",
+                                   status="BASELINE_CAPTURED" if captured is not None else "STARTED",
+                                   **opts.applied_plan, **gate_details)
+        except ReviewedRecordChanged as exc:
+            plan.blocked.append(f"phase=reviewed-record {exc}")
+            report.emit(f"phase=preflight status=BLOCKED {plan.blocked[-1]}")
+            summary(plan, report, "BLOCKED", **run)
+            note("BLOCKED", blockers=list(plan.blocked), phase="write-gate")
+            return 1
+        if captured is not None:
             report.emit(f"phase=baseline status=CAPTURED items={len(captured['items'])} "
                         f"complete={str(captured['complete']).lower()} revision={record['revision']}")
+        report.emit(f"phase=write-gate status=OPEN plan_revision={opts.applied_plan['plan_revision']} "
+                    f"revision={record['revision']}")
 
         def created_shares() -> Callable[[dict], Any]:
             """After an interrupt: read back, through a closed gate, what this run created."""
@@ -1860,12 +2231,56 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                 else:
                     found[row.account, row.region] = row.value
             return lambda current: current.update(shares=share_records(
-                current.get("shares", []), plan.groups, found, plan.migration))
+                current.get("shares", []), plan.groups, found, plan.migration, verified=False,
+                conflicts=[]))
         opts.interrupt_readback = created_shares
         gate.open = True
-        for row in scoped_fanout(group_scopes,
-                                 lambda owner, region: stacks.apply(owner, region, grouped[owner, region]),
-                                 opts):
+        writer = threading.Lock()
+        known = {"shares": list(record.get("shares", []))}
+
+        def record_stack(owner: str, region: str, name: str) -> None:
+            """Each owner/Region stack's shares are recorded as soon as it completes, so an
+            interrupted or killed run leaves at most its running stacks unrecorded."""
+            here = grouped[owner, region]
+            try:
+                found = {(owner, region): stacks.shares(owner, region)}
+            except Exception as exc:
+                report.emit(f"owner={owner} region={region} phase=record status=INCOMPLETE stack "
+                            f"shares were not read back ({failure_text(exc)}); the final "
+                            "readback records them")
+                return
+            conflicts: list[str] = []
+            updated = None
+            with writer:
+                # An unchanged stack whose shares are all recorded adds nothing.
+                if share_records(known["shares"], here, found, plan.migration, verified=False,
+                                 conflicts=conflicts) != known["shares"]:
+                    try:
+                        updated = update_record(
+                            args.record, plan.migration,
+                            lambda current: current.update(shares=share_records(
+                                current.get("shares", []), here, found, plan.migration,
+                                verified=False, conflicts=[])),
+                            mode="apply", status="STACK_COMPLETE", **opts.applied_plan,
+                            owner=owner, region=region, stack=name)
+                    except Exception as exc:
+                        report.emit(f"owner={owner} region={region} phase=record "
+                                    f"status=NOT_RECORDED {failure_text(exc)}; the final record "
+                                    "update retries")
+                        return
+                    known["shares"] = updated.get("shares", [])
+            for problem in conflicts:
+                report.emit(f"owner={owner} region={region} phase=record status=CONFLICT {problem}")
+            if updated is not None:
+                report.emit(f"owner={owner} region={region} phase=record status=STACK_COMPLETE "
+                            f"revision={updated['revision']} "
+                            f"stack_shares={len(found[owner, region])}")
+
+        def create(owner: str, region: str) -> str:
+            name = stacks.apply(owner, region, grouped[owner, region])
+            record_stack(owner, region, name)
+            return name
+        for row in scoped_fanout(group_scopes, create, opts):
             if row.error:
                 failures.append(f"owner={row.account} region={row.region} phase=creation {row.error}")
             else:
@@ -1886,6 +2301,13 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
             reused += 1
         else:
             created += 1
+    if args.mode == "apply":
+        # A stack share that differs from the recorded one is reported, never recorded
+        # over it; the other shares are still recorded.
+        conflicts: list[str] = []
+        share_records(record.get("shares", []), plan.groups, shares, plan.migration,
+                      conflicts=conflicts)
+        failures += [f"phase=record {problem}" for problem in conflicts]
 
     if args.mode == "apply":
         allowed: dict[tuple[str, str], dict[str, str]] = defaultdict(dict)
@@ -1948,7 +2370,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                            baseline["captured_at"] if baseline else "",
                            f"record revision {record['revision']}")
     projected = dict(record, drops=list(record.get("drops", [])) + new_drops)
-    status_now, reasons = migration_status(projected, comparison, organizations_now)
+    status_now, reasons = migration_status(projected, comparison, organizations_now, plan.groups)
     reasons += errors
     if errors and status_now in ("MIGRATION_VALIDATED", "PENDING_MIGRATION"):
         status_now = "INCONCLUSIVE"
@@ -1985,16 +2407,27 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
              "baseline_status": value(comparison, "status") if comparison is not None else None,
              "missing": len(value(comparison, "missing")) if comparison is not None else None,
              "degraded": len(value(comparison, "degraded")) if comparison is not None else None,
-             "gaps": len(value(final, "gaps")), "consumer_organizations": organizations_now}
+             "gaps": len(value(final, "gaps")), "consumer_organizations": organizations_now,
+             **opts.applied_plan}
 
     def record_outcome(current: dict) -> None:
         if args.mode == "apply":
             current["shares"] = share_records(current.get("shares", []), plan.groups, shares,
-                                              plan.migration)
+                                              plan.migration, conflicts=[])
+            # A plan recorded while this apply ran is kept, and was not applied.
+            newer = latest(current, "plan")
+            if newer is not None and newer["revision"] != opts.applied_plan["plan_revision"]:
+                entry["plan_superseded_by"] = newer["revision"]
         add_drops(current, new_drops)
         current.setdefault("verifications", []).append(entry)
     note(status, record_outcome, failures=failures, created=created, reused=reused,
          accepted=accepted_count, migration_status=status_now, drops=len(new_drops))
+    opts.interrupt_readback = None  # the outcome, with every share read back, is recorded
+    if entry.get("plan_superseded_by"):
+        report.emit(f"phase=record status=PLAN_SUPERSEDED plan revision {entry['plan_superseded_by']} "
+                    f"was recorded while this apply ran; this apply applied reviewed revision "
+                    f"{opts.applied_plan['plan_revision']} only. Review the newer plan before the "
+                    "next apply")
     return code
 
 
@@ -2043,11 +2476,13 @@ def run_complete(router: Router, opts: Options, ask: Callable[[str], str], repor
         record = update_record(args.record, migration, mutate, mode="complete", status=status,
                                **details)
 
+    excluded = exclusion_text(exclusion_scope(opts))
+
     def refuse(problems: list[str], drops: list[dict] | None = None) -> int:
         for problem in problems:
             report.emit(f"phase=complete status=BLOCKED {problem}")
         report.emit(f"status=BLOCKED migration={migration} phase=complete blockers={len(problems)} "
-                    "temporary shares retained")
+                    f"temporary shares retained{excluded}")
         note("BLOCKED", lambda current: add_drops(current, drops or []), blockers=problems)
         return 1
 
@@ -2097,9 +2532,15 @@ def run_complete(router: Router, opts: Options, ask: Callable[[str], str], repor
     if baseline is None or not baseline.get("complete"):
         problems.append("a complete original baseline is required before the temporary path is retired")
     else:
+        before = baseline.get("consumer_organizations", {})
         problems += [f"consumer {consumer} is not covered by the original baseline; its original "
                      "state was never recorded, so its temporary shares cannot be retired safely"
-                     for consumer in consumers if consumer not in baseline.get("consumer_organizations", {})]
+                     for consumer in consumers if consumer not in before]
+        problems += [f"entitlement owner={owner} region={region} consumer={consumer} resource={arn} "
+                     "is not covered by the original baseline; its original state was never "
+                     "recorded, so its temporary share cannot be retired safely"
+                     for owner, region, consumer, arn in uncovered_entitlements(baseline, groups)
+                     if consumer in before]
         comparison = verifier().compare(scoped_items(baseline["items"], groups), observation)
         if value(comparison, "status") != "INTACT":
             problems += [f"original {loss['reason']}: {loss['key']}" for loss in losses(comparison)] or [
@@ -2187,7 +2628,7 @@ def run_complete(router: Router, opts: Options, ask: Callable[[str], str], repor
     note("COMPLETED", lambda current: current.__setitem__("completion", completion),
          deleted=len(deleted), stacks=len(removed))
     report.emit(f"status=COMPLETED migration={migration} deleted_shares={len(deleted)} "
-                f"deleted_stacks={len(removed)} original baseline intact")
+                f"deleted_stacks={len(removed)} original baseline intact{excluded}")
     return 0
 
 
@@ -2198,18 +2639,20 @@ INTERRUPTED_NEXT = {
 
 
 def record_interruption(args: argparse.Namespace | None, report: Reporter,
-                        opts: Options | None = None) -> None:
-    """An interrupted apply or verify is history in its record, when one exists. An
-    apply interrupted after its write gate opened also records the temporary shares
-    it created, which verify and complete take their scope from."""
+                        opts: Options | None = None, *, status: str = "INTERRUPTED",
+                        failure: str | None = None) -> None:
+    """An interrupted apply or verify is history in its record, when one exists. So is an
+    apply that failed after its write gate opened (status INCOMPLETE). Such an apply also
+    records the temporary shares it created, which verify and complete take their scope
+    from; each stack's shares were already recorded when that stack completed."""
     if args is None or args.mode not in ("apply", "verify") or not args.record or \
             not args.migration_id or not Path(args.record).exists():
         return
     mutate: Callable[[dict], Any] = lambda _current: None
     readback = opts.interrupt_readback if opts is not None and args.mode == "apply" else None
     if readback is not None:
-        report.emit("phase=record status=INTERRUPTING reading back the temporary shares this "
-                    "run created")
+        report.emit(f"phase=record status={'INTERRUPTING' if failure is None else 'FAILING'} "
+                    "reading back the temporary shares this run created")
         try:
             mutate = readback()
         except KeyboardInterrupt:
@@ -2217,14 +2660,26 @@ def record_interruption(args: argparse.Namespace | None, report: Reporter,
                         "with this record to record the shares it created")
         except Exception as exc:
             report.emit(f"phase=record status=INCOMPLETE share readback {failure_text(exc)}")
+    details: dict[str, Any] = {**(opts.applied_plan if opts is not None else {}),
+                               "retained": INTERRUPTED_NEXT[args.mode]}
+    if failure is not None:
+        details["failures"] = [failure]
     try:
         record = update_record(args.record, args.migration_id, mutate, mode=args.mode,
-                               status="INTERRUPTED", retained=INTERRUPTED_NEXT[args.mode])
-        report.emit(f"phase=record status=INTERRUPTED record={args.record} "
+                               status=status, **details)
+        report.emit(f"phase=record status={status} record={args.record} "
                     f"revision={record['revision']} recorded_shares={len(record.get('shares', []))} "
                     f"next_action={INTERRUPTED_NEXT[args.mode]}")
     except Exception as exc:
         report.emit(f"phase=record status=NOT_RECORDED {failure_text(exc)}")
+
+
+def record_failure(args: argparse.Namespace, report: Reporter, opts: Options, failure: str) -> int:
+    """An apply that fails after its write gate opened made AWS changes: its outcome and
+    the shares it created are recorded, best effort, before the run ends."""
+    report.emit(f"status=INCOMPLETE {failure}; successful temporary shares are retained")
+    record_interruption(args, report, opts, status="INCOMPLETE", failure=failure)
+    return 1
 
 
 def main(argv: list[str] | None = None, *, input_fn: Callable[[str], str] | None = None) -> int:
@@ -2259,8 +2714,14 @@ def main(argv: list[str] | None = None, *, input_fn: Callable[[str], str] | None
         record_interruption(args, report, opts)
         return 130
     except (MigrationError, OSError, ValueError, EOFError, BotoCoreError, ClientError) as exc:
+        if opts is not None and opts.interrupt_readback is not None:  # apply wrote to AWS
+            return record_failure(args, report, opts, failure_text(exc))
         report.emit(f"status=BLOCKED {failure_text(exc)}")
         return 1
+    except Exception as exc:
+        if opts is not None and opts.interrupt_readback is not None:
+            record_failure(args, report, opts, f"{type(exc).__name__}: {exc}")
+        raise
 
 
 if __name__ == "__main__":

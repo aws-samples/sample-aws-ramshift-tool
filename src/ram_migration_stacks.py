@@ -12,7 +12,7 @@ from ram_migration_common import (
 )
 from ram_migration_discovery import (
     ApprovedGroup, LookupCache, cached_permission, permission_snapshot, policy_semantics,
-    read_template,
+    policy_sha256, read_template,
 )
 
 
@@ -80,6 +80,11 @@ _CHANGE_FIELDS = ("share", "permission_arn", "resource_type", "from_version",
                   "to_version", "from_policy_sha256", "to_policy_sha256", "approval_id")
 
 
+def row_key(row: dict) -> tuple[str, str, str, str]:
+    """A metadata row's identity; the template form of ram_migration_common.change_key."""
+    return (row["SourceShareArn"], row["PermissionArn"], row["FromVersion"], row["ToVersion"])
+
+
 def _changes_metadata(group: Group) -> list[dict]:
     """Owner-side, durable evidence of each approved permission change."""
     rows = []
@@ -89,7 +94,7 @@ def _changes_metadata(group: Group) -> list[dict]:
                 group.permissions.get(row["ResourceType"]) != row["PermissionArn"]:
             raise MigrationError("Approved permission change does not belong to its entitlement group")
         rows.append(row)
-    return sorted(rows, key=lambda r: (r["SourceShareArn"], r["PermissionArn"]))
+    return sorted(rows, key=row_key)
 
 
 def changes_from_metadata(metadata: dict) -> list[dict]:
@@ -176,10 +181,20 @@ def _validate_resource(logical: str, item: dict, migration: str,
             any(not isinstance(row[key], str) or not row[key] for key in CHANGE_KEYS) or
             row["SourceShareArn"] not in lineage or
             permissions.get(row["ResourceType"]) != row["PermissionArn"] or
-            (snapshots and snapshots.get(row["ResourceType"], {}).get("Version") != row["ToVersion"])
+            row["FromVersion"] == row["ToVersion"]
             for row in changes):
         raise MigrationError(f"{logical}: permission-change approval metadata does not match its scope")
-    if len({(row["SourceShareArn"], row["PermissionArn"]) for row in changes}) != len(changes):
+    if snapshots:
+        # Every change ends at the version the share attaches; its policy hash is the
+        # hash of that recorded policy. The original side cannot be checked here: the
+        # template holds only what the temporary share attaches.
+        for row in changes:
+            snapshot = snapshots.get(row["ResourceType"], {})
+            if snapshot.get("Version") != row["ToVersion"] or \
+                    policy_sha256(snapshot["Policy"]) != row["ToPolicySha256"]:
+                raise MigrationError(f"{logical}: permission-change approval metadata does not match "
+                                     "its permission snapshot")
+    if len({row_key(row) for row in changes}) != len(changes):
         raise MigrationError(f"{logical}: duplicate permission-change approval metadata")
 
 
@@ -229,12 +244,17 @@ def additive_template(old: dict, new: dict, migration: str) -> dict:
                 raise MigrationError(f"{logical}: approved managed permission policy changed")
         if not before and after:
             raise MigrationError(f"{logical}: existing permission approval missing; reconcile explicitly")
-        recorded = {(row["SourceShareArn"], row["PermissionArn"]): row
-                    for row in prior_metadata.get("PermissionChanges", [])}
+        # Recorded changes are evidence of what the share was created or extended under;
+        # they are kept, and a later change of the same share is added beside them.
+        recorded = {row_key(row): row for row in prior_metadata.get("PermissionChanges", [])}
         for row in fresh_metadata.get("PermissionChanges", []):
-            key = (row["SourceShareArn"], row["PermissionArn"])
+            key = row_key(row)
             if key in recorded and recorded[key] != row:
-                raise MigrationError(f"{logical}: recorded permission-change approval differs")
+                raise MigrationError(
+                    f"{logical}: recorded permission-change approval differs: the stack records "
+                    f"{recorded[key]['ApprovalId']} for {key[0]} v{key[2]}->v{key[3]}, this plan "
+                    f"{row['ApprovalId']}; run with the migration record that approved "
+                    f"{recorded[key]['ApprovalId']}")
             recorded[key] = row
         if recorded:
             prior_metadata["PermissionChanges"] = [recorded[k] for k in sorted(recorded)]
@@ -333,10 +353,13 @@ class Stacks:
 
     def prepare(self, owner: str, region: str, groups: list[Group], *,
                 fresh: bool = False) -> tuple[dict, dict | None]:
-        """The current default of every permission is always reread, so approval evidence
-        is compared with AWS, never with discovery's cached read of it. fresh=True also
-        rereads the template: the post-confirmation recheck and apply never rely on
-        what planning read earlier."""
+        """Every permission is always reread, so approval evidence is compared with AWS,
+        never with discovery's cached read of it. A new share receives the current
+        default version, so its group is checked against the current default. A share
+        already in the migration stack keeps the version it was created with: its group
+        must carry exactly that snapshot, which is checked against that version, and a
+        newer default is not a change to it. fresh=True also rereads the template: the
+        post-confirmation recheck and apply never rely on what planning read earlier."""
         old = self.existing(owner, region)
         if any(g.owner != owner or g.region != region for g in groups):
             raise MigrationError("Migration group does not belong to the selected owner/Region")
@@ -346,23 +369,41 @@ class Stacks:
                 f"{old['StackStatus']}: existing migration stack cannot be retried automatically; "
                 "inspect and explicitly reconcile the failed/pending operation. "
                 "Successful partial resources remain retained; do not delete the stack.")
+        previous = self._template(owner, region, old, fresh=fresh) if old is not None else None
+        deployed = previous["Resources"] if previous is not None else {}
         ram = self.router.client(owner, "ram", region)
-        defaults = LookupCache()  # read fresh, once per permission for this preflight
+        reads = LookupCache()  # read fresh, once per permission version for this preflight
         for group in groups:
             metadata = proposed["Resources"][group.logical_id]["Metadata"]
             snapshots = metadata["PermissionSnapshots"]
+            existing = deployed.get(group.logical_id)
             for kind, arn in group.permissions.items():
-                current = cached_permission(defaults, owner, region, ram, arn)
+                approved = snapshots.get(kind)
+                if existing is not None:
+                    kept = existing["Metadata"]["PermissionSnapshots"].get(kind) or {}
+                    if kept.get("Arn") != arn or "Policy" not in kept or approved is not None and (
+                            approved.get("Version") != kept.get("Version") or
+                            policy_semantics(approved["Policy"]) != policy_semantics(kept["Policy"])):
+                        raise MigrationError(
+                            f"{arn}: permission evidence differs from existing temporary share "
+                            f"{group.logical_id}, which keeps version {kept.get('Version')}")
+                    attached = cached_permission(reads, owner, region, ram, arn, kept["Version"])
+                    if attached["ResourceType"] != kind or \
+                            attached["Policy"] != policy_semantics(kept["Policy"]):
+                        raise MigrationError(f"{arn}: version {kept['Version']} attached to existing "
+                                             f"temporary share {group.logical_id} differs from its "
+                                             "recorded policy")
+                    snapshots[kind] = copy.deepcopy(kept)
+                    continue
+                current = cached_permission(reads, owner, region, ram, arn)
                 if current["ResourceType"] != kind or not current["DefaultVersion"]:
                     raise MigrationError(f"{arn}: permission resource type/default version differs")
-                approved = snapshots.get(kind)
                 if approved is not None and (approved["Arn"] != arn or
                                              approved["Policy"] != current["Policy"]):
                     raise MigrationError(f"{arn}: managed permission changed since plan approval")
                 snapshots[kind] = current
-        if old is None:
+        if previous is None:
             return proposed, old
-        previous = self._template(owner, region, old, fresh=fresh)
         return additive_template(previous, proposed, self.migration), old
 
     def persisted_groups(self, owner: str, region: str) -> list[Group]:
