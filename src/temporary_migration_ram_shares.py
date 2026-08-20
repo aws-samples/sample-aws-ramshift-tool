@@ -2702,9 +2702,19 @@ def main(argv: list[str] | None = None, *, input_fn: Callable[[str], str] | None
                 module = importlib.import_module("ram_migration_monitor")
             except ImportError as exc:
                 raise MigrationError("monitor requires the ram_migration_monitor module") from exc
-            # The monitor owns read-only probe/evidence validation; its config
-            # passes through intact.
-            result = module.monitor(router, opts.monitor_config)
+            # The monitor owns read-only probe/evidence validation; its config passes
+            # through intact, except that --record/--migration-id name the reviewed
+            # record it must consume and write drop events into.
+            config = dict(opts.monitor_config)
+            for key, given in (("record", str(args.record) if args.record else None),
+                               ("migration_id", args.migration_id)):
+                if given is None:
+                    continue
+                if config.get(key) not in (None, given):
+                    raise MigrationError(f"--{key.replace('_', '-')} differs from the monitor "
+                                         f"config {key}")
+                config[key] = given
+            result = module.monitor(router, config)
             code = result if type(result) is int else (1 if result is False else 0)
             report.emit(f"phase=monitor status={'FINISHED' if code == 0 else 'INCOMPLETE'} exit_code={code}")
             return code

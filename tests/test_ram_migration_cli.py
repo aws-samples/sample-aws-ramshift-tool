@@ -1422,6 +1422,20 @@ def test_monitor_delegates_config_and_exit_code_without_share_work(harness, monk
     assert [call[0] for call in harness.calls] == ["router"]
 
 
+def test_monitor_receives_the_record_and_migration_id(harness, monkeypatch, tmp_path):
+    received = []
+    monkeypatch.setitem(sys.modules, "ram_migration_monitor",
+                        SimpleNamespace(monitor=lambda router, config: received.append(config) or 0))
+    record = tmp_path / "record.json"
+    base = ["monitor", "--profile", "explicit-source", "--record", str(record),
+            "--migration-id", MIGRATION]
+    assert main(base + ["--monitor-config", json.dumps({"evidence_directory": "e"})]) == 0
+    assert received[-1] == {"evidence_directory": "e", "record": str(record), "migration_id": MIGRATION}
+    clash = json.dumps({"evidence_directory": "e", "record": str(tmp_path / "other.json")})
+    assert main(base + ["--monitor-config", clash]) == 1
+    assert len(received) == 1
+
+
 def test_monitor_missing_configuration_fails_before_authentication(harness, capsys):
     assert main(["monitor", "--profile", "explicit-source"]) == 1
     assert "monitor requires --monitor-config" in capsys.readouterr().out
