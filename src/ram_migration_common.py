@@ -120,6 +120,12 @@ class Plan:
     # Informational findings that neither block nor exclude anything, for example a
     # newer default permission version that an existing temporary share does not attach.
     notes: list[str] = field(default_factory=list)
+    # Recovered external access: {owner, region, share, consumer, status, external} for
+    # each migrating consumer whose live principal association on an original share is
+    # ASSOCIATED with external=true. It is pre-existing access outside the owner's
+    # organization, so no temporary share duplicates it and the received audit counts
+    # that share as covered for that consumer.
+    external_access: list[dict] = field(default_factory=list)
 
     def merge(self, other: "Plan") -> None:
         grouped = {g.key: g for g in self.groups}
@@ -141,6 +147,7 @@ class Plan:
         self.existing += other.existing
         self.permission_changes += other.permission_changes
         self.notes += other.notes
+        self.external_access += other.external_access
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -186,6 +193,31 @@ def refresh_session(refresh: Callable[[], dict]) -> boto3.Session:
     return boto3.Session(botocore_session=bc)
 
 
+# The Region of every STS call the router makes, per partition: one enabled in every
+# account. The call always goes to that Region's own endpoint (sts.<region>.<domain>),
+# never to the global sts.amazonaws.com. Session tokens from the global endpoint are
+# valid only in Regions enabled by default, unless the account changed its global
+# endpoint token version, so an opt-in Region such as af-south-1 rejects them; tokens
+# from any Regional endpoint are valid in every Region. botocore sends a client with no
+# Region to the global endpoint, and us-east-1 too when sts_regional_endpoints is
+# "legacy", so the Region and the Regional endpoint are both set explicitly.
+STS_REGIONS = {"aws": "us-east-1", "aws-us-gov": "us-gov-west-1", "aws-cn": "cn-north-1"}
+
+
+def sts_region(partition: str) -> str:
+    if partition not in STS_REGIONS:
+        raise MigrationError(f"Unsupported AWS partition {partition!r} for role sessions; "
+                             f"supported partitions: {', '.join(sorted(STS_REGIONS))}")
+    return STS_REGIONS[partition]
+
+
+def regional_sts(session: boto3.Session, region: str) -> Any:
+    """An STS client on ``region``'s Regional endpoint whatever the operator's
+    sts_regional_endpoints setting; credentials it issues work in opt-in Regions."""
+    session._session.set_config_variable("sts_regional_endpoints", "regional")
+    return session.client("sts", region_name=region, config=CONFIG)
+
+
 class Router:
     """Route by verified account identity; never invent or modify role trusts."""
     def __init__(self, profiles: list[str], mappings: dict[str, str],
@@ -226,10 +258,11 @@ class Router:
         with self._lock:
             if account in self._sessions:
                 return self._sessions[account]
+            region = None  # the STS Region of a role or SSO session; see STS_REGIONS
             if account in self.mappings:
                 value = self.mappings[account]
                 if value.startswith("arn:"):
-                    candidate = self._assume(value)
+                    candidate, region = self._assume(value)
                 else:
                     candidate = boto3.Session(profile_name=value)
             else:
@@ -237,27 +270,33 @@ class Router:
                 failures = []
                 for base in self._bases:
                     try:
-                        candidate = self._sso_account(base, account)
+                        candidate, region = self._sso_account(base, account)
                         break
                     except Exception as exc:
                         failures.append(f"{base.profile_name}: {error_text(exc)}")
                 if candidate is None and self.role_name:
-                    candidate = self._assume(f"arn:aws:iam::{account}:role/{self.role_name}")
+                    candidate, region = self._assume(f"arn:aws:iam::{account}:role/{self.role_name}")
                 if candidate is None:
                     raise MigrationError(
                         f"{account}: supply an account/profile or role mapping; "
                         + "; ".join(failures))
-            identity = candidate.client("sts", config=CONFIG).get_caller_identity()
+            # A profile mapping is checked like a base profile: in its own Region.
+            sts = regional_sts(candidate, region) if region is not None else candidate.client(
+                "sts", region_name=candidate.region_name or "us-east-1", config=CONFIG)
+            identity = sts.get_caller_identity()
             if identity["Account"] != account:
                 raise MigrationError(f"Caller identity mismatch for {account}")
             self._sessions[account] = candidate
             return candidate
 
-    def _assume(self, arn: str) -> boto3.Session:
+    def _assume(self, arn: str) -> tuple[boto3.Session, str]:
+        """The role's refreshable session and its STS Region. AssumeRole goes to a Regional
+        STS endpoint, so the session also works in opt-in Regions such as af-south-1."""
+        region = sts_region(arn.split(":")[1])
         failures = []
         for base in self._bases:
             try:
-                sts = base.client("sts", config=CONFIG)
+                sts = regional_sts(base, region)
                 def refresh(sts=sts):
                     value = sts.assume_role(RoleArn=arn, RoleSessionName="ram-migration",
                                             DurationSeconds=3600)["Credentials"]
@@ -265,12 +304,14 @@ class Router:
                             "secret_key": value["SecretAccessKey"],
                             "token": value["SessionToken"],
                             "expiry_time": value["Expiration"].isoformat()}
-                return refresh_session(refresh)
+                return refresh_session(refresh), region
             except ClientError as exc:
                 failures.append(f"{base.profile_name}: {error_text(exc)}")
         raise MigrationError(f"Unable to assume configured role {arn}; " + "; ".join(failures))
 
-    def _sso_account(self, base: boto3.Session, account: str) -> boto3.Session:
+    def _sso_account(self, base: boto3.Session, account: str) -> tuple[boto3.Session, str]:
+        """The SSO role's refreshable session and the STS Region its identity is checked
+        in: a Regional endpoint of the SSO Region's partition."""
         if not self.sso_role:
             raise MigrationError("Supply --sso-role or an explicit account/profile or role mapping")
         profile = base.profile_name
@@ -284,6 +325,7 @@ class Router:
         if token is None:
             raise MigrationError("SSO login required")
         client = base.client("sso", region_name=sso["sso_region"], config=CONFIG)
+        region = sts_region(base._session.get_partition_for_region(sso["sso_region"]))
 
         def refresh():
             value = client.get_role_credentials(
@@ -292,7 +334,7 @@ class Router:
             expiry = datetime.fromtimestamp(value["expiration"] / 1000, timezone.utc)
             return {"access_key": value["accessKeyId"], "secret_key": value["secretAccessKey"],
                     "token": value["sessionToken"], "expiry_time": expiry.isoformat()}
-        return refresh_session(refresh)
+        return refresh_session(refresh), region
 
     def client(self, account: str, service: str, region: str,
                write: bool = False) -> Api:

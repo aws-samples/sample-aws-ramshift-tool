@@ -181,6 +181,34 @@ def share_blocker(owner: str, region: str, arn: str, exc: Exception) -> str:
     return f"{arn}: owner={owner} region={region} {failure_text(exc)}"
 
 
+LIVE = ("ASSOCIATED", "ASSOCIATING")
+
+
+def feature_set_problem(owner: str, region: str, arn: str, feature: Any) -> str:
+    """Why a share that is not a STANDARD share blocks, and what makes it one.
+
+    RAM creates a CREATED_FROM_POLICY share from a resource-based policy. Only its owner
+    can see it, so no consumer's received-share audit can account for it, and the
+    permission RAM derived from the policy cannot be attached to a standard share."""
+    if feature == "CREATED_FROM_POLICY":
+        return ("featureSet CREATED_FROM_POLICY: RAM created this share from a resource-based "
+                "policy, so it is not a standard share and is never inspected as one: only its "
+                "owner can see it, so the consumers' received-share audit cannot account for it, "
+                "and the permission RAM derived from the policy cannot be attached to a "
+                f"temporary share. In owner {owner} Region {region}, promote it to a standard "
+                "share: aws ram promote-permission-created-from-policy for the permission it "
+                "attaches, then aws ram promote-resource-share-created-from-policy "
+                f"--resource-share-arn {arn}; re-run plan once its featureSet is STANDARD")
+    if feature == "PROMOTING_TO_STANDARD":
+        return ("featureSet PROMOTING_TO_STANDARD: this share, which RAM created from a "
+                "resource-based policy, is being promoted to a standard share and is not one "
+                "yet; it is never inspected as one. Wait until aws ram get-resource-shares "
+                f"--resource-owner SELF --resource-share-arns {arn} --region {region} in owner "
+                f"{owner} shows featureSet STANDARD, then re-run plan")
+    return (f"unsupported featureSet {feature!r}: only STANDARD shares are inspected; this "
+            "tool version cannot classify this share, so it blocks")
+
+
 @dataclass
 class ApprovedGroup(Group):
     """Compatible Group carrying the policy and source-stack approval evidence."""
@@ -955,6 +983,54 @@ class Discovery:
         return {a["Id"] for a in pages(org, "list_accounts", "Accounts")
                 if a.get("State", a.get("Status")) == "ACTIVE"}
 
+    @staticmethod
+    def _owner_listed(owner: str, partition: str, associations: list[dict],
+                      configured: list[str], overridden: list[str]) -> list[str]:
+        """Where a share names its own owner as a principal. RAM fails that association
+        ('The resource share owner cannot be associated with the resource share.'); it is
+        neither a consumer, nor a blocker, nor a missing entitlement."""
+        evidence = []
+        for row in associations:
+            if direct_account_principal(row["associatedEntity"], partition) == owner:
+                message = row.get("statusMessage")
+                evidence.append(f"association {row.get('status')}"
+                                + (f": {message}" if message else ""))
+        if any(direct_account_principal(p, partition) == owner for p in configured):
+            evidence.append("owning template principal")
+        if owner in overridden:
+            evidence.append("principal-map entry")
+        return list(dict.fromkeys(evidence))
+
+    @staticmethod
+    def _external_access(associations: list[dict], selected: set[str],
+                         partition: str) -> set[str]:
+        """Selected consumers whose live association on this original share is external:
+        the account is outside the owner's organization and holds the share directly, for
+        example a principal restored after it left. That access does not depend on
+        organization membership. An external association that is not ASSOCIATED holds no
+        access yet, and an invitation is never accepted on an original share's behalf."""
+        rows: dict[str, list[dict]] = defaultdict(list)
+        for row in associations:
+            account = direct_account_principal(row["associatedEntity"], partition)
+            if account in selected and row.get("status") in LIVE:
+                rows[account].append(row)
+        recovered = set()
+        for account, live in sorted(rows.items()):
+            if not any(row.get("external") is True for row in live):
+                continue
+            if all(row.get("external") is True and row["status"] == "ASSOCIATED" for row in live):
+                recovered.add(account)
+                continue
+            states = ", ".join(sorted(
+                f"{row['status']} external={'true' if row.get('external') is True else 'false'}"
+                for row in live))
+            raise MigrationError(
+                f"external principal association of {account} on this original share is not "
+                f"settled ({states}): an external account holds no access until it accepts the "
+                "share's invitation, and this tool never accepts an original share's invitation; "
+                f"have {account} accept or reject that invitation, then re-run plan")
+        return recovered
+
     def inspect(self, owner: str, region: str) -> Plan:
         """Shares are inspected concurrently (share_workers) and merged in share-ARN
         order, so the plan never depends on completion order."""
@@ -987,6 +1063,7 @@ class Discovery:
         plan.permission_changes.extend(part.permission_changes)
         plan.blocked.extend(part.blocked)
         plan.notes.extend(part.notes)
+        plan.external_access.extend(part.external_access)
         if group is None:
             return
         try:
@@ -1016,6 +1093,10 @@ class Discovery:
             if share.get("status") == "DELETED":
                 part.excluded.append(f"{arn}: deleted share (status DELETED)")
                 return part, None
+            # A row without featureSet predates the field and describes a standard share.
+            feature = share.get("featureSet", "STANDARD")
+            if feature != "STANDARD":
+                raise MigrationError(feature_set_problem(owner, region, arn, feature))
             if self._migration_owned(owner, region, share):
                 part.existing.append(share)
                 return part, None
@@ -1030,8 +1111,7 @@ class Discovery:
                                  "resourceShareAssociations", associationType="PRINCIPAL",
                                  resourceShareArns=[arn])
             observed = flatten([r["associatedEntity"] for r in associations])
-            live = [r["associatedEntity"] for r in associations
-                    if r["status"] in ("ASSOCIATED", "ASSOCIATING")]
+            live = [r["associatedEntity"] for r in associations if r["status"] in LIVE]
             explicit = self.overrides.get(arn)
             source_stacks = []
             source = self._stack_source(owner, region, arn)
@@ -1060,6 +1140,27 @@ class Discovery:
                                          "service-principal-only share to account-wide access")
             else:
                 principals = original
+            listed = self._owner_listed(owner, ram.meta.partition, associations, configured,
+                                        principals if explicit is not None else [])
+            if listed:
+                part.excluded.append(
+                    f"{arn}: owner {owner} is listed as a principal of its own share "
+                    f"({'; '.join(listed)}); an owner is never a consumer of its own share, so it "
+                    "is excluded from the intended consumers and is never a temporary-share "
+                    "principal")
+            # Live evidence, whatever the configured or overridden principals say.
+            recovered = self._external_access(associations, self.consumers - {owner},
+                                              ram.meta.partition)
+            if recovered:
+                part.external_access.extend(
+                    {"owner": owner, "region": region, "share": arn, "consumer": consumer,
+                     "status": "ASSOCIATED", "external": True} for consumer in sorted(recovered))
+                part.excluded.append(
+                    f"{arn}: recovered external access for {sorted(recovered)}: each holds an "
+                    "ASSOCIATED principal association with external=true on this original share, "
+                    "so it is outside the owner's organization and keeps this access whatever "
+                    "organization it is in; that access is pre-existing, not created by this tool, "
+                    "so no temporary share duplicates it and the original share is never modified")
             if not principals:
                 if explicit is not None:
                     part.excluded.append(f"{arn}: explicitly approved empty consumer inventory")
@@ -1112,8 +1213,10 @@ class Discovery:
                     f"{arn}: unrelated consumers outside migration population: {sorted(unrelated)}")
             consumers &= self.consumers
             consumers.discard(owner)
+            consumers -= recovered
             if not consumers:
-                part.excluded.append(f"{arn}: no selected consumers")
+                if not recovered:
+                    part.excluded.append(f"{arn}: no selected consumers")
                 return part, None
             permission_map: dict[str, str] = {}
             attached: dict[str, tuple[dict, dict]] = {}

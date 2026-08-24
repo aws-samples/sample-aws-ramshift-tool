@@ -4,6 +4,8 @@ from __future__ import annotations
 import copy
 import json
 import time
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 
 from botocore.exceptions import ClientError
 
@@ -11,13 +13,53 @@ from ram_migration_common import (
     PURPOSE, Group, MigrationError, Router, account_id, digest, managed, pages, tags,
 )
 from ram_migration_discovery import (
-    ApprovedGroup, LookupCache, cached_permission, permission_snapshot, policy_semantics,
-    policy_sha256, read_template,
+    ApprovedGroup, LookupCache, cached_permission, failure_text, permission_snapshot,
+    policy_semantics, policy_sha256, read_template,
 )
+
+# AWS RAM quotas per resource share, from "AWS Resource Access Manager endpoints and
+# quotas" (https://docs.aws.amazon.com/general/latest/gr/ram.html, read 2026-10-14):
+# "Number of resource associations per resource share" and "Number of principal
+# associations per resource share" are 5,000 in each supported Region and are not
+# adjustable. Each temporary share must stay within both. A group is never split across
+# shares: a share's identity (logical ID, name and EntitlementHash) is its owner, Region,
+# consumers and managed permissions, which persisted_groups, verify_group, discovery and
+# the monitor all re-derive, and an additive stack never moves a resource between shares.
+RAM_MAX_RESOURCES_PER_SHARE = 5000
+RAM_MAX_PRINCIPALS_PER_SHARE = 5000
 
 
 def stack_name(migration: str, owner: str, region: str) -> str:
     return f"{PURPOSE}-{owner}-{region}-{digest(migration, 8)}"
+
+
+def quota_problems(template: dict) -> list[str]:
+    """Every temporary share in a migration template that a fixed RAM quota would reject."""
+    problems = []
+    for logical, item in sorted(template["Resources"].items()):
+        properties = item["Properties"]
+        for field_name, label, limit in (
+                ("ResourceArns", "resource", RAM_MAX_RESOURCES_PER_SHARE),
+                ("Principals", "principal", RAM_MAX_PRINCIPALS_PER_SHARE)):
+            count = len(properties[field_name])
+            if count > limit:
+                problems.append(f"{logical}: the temporary share would hold {count} {label} "
+                                f"associations; AWS RAM allows at most {limit} {label} "
+                                "associations per resource share and the quota is not adjustable")
+    return problems
+
+
+def check_quotas(template: dict) -> None:
+    """Fail closed before any write when a share would exceed a per-share RAM quota."""
+    problems = quota_problems(template)
+    if problems:
+        raise MigrationError(
+            "; ".join(problems) + ". Nothing was written. This tool version keeps one temporary "
+            "share per entitlement group (owner, Region, consumers and managed permissions) and "
+            "never splits a group across shares: plan migrating consumers in separate migration "
+            "records (--migration-id and --record) to bring a group's principals within the "
+            "quota; a group with more resources than the quota cannot be bridged by this tool, "
+            "so escalate it")
 
 
 def template_for(groups: list[Group], migration: str) -> dict:
@@ -315,6 +357,18 @@ def validate_changes(changes: list[dict], proposed: dict, previous: dict | None)
                 raise MigrationError(f"{logical}: unsupported change detail")
 
 
+@dataclass
+class Readback:
+    """One migration stack read back per logical share: ``shares`` holds each share proven
+    to be the one its template declares, ``failures`` the error for each that is not. A
+    failed share is never verified, recorded or counted as ready."""
+    shares: dict[str, dict] = dataclass_field(default_factory=dict)
+    failures: dict[str, Exception] = dataclass_field(default_factory=dict)
+
+    def reason(self, logical: str) -> str:
+        return failure_text(self.failures[logical])
+
+
 class Stacks:
     def __init__(self, router: Router, migration: str, timeout: int = 1800,
                  cache: LookupCache | None = None):
@@ -364,6 +418,7 @@ class Stacks:
         if any(g.owner != owner or g.region != region for g in groups):
             raise MigrationError("Migration group does not belong to the selected owner/Region")
         proposed = template_for(groups, self.migration)
+        check_quotas(proposed)  # before any read; shares only grow when merged below
         if old is not None and old["StackStatus"] not in ("CREATE_COMPLETE", "UPDATE_COMPLETE"):
             raise MigrationError(
                 f"{old['StackStatus']}: existing migration stack cannot be retried automatically; "
@@ -402,9 +457,12 @@ class Stacks:
                                              approved["Policy"] != current["Policy"]):
                     raise MigrationError(f"{arn}: managed permission changed since plan approval")
                 snapshots[kind] = current
-        if previous is None:
-            return proposed, old
-        return additive_template(previous, proposed, self.migration), old
+        body = proposed if previous is None else additive_template(previous, proposed,
+                                                                    self.migration)
+        # The shares as they would be deployed, existing resources included: plan's
+        # preflight, the post-confirmation recheck and apply all prepare first.
+        check_quotas(body)
+        return body, old
 
     def persisted_groups(self, owner: str, region: str) -> list[Group]:
         """Recover the approved entitlement matrix from its owning CFN template."""
@@ -538,41 +596,72 @@ class Stacks:
                 raise MigrationError(f"{stack['StackId']}: stack deletion did not finish before the timeout")
             time.sleep(interval)
 
-    def shares(self, owner: str, region: str) -> dict[str, dict]:
+    def readback(self, owner: str, region: str) -> Readback:
+        """Each logical share of the migration stack, proven on its own.
+
+        The stack fails as a whole (raises) when it is missing, its template is invalid,
+        its resources cannot be listed or it holds a non-RAM resource. Otherwise every
+        share its template declares, and any share it holds that the template does not
+        declare, is either proven in ``shares`` or has its failure in ``failures``; one
+        failed share never hides a proven sibling."""
         stack = self.existing(owner, region)
         if stack is None:
             raise MigrationError("Migration stack does not exist")
         cfn = self.router.client(owner, "cloudformation", region)
         template = self._template(owner, region, stack)
         rows = pages(cfn, "list_stack_resources", "StackResourceSummaries", StackName=stack["StackId"])
+        if any(row.get("ResourceType") != "AWS::RAM::ResourceShare" for row in rows):
+            raise MigrationError("Non-RAM resource in migration stack")
+        if any(not isinstance(row.get("LogicalResourceId"), str) for row in rows):
+            raise MigrationError("Migration stack resource summary has no logical ID")
+        listed: dict[str, list[dict]] = {}
+        for row in rows:  # read in stack order
+            listed.setdefault(row["LogicalResourceId"], []).append(row)
         ram = self.router.client(owner, "ram", region)
-        result = {}
-        for row in rows:
-            if row["ResourceType"] != "AWS::RAM::ResourceShare":
-                raise MigrationError("Non-RAM resource in migration stack")
-            arn = row.get("PhysicalResourceId")
-            if not arn:
-                raise MigrationError(f"Migration resource not created: {row['LogicalResourceId']}")
-            shares = pages(ram, "get_resource_shares", "resourceShares",
-                           resourceOwner="SELF", resourceShareArns=[arn])
-            logical = row["LogicalResourceId"]
-            if logical not in template["Resources"] or len(shares) != 1 or \
-                    not managed(shares[0].get("tags", []), self.migration):
-                raise MigrationError("Migration resource ownership verification failed")
-            share = shares[0]
-            values = tags(share.get("tags", []))
-            if share.get("owningAccountId") != owner or \
-                    share.get("resourceShareArn") != arn or \
-                    values.get("owneraccount") != owner or \
-                    values.get("entitlementhash") != logical.removeprefix("Share") or \
-                    share.get("name") != template["Resources"][logical]["Properties"]["Name"]:
-                raise MigrationError("Migration share provenance differs from owning template")
-            if logical in result:
-                raise MigrationError("Duplicate migration stack resource")
-            result[logical] = share
-        if set(result) != set(template["Resources"]):
-            raise MigrationError("Migration stack resource inventory is incomplete")
+        result = Readback()
+        for logical in [*listed, *sorted(set(template["Resources"]) - set(listed))]:
+            try:
+                result.shares[logical] = self._proven_share(ram, owner, template, logical,
+                                                            listed.get(logical, []))
+            except Exception as exc:  # this share only; it is never verified or recorded
+                result.failures[logical] = exc
         return result
+
+    def _proven_share(self, ram, owner: str, template: dict, logical: str,
+                      rows: list[dict]) -> dict:
+        if logical not in template["Resources"]:
+            raise MigrationError(f"Migration resource ownership verification failed: stack share "
+                                 f"{logical} is not declared by the migration template")
+        if not rows:
+            raise MigrationError(f"Migration stack resource inventory is incomplete: {logical} is "
+                                 "declared by the migration template but not in the stack")
+        if len(rows) > 1:
+            raise MigrationError(f"Duplicate migration stack resource: {logical}")
+        arn = rows[0].get("PhysicalResourceId")
+        if not arn:
+            raise MigrationError(f"Migration resource not created: {logical}")
+        shares = pages(ram, "get_resource_shares", "resourceShares",
+                       resourceOwner="SELF", resourceShareArns=[arn])
+        if len(shares) != 1 or not managed(shares[0].get("tags", []), self.migration):
+            raise MigrationError("Migration resource ownership verification failed")
+        share = shares[0]
+        values = tags(share.get("tags", []))
+        if share.get("owningAccountId") != owner or \
+                share.get("resourceShareArn") != arn or \
+                values.get("owneraccount") != owner or \
+                values.get("entitlementhash") != logical.removeprefix("Share") or \
+                share.get("name") != template["Resources"][logical]["Properties"]["Name"]:
+            raise MigrationError("Migration share provenance differs from owning template")
+        return share
+
+    def shares(self, owner: str, region: str) -> dict[str, dict]:
+        """Every share of the migration stack, or a MigrationError naming each share that
+        could not be proven. For callers that need the whole stack: complete, the monitor."""
+        result = self.readback(owner, region)
+        if result.failures:
+            raise MigrationError("Migration stack shares could not all be proven: " + "; ".join(
+                f"{logical}: {result.reason(logical)}" for logical in sorted(result.failures)))
+        return result.shares
 
 
 def delete_share(router: Router, owner: str, region: str, arn: str, migration: str,

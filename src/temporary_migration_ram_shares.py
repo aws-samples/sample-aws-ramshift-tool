@@ -49,7 +49,7 @@ from ram_migration_record import (
 )
 from ram_migration_record import load as load_record
 from ram_migration_record import update as update_record
-from ram_migration_stacks import Stacks, accept, delete_share, stack_name, verify_group
+from ram_migration_stacks import Readback, Stacks, accept, delete_share, stack_name, verify_group
 
 try:
     import ram_migration_verification as verification
@@ -748,29 +748,40 @@ def dependency_regions(audit: ReceivedAudit | None) -> dict[str, set[str]]:
 
 def received_provenance(stacks: Stacks, persisted: dict[tuple[str, str], list[Group]],
                         opts: Options) -> tuple[dict[tuple[str, str, str], Group], list[str]]:
+    """Temporary shares proven per logical share: a share that cannot be proven blocks
+    alone, and never hides the provenance of its siblings in the same stack."""
     proven: dict[tuple[str, str, str], Group] = {}
     blocked = []
     persisted_scopes = grouped_scopes([group for groups in persisted.values() for group in groups])[1]
-    for row in scoped_fanout(persisted_scopes, stacks.shares, opts):
+    for row in scoped_fanout(persisted_scopes, stacks.readback, opts):
         if row.error:
             blocked.append(
                 f"owner={row.account} region={row.region} phase=received-provenance status=BLOCKED {row.error}")
             continue
+        readback, logicals = row.value, set()
         for group in persisted[row.account, row.region]:
-            share = row.value.get(group.logical_id)
+            logicals.add(group.logical_id)
+            share = readback.shares.get(group.logical_id)
             if share is None or share.get("owningAccountId") != group.owner:
+                reason = (f": {readback.reason(group.logical_id)}"
+                          if group.logical_id in readback.failures else "")
                 blocked.append(f"{row.account}/{row.region}/{group.key}: "
-                               "stored migration share ownership could not be proven")
+                               f"stored migration share ownership could not be proven{reason}")
                 continue
             proven[group.owner, group.region, share["resourceShareArn"]] = group
+        blocked += [f"owner={row.account} region={row.region} logical_id={logical} "
+                    f"phase=received-provenance status=BLOCKED {readback.reason(logical)}"
+                    for logical in sorted(set(readback.failures) - logicals)]
     return proven, blocked
 
 
 def classify_received(audit: ReceivedAudit, plan: Plan, proven: dict, owner_scopes: dict,
                       opts: Options) -> dict[str, dict]:
     """Every active received dependency of a migrating account must be covered by a
-    planned temporary share. Owners outside the approved scope are proposed, never
-    added silently. Returns the proposed-owner evidence."""
+    planned temporary share, unless owner-side discovery proved that account's own
+    ASSOCIATED external=true association on that original share (recovered external
+    access). Owners outside the approved scope are proposed, never added silently.
+    Returns the proposed-owner evidence."""
     intended_shares: dict[tuple[str, str], set[str]] = defaultdict(set)
     intended_resources: dict[tuple[str, str], set[str]] = defaultdict(set)
     covered: set[tuple[str, str, str, str]] = set()
@@ -779,6 +790,8 @@ def classify_received(audit: ReceivedAudit, plan: Plan, proven: dict, owner_scop
             intended_shares[consumer, group.region].update(group.source_shares)
             intended_resources[consumer, group.region].update(group.resources)
             covered.update((consumer, group.owner, group.region, arn) for arn in group.resources)
+    external = {(row["consumer"], row["owner"], row["region"], row["share"]): row
+                for row in plan.external_access}
     proposed: dict[str, dict] = {}
 
     def propose(entry: dict, pending: bool = False) -> None:
@@ -837,6 +850,19 @@ def classify_received(audit: ReceivedAudit, plan: Plan, proven: dict, owner_scop
             entry["status"] = "OUTSIDE_OWNER_SCOPE"
             propose(entry)
             continue
+        association = external.get((account, owner, region, arn))
+        if association is not None:
+            # Proven owner-side in this run's discovery of this owner and Region.
+            entry["status"] = "RECOVERED_EXTERNAL"
+            entry["association"] = {"status": association["status"],
+                                    "external": association["external"]}
+            audit.excluded.append(
+                f"{context} status=EXCLUDED recovered external access: the owner's "
+                f"principal association for {account} on this original share is "
+                f"{association['status']} with external=true, which does not depend on "
+                "organization membership; it is pre-existing access, neither duplicated in a "
+                "temporary share nor modified")
+            continue
         if region not in owner_scopes.get(owner, []):
             entry["status"] = "BLOCKED"
             audit.blocked.append(f"{context} status=BLOCKED "
@@ -876,9 +902,12 @@ def print_received(audit: ReceivedAudit, report: Reporter) -> None:
     inventory: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
     for entry in audit.entries:
         inventory[entry["account"], entry["owner"], entry["region"]].append(entry)
+        association = entry.get("association")
         report.emit(f"account={entry['account']} owner={entry['owner']} region={entry['region']} "
                     f"share={entry['share']} phase=received-audit status={entry['status']} "
-                    f"share_status={entry['share_status']} resources={len(entry['resources'])}")
+                    f"share_status={entry['share_status']} resources={len(entry['resources'])}"
+                    + (f" association_status={association['status']} external="
+                       f"{str(association['external']).lower()}" if association else ""))
         for resource in entry["resources"]:
             report.emit(f"  resource={resource['arn']} type={resource['type']} status={resource['status']}")
     for (account, owner, region), entries in sorted(inventory.items()):
@@ -913,6 +942,7 @@ def merge_plan(plan: Plan, addition: Plan) -> None:
     plan.existing.extend(addition.existing)
     plan.permission_changes.extend(addition.permission_changes)
     plan.notes.extend(addition.notes)
+    plan.external_access.extend(addition.external_access)
 
 
 def backing_approval(approvals: list[dict], migration: str, change: dict) -> dict | None:
@@ -1709,7 +1739,10 @@ BLOCKER_ACTIONS = {
     "authentication": {
         "*": "refresh or supply credentials for each named account (aws sso login, --sso-role, "
              "--account-map, --profile-map or --role-map), then {rerun}; expired tokens are "
-             "not retried",
+             "not retried. A token rejected only in an opt-in Region such as af-south-1 means "
+             "that Region is not enabled in that account, or the token came from the global "
+             "STS endpoint: role and SSO sessions this tool opens use Regional STS endpoints, "
+             "so give a base profile credentials from a Regional STS endpoint",
     },
     "region-scope": {
         "plan": "make every Region resolvable: allow ec2:DescribeRegions for the named accounts "
@@ -1760,6 +1793,22 @@ BLOCKER_ACTIONS = {
                   "recording its shares is resumed by apply with the same --record while its "
                   "reviewed plan still matches; then re-run verify with the same --record",
     },
+    "policy-created-share": {
+        "*": "each named share was created by RAM from a resource-based policy (featureSet "
+             "CREATED_FROM_POLICY) or is being promoted (PROMOTING_TO_STANDARD), and is never "
+             "inspected as a standard share: in its owner account run aws ram "
+             "promote-permission-created-from-policy and then aws ram "
+             "promote-resource-share-created-from-policy, wait until its featureSet is "
+             "STANDARD, then {replan}",
+    },
+    "ram-share-quota": {
+        "*": "a planned temporary share exceeds a fixed AWS RAM per-share quota (5,000 resource "
+             "or 5,000 principal associations, not adjustable) and nothing was written; this "
+             "tool version never splits an entitlement group across shares, so put migrating "
+             "consumers in separate migration records (new --migration-id and --record) to "
+             "reduce a group's principals and escalate a group with more resources than the "
+             "quota, then {replan}",
+    },
     "other": {"*": "resolve each blocker listed above, then {rerun}"},
 }
 RERUN = {"plan": "re-run plan --record", "apply": "re-run apply with the same --record",
@@ -1791,6 +1840,8 @@ BLOCKER_PATTERNS = (
     ("owner-outside-approved-scope", re.compile(r"phase=owner-scope ")),
     ("reviewed-record-mismatch", re.compile(
         r"phase=reviewed-record |plan changed; run plan/apply")),
+    ("policy-created-share", re.compile(r"featureSet (?:CREATED_FROM_POLICY|PROMOTING_TO_STANDARD):")),
+    ("ram-share-quota", re.compile(r"AWS RAM allows at most \d+ \w+ associations per resource share")),
     ("discovery-api-error", re.compile(r"operation=\w+|\(request [^)]*\)")),
     ("permission-approval-required", re.compile(
         r"requires approval|changed since (?:plan )?approval|approval \S+ no longer covers")),
@@ -2222,7 +2273,14 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
             reader = Stacks(WriteGate(router), plan.migration, timeout=args.timeout)
 
             def read(owner, region):
-                return {} if reader.existing(owner, region) is None else reader.shares(owner, region)
+                if reader.existing(owner, region) is None:
+                    return {}
+                readback = reader.readback(owner, region)  # proven shares are still recorded
+                for logical in sorted(readback.failures):
+                    report.emit(f"owner={owner} region={region} logical_id={logical} "
+                                "phase=interrupted-readback status=INCOMPLETE "
+                                f"{readback.reason(logical)}")
+                return readback.shares
             found: dict[tuple[str, str], dict] = {}
             for row in scoped_fanout(group_scopes, read, opts):
                 if row.error:
@@ -2243,12 +2301,17 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
             interrupted or killed run leaves at most its running stacks unrecorded."""
             here = grouped[owner, region]
             try:
-                found = {(owner, region): stacks.shares(owner, region)}
+                readback = stacks.readback(owner, region)
             except Exception as exc:
                 report.emit(f"owner={owner} region={region} phase=record status=INCOMPLETE stack "
                             f"shares were not read back ({failure_text(exc)}); the final "
                             "readback records them")
                 return
+            for logical in sorted(readback.failures):
+                report.emit(f"owner={owner} region={region} logical_id={logical} phase=record "
+                            f"status=INCOMPLETE share was not proven ({readback.reason(logical)}); "
+                            "it is not recorded, and the final readback reports it")
+            found = {(owner, region): readback.shares}
             conflicts: list[str] = []
             updated = None
             with writer:
@@ -2287,15 +2350,28 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                 report.emit(f"owner={row.account} region={row.region} phase=creation "
                             f"status=COMPLETE stack={row.value}")
 
+    # Per logical share: a share that cannot be proven fails alone, and its proven
+    # siblings are still recorded, accepted and verified.
     shares: dict[tuple[str, str], dict] = {}
-    for row in scoped_fanout(group_scopes, stacks.shares, opts):
+    readbacks: dict[tuple[str, str], Readback] = {}
+    for row in scoped_fanout(group_scopes, stacks.readback, opts):
         if row.error:
             failures.append(f"owner={row.account} region={row.region} phase=share-readback {row.error}")
         else:
-            shares[row.account, row.region] = row.value
+            shares[row.account, row.region] = row.value.shares
+            readbacks[row.account, row.region] = row.value
+    planned = {(group.owner, group.region, group.logical_id) for group in plan.groups}
+    for (owner, region), readback in sorted(readbacks.items()):
+        failures += [f"owner={owner} region={region} logical_id={logical} phase=share-readback "
+                     f"{readback.reason(logical)}" for logical in sorted(readback.failures)
+                     if (owner, region, logical) not in planned]
     for group in plan.groups:
         share = shares.get((group.owner, group.region), {}).get(group.logical_id)
-        if share is None:
+        readback = readbacks.get((group.owner, group.region))
+        if share is None and readback is not None and group.logical_id in readback.failures:
+            failures.append(f"{group.owner}/{group.region}/{group.key}: planned share could not be "
+                            f"proven from its migration stack: {readback.reason(group.logical_id)}")
+        elif share is None:
             failures.append(f"{group.owner}/{group.region}/{group.key}: planned share missing from migration stack")
         elif group.key in persisted or args.mode == "verify":
             reused += 1
@@ -2339,7 +2415,10 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                 continue  # Missing shares already contribute a failure above.
             try:
                 def check_current_share():
-                    current = verification_stacks.shares(owner, region).get(group.logical_id)
+                    readback = verification_stacks.readback(owner, region)
+                    if group.logical_id in readback.failures:  # this share only, never a sibling
+                        raise readback.failures[group.logical_id]
+                    current = readback.shares.get(group.logical_id)
                     if current is None:
                         raise MigrationError(f"{group.key}: migration share MISSING during verification")
                     verify_group(readonly, group, current, plan.migration)

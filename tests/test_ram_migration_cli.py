@@ -21,7 +21,7 @@ from ram_migration_common import Group, MigrationError, Plan
 from ram_migration_discovery import ApprovedGroup, approved_change, permission_change
 from ram_migration_record import approval_for
 import ram_migration_record as record_module
-from ram_migration_stacks import template_for
+from ram_migration_stacks import Readback, check_quotas, template_for
 
 OWNER = "000000000001"
 CONSUMER = "000000000002"
@@ -257,6 +257,8 @@ class Harness:
         self.apply_errors = {}
         self.verify_errors = {}
         self.verify_hook = None
+        self.readback_failures = {}       # (owner, region) -> {logical ID: exception}
+        self.external_access = {}         # (owner, region) -> discovery's recovered external access
         self.share_states = {}
         self.share_reads = Counter()
         self.prepare_counts = Counter()
@@ -320,7 +322,9 @@ class Harness:
                 if error:
                     return Plan(self.migration, blocked=[str(error)])
                 plan = Plan(self.migration, groups=copy.deepcopy(harness.source.get((owner, region), [])),
-                            excluded=["local empty share"] if region == HOME else [])
+                            excluded=["local empty share"] if region == HOME else [],
+                            external_access=copy.deepcopy(
+                                harness.external_access.get((owner, region), [])))
                 approvals = harness.discovery_kwargs.get("approved_changes", [])
                 for change in harness.permission_changes.get((owner, region), []):
                     granted = approval_for(approvals, self.migration, change)
@@ -358,6 +362,7 @@ class Harness:
                 if key in harness.prepare_errors:
                     raise harness.prepare_errors[key]
                 body = template_for(groups, self.migration)
+                check_quotas(body)  # as Stacks.prepare does, before any write
                 if key in harness.drift and harness.prepare_counts[key] > 1:
                     body["Description"] = "changed after confirmation"
                 return body, self.existing(owner, region)
@@ -392,6 +397,14 @@ class Harness:
                 state = states.pop(0) if len(states) > 1 else states[0]
                 return {g.logical_id: dict(harness.share(g), status=state)
                         for g in harness.stored[owner, region] if g.key not in harness.missing_shares}
+
+            def readback(self, owner, region):
+                """Like Stacks.readback: proven shares, and each unproven share's failure."""
+                found = self.shares(owner, region)
+                failures = {logical: copy.copy(error) for logical, error in
+                            harness.readback_failures.get((owner, region), {}).items()}
+                return Readback({logical: share for logical, share in found.items()
+                                 if logical not in failures}, failures)
 
         def local_verify(router, g, share, migration):
             harness.calls.append(("verify", g.key, share["resourceShareArn"], migration))
@@ -3095,3 +3108,150 @@ def test_verify_and_complete_name_an_entitlement_the_baseline_never_covered(
     output = capsys.readouterr().out
     assert "status=INCONCLUSIVE" in summary_line(output) and reason in output
     refused(harness, migration_record, capsys, reason)
+
+
+# ---------------------------------------------------------------------------
+# large-estate discovery edge cases (case 022, case 030, case 032, case 114)
+# ---------------------------------------------------------------------------
+from ram_migration_discovery import feature_set_problem, share_blocker  # noqa: E402
+
+
+def two_consumer_groups(harness):
+    """Two temporary shares in one owner/Region stack, one per migrating consumer."""
+    first, second = group(), group(consumer=OTHER_CONSUMER)
+    harness.source[OWNER, REGION] = [first, second]
+    return first, second, args(consumers=f"{CONSUMER},{OTHER_CONSUMER}")
+
+
+def test_verify_reports_an_unproven_share_alone_and_still_verifies_its_sibling(
+        harness, capsys, migration_record):
+    """case 114: one failed logical share no longer aborts the readback of its siblings."""
+    first, second, argv = two_consumer_groups(harness)
+    applied(harness, migration_record, argv)
+    harness.readback_failures[OWNER, REGION] = {
+        first.logical_id: MigrationError("Migration resource ownership verification failed")}
+    capsys.readouterr()
+    assert main(mode_args("verify", migration_record)) == 1
+    output = capsys.readouterr().out
+    assert (f"{OWNER}/{REGION}/{first.key}: planned share could not be proven from its migration "
+            "stack: Migration resource ownership verification failed") in output
+    assert "planned share missing" not in output
+    second_arn = harness.share(second)["resourceShareArn"]
+    assert (f"share={second_arn} consumer={OTHER_CONSUMER} phase=verification "
+            "status=VERIFIED") in output
+    assert [call[1] for call in harness.calls if call[0] == "verify"] == [second.key]
+    assert "sharing_status=SHARING_INCOMPLETE" in summary_line(output)   # never reported ready
+    assert read_record(migration_record)["verifications"][-1]["sharing_status"] == \
+        "SHARING_INCOMPLETE"
+
+
+def test_apply_records_and_accepts_only_the_proven_share_of_a_partly_readable_stack(
+        harness, capsys, migration_record):
+    first, second, argv = two_consumer_groups(harness)
+    assert quietly(with_record(argv, migration_record)) == 0
+    harness.readback_failures[OWNER, REGION] = {
+        first.logical_id: MigrationError("Migration share provenance differs from owning template")}
+    capsys.readouterr()
+    assert main(with_record(["apply", *argv], migration_record), input_fn=harness.confirm) == 1
+    output = capsys.readouterr().out
+    assert (f"owner={OWNER} region={REGION} logical_id={first.logical_id} phase=record "
+            "status=INCOMPLETE share was not proven (Migration share provenance differs from "
+            "owning template); it is not recorded") in output
+    assert f"{OWNER}/{REGION}/{first.key}: planned share could not be proven" in output
+    record = read_record(migration_record)
+    assert [share["logical_id"] for share in record["shares"]] == [second.logical_id]
+    assert [call[1] for call in harness.calls if call[0] == "accept-write"] == [
+        f"local-invitation-{OTHER_CONSUMER}-{second.key}"]
+    assert [entry["status"] for entry in record["history"]][-2:] == ["STACK_COMPLETE", "INCOMPLETE"]
+
+
+def test_received_provenance_blocks_only_the_unproven_temporary_share(
+        harness, capsys, migration_record):
+    first, second, argv = two_consumer_groups(harness)
+    applied(harness, migration_record, argv)
+    for g, consumer in ((first, CONSUMER), (second, OTHER_CONSUMER)):
+        arn = harness.share(g)["resourceShareArn"]
+        harness.received_shares[consumer, REGION].append(
+            {"resourceShareArn": arn, "owningAccountId": OWNER, "status": "ACTIVE"})
+        harness.received_resources[consumer, REGION, arn] = [
+            {"arn": POOL, "type": IPAM, "status": "AVAILABLE", "resourceShareArn": arn}]
+    harness.readback_failures[OWNER, REGION] = {
+        first.logical_id: MigrationError("Migration resource ownership verification failed")}
+    capsys.readouterr()
+    assert main(with_record(argv, migration_record)) == 1
+    output = capsys.readouterr().out
+    assert (f"{OWNER}/{REGION}/{first.key}: stored migration share ownership could not be "
+            "proven: Migration resource ownership verification failed") in output
+    assert (f"share={harness.share(second)['resourceShareArn']} phase=received-audit "
+            "status=CURRENT_MIGRATION") in output
+
+
+def restored(harness, consumer=CONSUMER):
+    """An original re-added to a departed account: ASSOCIATED, external=true (case 030)."""
+    share = harness.receive(receiver=consumer, suffix="restored-ec2")
+    return share, {"owner": OWNER, "region": REGION, "share": share["resourceShareArn"],
+                   "consumer": consumer, "status": "ASSOCIATED", "external": True}
+
+
+def test_recovered_external_access_is_its_own_received_audit_status_and_is_recorded(
+        harness, capsys, migration_record):
+    harness.source = {}   # the account holds the original itself; nothing is bridged
+    share, evidence = restored(harness)
+    harness.external_access[OWNER, REGION] = [evidence]
+    assert main(with_record(args(), migration_record)) == 0
+    output = capsys.readouterr().out
+    assert (f"share={share['resourceShareArn']} phase=received-audit status=RECOVERED_EXTERNAL "
+            "share_status=ACTIVE resources=1 association_status=ASSOCIATED external=true") in output
+    assert "status=EXCLUDED recovered external access: the owner's principal association" in output
+    assert "not covered by any planned temporary share" not in output
+    entry, = read_record(migration_record)["plan"]["received_entitlements"]["entries"]
+    assert entry["status"] == "RECOVERED_EXTERNAL"
+    assert entry["association"] == {"status": "ASSOCIATED", "external": True}
+    assert not harness.writes()
+
+
+@pytest.mark.parametrize("evidence_for", [None, OTHER_CONSUMER])
+def test_a_receipt_without_its_own_external_evidence_still_blocks(harness, capsys, evidence_for):
+    harness.source = {}
+    restored(harness)
+    if evidence_for:   # another account's external association covers nothing for this one
+        harness.external_access[OWNER, REGION] = [restored(harness, evidence_for)[1]]
+    assert main(args(consumers=f"{CONSUMER},{OTHER_CONSUMER}")) == 1
+    output = capsys.readouterr().out
+    assert (f"account={CONSUMER} owner={OWNER} region={REGION} share=arn:aws:ram:{REGION}:"
+            f"{OWNER}:resource-share/restored-ec2 phase=received-audit status=NOT_COVERED") in output
+    assert "category=received-dependency-not-covered blockers=1 " in output
+
+
+def test_an_over_quota_temporary_share_blocks_plan_and_apply_before_any_write(
+        harness, capsys, migration_record):
+    """case 022: 5,000 resource associations per share is a fixed RAM quota."""
+    big = group()
+    big.resources = {f"arn:aws:ec2:{REGION}:{OWNER}:ipam-pool/ipam-pool-{index:05d}": IPAM
+                     for index in range(5001)}
+    harness.source[OWNER, REGION] = [big]
+    assert main(with_record(args(), migration_record)) == 1
+    output = capsys.readouterr().out
+    assert (f"owner={OWNER} region={REGION} phase=stack-preflight {big.logical_id}: the temporary "
+            "share would hold 5001 resource associations; AWS RAM allows at most 5000 resource "
+            "associations per resource share and the quota is not adjustable") in output
+    assert "category=ram-share-quota blockers=1 owners=1 next_action=" in output
+    assert read_record(migration_record)["plan"]["status"] == "BLOCKED"
+    assert main(with_record(["apply", *args()], migration_record),
+                input_fn=lambda _: pytest.fail("blocked before confirmation")) == 1
+    assert not harness.writes() and not any(call[0] == "apply" for call in harness.calls)
+
+
+def test_a_policy_created_share_is_its_own_blocker_category_with_the_promotion_steps(
+        harness, capsys, migration_record):
+    """case 032: never inspected as a standard share; promote it, then plan again."""
+    arn = f"arn:aws:ram:{REGION}:{OWNER}:resource-share/1f35643b"
+    harness.discovery_errors[OWNER, REGION] = share_blocker(OWNER, REGION, arn, MigrationError(
+        feature_set_problem(OWNER, REGION, arn, "CREATED_FROM_POLICY")))
+    assert main(with_record(args(), migration_record)) == 1
+    output = capsys.readouterr().out
+    line, = [row for row in output.splitlines() if "category=policy-created-share" in row]
+    assert "blockers=1 shares=1 owners=1 next_action=" in line
+    assert "promote-resource-share-created-from-policy" in line
+    assert line.endswith("then re-run plan --record")
+    assert read_record(migration_record)["plan"]["status"] == "BLOCKED"
