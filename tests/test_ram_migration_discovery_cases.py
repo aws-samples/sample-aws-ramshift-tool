@@ -269,12 +269,31 @@ def policy_share(arn, feature="CREATED_FROM_POLICY", status="ACTIVE"):
     return dict(live_share(arn, status), name=POLICY_NAME, featureSet=feature, tags=[])
 
 
+def policy_principals(stubs, arn, rows):
+    stubs["ram"].add_response("get_resource_share_associations", {"resourceShareAssociations": rows},
+                              {"associationType": "PRINCIPAL", "resourceShareArns": [arn]})
+
+
+def test_a_service_principal_only_policy_created_share_is_excluded_not_blocked(clients):
+    """400000000015's pca-connector-ad shares: service-principal-only shares stay excluded."""
+    cs, stubs = clients
+    created = f"{SOURCE}-1f35643b"
+    listing(stubs, policy_share(created), live_share(SOURCE))
+    policy_principals(stubs, created, [principal("pca-connector-ad.amazonaws.com", share=created)])
+    stub_share(stubs, SOURCE, [principal(CONSUMER)])
+    result = inspect(cs)
+    assert not result.blocked and [g.source_shares for g in result.groups] == [[SOURCE]]
+    assert f"{created}: service-principal-only share (featureSet CREATED_FROM_POLICY); never " \
+        "replicated account-wide" in result.excluded
+
+
 def test_a_policy_created_share_blocks_alone_with_its_promotion_remediation(clients):
     """400000000015: four such shares in us-east-1 and two in eu-west-1 (pca-connector-ad)."""
     cs, stubs = clients
     created = f"{SOURCE}-1f35643b"
     listing(stubs, policy_share(created), live_share(SOURCE))
-    # Strict stubs: the policy share is classified from its listing row and read no further.
+    # Strict stubs: the policy share is read only far enough to see it has account principals.
+    policy_principals(stubs, created, [principal(CONSUMER, share=created)])
     stub_share(stubs, SOURCE, [principal(CONSUMER)])
     result = inspect(cs)
     assert [g.source_shares for g in result.groups] == [[SOURCE]]   # the sibling is planned
@@ -296,6 +315,7 @@ def test_a_policy_created_share_blocks_alone_with_its_promotion_remediation(clie
 def test_a_share_being_promoted_blocks_until_it_is_standard(clients):
     cs, stubs = clients
     listing(stubs, policy_share(SOURCE, "PROMOTING_TO_STANDARD"))
+    policy_principals(stubs, SOURCE, [principal(CONSUMER)])
     result = inspect(cs)
     assert not result.groups and not result.excluded
     reason, = result.blocked
@@ -311,6 +331,7 @@ def test_a_share_being_promoted_blocks_until_it_is_standard(clients):
 def test_an_unknown_feature_set_is_never_treated_as_standard(clients):
     cs, stubs = clients
     listing(stubs, policy_share(SOURCE, "SOMETHING_NEW"))
+    policy_principals(stubs, SOURCE, [principal(CONSUMER)])
     assert inspect(cs).blocked == [
         f"{SOURCE}: owner={OWNER} region={REGION} unsupported featureSet 'SOMETHING_NEW': only "
         "STANDARD shares are inspected; this tool version cannot classify this share, so it "
@@ -320,7 +341,10 @@ def test_an_unknown_feature_set_is_never_treated_as_standard(clients):
 def test_policy_created_share_never_passes_as_a_migration_share(clients):
     """Migration tags on a policy-created share are not provenance: no stack is read."""
     cs, stubs = clients
-    listing(stubs, dict(migration_share(), featureSet="CREATED_FROM_POLICY"))
+    share = dict(migration_share(), featureSet="CREATED_FROM_POLICY")
+    listing(stubs, share)
+    policy_principals(stubs, share["resourceShareArn"],
+                      [principal(CONSUMER, share=share["resourceShareArn"])])
     result = inspect(cs)
     assert not result.existing and not result.groups
     assert "featureSet CREATED_FROM_POLICY" in result.blocked[0]

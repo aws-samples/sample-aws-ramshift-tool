@@ -1096,6 +1096,15 @@ class Discovery:
             # A row without featureSet predates the field and describes a standard share.
             feature = share.get("featureSet", "STANDARD")
             if feature != "STANDARD":
+                # A service-principal-only share is never replicated account-wide, whatever
+                # its featureSet (for example pca-connector-ad shares created from policy).
+                principals = [r["associatedEntity"] for r in pages(
+                    ram, "get_resource_share_associations", "resourceShareAssociations",
+                    associationType="PRINCIPAL", resourceShareArns=[arn]) if r.get("status") in LIVE]
+                if principals and all(SERVICE_PRINCIPAL.fullmatch(p) for p in principals):
+                    part.excluded.append(f"{arn}: service-principal-only share (featureSet "
+                                         f"{feature}); never replicated account-wide")
+                    return part, None
                 raise MigrationError(feature_set_problem(owner, region, arn, feature))
             if self._migration_owned(owner, region, share):
                 part.existing.append(share)
