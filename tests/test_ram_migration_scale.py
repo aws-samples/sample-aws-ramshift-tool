@@ -588,11 +588,14 @@ def organization_denied(monkeypatch):
 @pytest.mark.parametrize("failure,confirmed", [
     (recheck_throttled, True), (organization_denied, False)])
 def test_blocked_apply_api_errors_say_rerun_apply_not_plan(harness, capsys, monkeypatch,
-                                                           failure, confirmed):
+                                                           migration_record, failure, confirmed):
+    # The plan is reviewed before the failure starts: an organization that cannot be
+    # read blocks plan itself, in the organization-policy preflight.
+    assert main(with_record(args(), migration_record)) == 0
     failure(monkeypatch)
     confirmations = []
-    assert main(args("apply"), input_fn=lambda prompt: confirmations.append(prompt) or
-                f"APPLY {MIGRATION}") == 1
+    assert main(with_record(args("apply"), migration_record),
+                input_fn=lambda prompt: confirmations.append(prompt) or f"APPLY {MIGRATION}") == 1
     assert bool(confirmations) == confirmed and not harness.writes()
     api, = [line for line in summary_lines(capsys.readouterr().out) if "category=" in line]
     assert "category=discovery-api-error blockers=1 " in api

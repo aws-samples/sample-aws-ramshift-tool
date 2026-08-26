@@ -9,6 +9,8 @@ live discovery, then opens its write gate only after complete preflight, the
 exact ``APPLY <migration-id>`` reply, and a check under the record lock that the
 record still holds that reviewed revision. It records each stack's shares as
 the stack completes, and its outcome even when it fails or is interrupted.
+Plan and apply, before and after the confirmation, also evaluate the
+organization's SCPs and RCPs read-only (ram_migration_preflight).
 This tool neither moves accounts nor cleans up shares or Resolver associations.
 """
 from __future__ import annotations
@@ -46,6 +48,9 @@ from ram_migration_record import (
     APPLICABLE, CHANGE_FIELDS, add_drops, approval_for, approve_owner_scope,
     approve_permission_change, approved_owners, drop_id, failure_drops, latest, new_record,
     owner_scope_request, pending_requests, permission_requests, plan_digest, tool_identity,
+)
+from ram_migration_preflight import (
+    destination_target, organization_preflight, policy_changes, recorded_destination,
 )
 from ram_migration_record import load as load_record
 from ram_migration_record import update as update_record
@@ -126,6 +131,12 @@ def build_parser() -> argparse.ArgumentParser:
                              "be excluded")
     parser.add_argument("--exclude-reason",
                         help="mandatory reason for --exclude-regions, recorded with them")
+    parser.add_argument("--destination-ou",
+                        help="plan/apply: destination OU (or root) ARN, "
+                             "arn:aws:organizations::<management-account>:ou/<o-id>/<ou-id>; the "
+                             "SCPs and RCPs on its path are evaluated for the reads verify and "
+                             "monitor need after the move. Its management account must be "
+                             "reachable through the account map or a base profile")
     parser.add_argument("--profile", action="append", default=[], help="base profile; repeatable")
     parser.add_argument("--source-profile", help="explicit source base profile")
     parser.add_argument("--destination-profile", help="explicit destination base profile")
@@ -274,6 +285,10 @@ def excluded_regions(args: argparse.Namespace, regions: list[str]) -> tuple[list
 
 
 def options(args: argparse.Namespace, ask: Callable[[str], str]) -> Options:
+    if args.destination_ou is not None:
+        if args.mode not in ("plan", "apply"):
+            raise MigrationError("--destination-ou is supported only for plan and apply")
+        destination_target(args.destination_ou)
     if args.mode == "approve":
         # Approval is an offline review of the record; it needs no AWS access.
         if not args.record:
@@ -1502,8 +1517,23 @@ def reviewed_plan_problem(record: dict, plan: Plan, scope: dict) -> str | None:
     return None
 
 
+def organization_policies(router: Any, plan: Plan, opts: Options, report: Reporter,
+                          organization_shares: dict[str, list[str]]) -> dict:
+    """The read-only organization-policy preflight (ram_migration_preflight) for the
+    owners that write this plan's temporary shares, their consumers and, with
+    --destination-ou, the destination path. Only shares in the plan's groups decide
+    where RAM organization sharing is relied on. Its blockers join the plan's."""
+    sources = {arn for group in plan.groups for arn in group.source_shares}
+    return organization_preflight(
+        router, plan.groups, opts.consumers, destination=opts.args.destination_ou,
+        organization_shares={arn: principals for arn, principals in organization_shares.items()
+                             if arn in sources},
+        emit=report.emit)
+
+
 def record_plan(record: dict, plan: Plan, scope: dict, prepared: dict, received: Any,
-                capability_provenance: dict, status: str, proposed: dict | None = None) -> dict:
+                capability_provenance: dict, status: str, proposed: dict | None = None,
+                preflight: dict | None = None) -> dict:
     record = dict(record)
     record["scope"] = scope
     record["plan"] = {
@@ -1521,6 +1551,7 @@ def record_plan(record: dict, plan: Plan, scope: dict, prepared: dict, received:
             {"owner": owner, "region": region, "template": body,
              "existing_stack": old.get("StackId") if old else None}
             for (owner, region), (body, old) in sorted(prepared.items())],
+        "organization_policy_preflight": preflight,
     }
     record["permission_change_requests"] = permission_requests(plan.migration,
                                                                plan.permission_changes)
@@ -1736,6 +1767,37 @@ BLOCKER_ACTIONS = {
              "--capabilities can only restrict that, so plan an unsupported type's continuity "
              "separately; then {replan}",
     },
+    "organization-policy-deny": {
+        "*": "an SCP or RCP on the named account's organization path denies actions the "
+             "migration needs: the policy, its target, the statement and the actions are named, "
+             "and a target whose policies allow none of them denies them too (an allow-list "
+             "without them). This tool never edits organization policies and an administrator "
+             "role does not override them: obtain an approved exception from the policy owner, "
+             "then {rerun}; leaving the account out of this migration needs a new reviewed plan",
+    },
+    "organization-policy-gap": {
+        "*": "the preflight could not decide whether the named statements apply to the "
+             "migration's requests (a condition key or operator it does not evaluate, a policy "
+             "variable, a resource pattern or a malformed statement); each is listed for human "
+             "review with its text (phase=org-policy status=REVIEW). The run stays blocked "
+             "while any is undecided: have the policy owner make the statement decidable for "
+             "these requests or grant an approved exception, then {rerun}",
+    },
+    "organization-policy-unreadable": {
+        "*": "the organization policies of the named accounts or destination could not be "
+             "read, and unread policies never pass: make each named management account "
+             "reachable through --account-map, --profile-map or --role-map, or a base profile, "
+             "with read access (a read-only role suffices) to organizations "
+             "DescribeOrganization, ListParents, ListPoliciesForTarget, DescribePolicy and "
+             "ListAWSServiceAccessForOrganization, then {rerun}; a throttled read "
+             "(TooManyRequestsException) needs only the re-run",
+    },
+    "ram-organization-prerequisites": {
+        "*": "shares with OU or organization principals rely on RAM sharing with AWS "
+             "Organizations, which needs ALL features and ram.amazonaws.com trusted access in "
+             "the named organization; this tool never enables them: have that organization's "
+             "management account enable them through its approved change process, then {rerun}",
+    },
     "authentication": {
         "*": "refresh or supply credentials for each named account (aws sso login, --sso-role, "
              "--account-map, --profile-map or --role-map), then {rerun}; expired tokens are "
@@ -1829,6 +1891,12 @@ BLOCKER_PATTERNS = (
         r"|security token included in the request is (?:expired|invalid)"
         r"|SSO (?:session|token|login)|token has expired|unable to locate credentials",
         re.IGNORECASE)),
+    ("organization-policy-unreadable", re.compile(
+        r"phase=(?:org-policy|ram-org-prerequisites) status=BLOCKED decision=UNREADABLE ")),
+    ("organization-policy-gap", re.compile(r"phase=org-policy status=GAP ")),
+    ("organization-policy-deny", re.compile(
+        r"phase=org-policy status=BLOCKED decision=(?:EXPLICIT_DENY|NO_ALLOW) ")),
+    ("ram-organization-prerequisites", re.compile(r"phase=ram-org-prerequisites ")),
     ("region-scope", re.compile(
         r"phase=(?:regions|received-regions) |Region is outside the selected discovery scope"
         r"|outside the explicit owner/Region scope")),
@@ -1861,6 +1929,15 @@ CATEGORY_COUNTED_AS = {
     "authentication": {"account": "accounts", "consumer": "accounts", "owner": "accounts"},
     "baseline-capture": {"account": "accounts", "consumer": "consumers", "owner": "owners"},
 }
+# Organization-policy blockers name each account with its role, and the policies
+# and organizations involved, which are counted too.
+ORGANIZATION_CATEGORIES = ("organization-policy-deny", "organization-policy-gap",
+                           "organization-policy-unreadable", "ram-organization-prerequisites")
+CATEGORY_COUNTED_AS.update({category: {"account": "accounts", "consumer": "accounts",
+                                       "owner": "accounts"}
+                            for category in ORGANIZATION_CATEGORIES})
+POLICY_ID = re.compile(r"\b(p-[0-9A-Za-z_]{8,128})\b")
+ORGANIZATION_FIELD = re.compile(r"\borganization=(o-[a-z0-9]{10,32})\b")
 OWNER_EVIDENCE = re.compile(r"phase=owner-scope owner=(\d{12}) .*? provides (\d+) unique "
                             r"received resources .*? through (\d+) shares .*?\((\d+) observations\)")
 
@@ -1909,6 +1986,9 @@ def report_blockers(plan: Plan, report: Reporter, status: str, *, mode: str,
             roles = CATEGORY_COUNTED_AS.get(category, COUNTED_AS)
             for name, account in ACCOUNT_FIELD.findall(text):
                 counts[roles[name]].add(account)
+            if category in ORGANIZATION_CATEGORIES:
+                counts["policies"] = set(POLICY_ID.findall(text))
+                counts["organizations"] = set(ORGANIZATION_FIELD.findall(text))
             fields += [f"{name}={len(found)}" for name, found in counts.items() if found]
         if category == "permission-approval-required":
             pending = [c for c in plan.permission_changes if c.get("status") == "APPROVAL_REQUIRED"]
@@ -2024,6 +2104,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
 
     capability_provenance: dict = {}
     proposed: dict[str, dict] = {}
+    organization_shares: dict[str, list[str]] = {}  # original share -> its OU/org principals
     if args.mode != "verify":
         capabilities, capability_provenance = capabilities_for(opts)
         report.emit(f"phase=plan capability_provenance={json.dumps(capability_provenance, sort_keys=True)}")
@@ -2043,6 +2124,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                 plan.blocked.append(f"owner={row.account} region={row.region} phase=discovery {row.error}")
             else:
                 merge_plan(plan, row.value)
+        organization_shares = dict(getattr(discovery, "organization_principals", {}))
         proven, provenance_blocked = received_provenance(stacks, persisted_groups, opts)
         received.blocked.extend(provenance_blocked)
         proposed = classify_received(received, plan, proven, scopes, opts)
@@ -2066,6 +2148,11 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                 if len(json.dumps(body, sort_keys=True).encode()) > 51200:
                     plan.blocked.append(f"{row.account}/{row.region}: migration template exceeds inline CFN limit")
                 prepared[row.account, row.region] = body, old
+    # Read-only SCP/RCP evaluation; plan records it with the reviewed plan.
+    org_policy: dict | None = None
+    if args.mode == "plan":
+        org_policy = organization_policies(gate, plan, opts, report, organization_shares)
+        plan.blocked.extend(org_policy["blockers"])
 
     if args.mode == "apply" and record is not None:
         problem = reviewed_plan_problem(record, plan, scope)
@@ -2074,6 +2161,14 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         else:
             opts.applied_plan = {"plan_revision": latest(record, "plan")["revision"],
                                  "plan_digest": record["plan"]["digest"]}
+            reviewed = recorded_destination(record["plan"].get("organization_policy_preflight"))
+            if reviewed != args.destination_ou:
+                plan.blocked.append(
+                    f"phase=reviewed-record --destination-ou {args.destination_ou or 'none'} "
+                    f"differs from the destination {reviewed or 'none'} that reviewed plan "
+                    f"revision {opts.applied_plan['plan_revision']} evaluated; pass the same "
+                    "--destination-ou, or re-run plan --record with the intended destination "
+                    "and review it")
         if record.get("baseline") is not None:
             plan.blocked.extend(baseline_scope_problems(
                 record["baseline"], plan.groups, [g for groups in deployed.values() for g in groups]))
@@ -2099,6 +2194,12 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         pending_drops = drops_from(comparison, preflight, organizations, "apply",
                                    record["baseline"]["captured_at"] if record and record.get("baseline")
                                    else "", f"record revision {record['revision'] if record else 0}")
+    if args.mode == "apply" and not plan.blocked and plan.groups:
+        org_policy = organization_policies(gate, plan, opts, report, organization_shares)
+        plan.blocked.extend(org_policy["blockers"])
+        for line in policy_changes((record.get("plan") or {}).get("organization_policy_preflight"),
+                                   org_policy):
+            report.emit(line)
     if args.mode != "verify":
         print_plan(plan, prepared, report)
         requests = print_permission_changes(plan, approvals, report)
@@ -2110,7 +2211,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                 args.record, plan.migration,
                 lambda current: current.update(record_plan(
                     current, plan, scope, prepared, received, capability_provenance, status,
-                    proposed)),
+                    proposed, org_policy)),
                 mode="plan", status=status, create=True,
                 plan_digest=plan_digest(plan.groups, scope), blockers=len(plan.blocked),
                 permission_changes_pending=pending)
@@ -2121,6 +2222,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
             exported["capability_provenance"] = capability_provenance
             exported["received_entitlements"] = received.to_dict()
             exported["scope"] = scope
+            exported["organization_policy_preflight"] = org_policy
             exported["migration_stacks"] = [
                 {"owner": owner, "region": region, "template": body,
                  "existing_stack": old.get("StackId") if old else None}
@@ -2204,6 +2306,12 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                 except Exception as exc:
                     plan.blocked.append(f"{group.owner}/{group.region}: post-confirmation "
                                         f"permission revalidation {failure_text(exc)}")
+        # The organization policies are read again, fresh: an SCP or RCP changed during
+        # the confirmation blocks every write.
+        recheck = organization_policies(gate, plan, opts, report, organization_shares)
+        plan.blocked.extend(f"post-confirmation {reason}" for reason in recheck["blockers"])
+        for line in policy_changes(org_policy, recheck, since="the read before the confirmation"):
+            report.emit(line)
         # The original baseline is observed again immediately before the first write.
         captured = None
         if not plan.blocked:

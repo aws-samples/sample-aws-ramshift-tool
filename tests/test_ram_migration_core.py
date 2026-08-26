@@ -500,6 +500,31 @@ def test_mixed_ou_and_departed_root_principal_proves_direct_account_entitlement(
     assert result.groups[0].consumers == (CONSUMER, DEPARTED)
 
 
+def test_discovery_records_the_ou_and_organization_principals_of_original_shares(
+        clients, monkeypatch):
+    """The organization-policy preflight checks the RAM organization prerequisites
+    only where an original share relies on them; account principals are not recorded."""
+    cs, stubs = clients
+    organization = {"Id": "o-offline123", "ManagementAccountId": OWNER}
+    ou = f"arn:aws:organizations::{OWNER}:ou/o-offline123/ou-offline-first"
+    discovery = Discovery(OfflineRouter(cs), {CONSUMER, DEPARTED}, MIGRATION, {},
+                          {KIND.lower(): True})
+    monkeypatch.setattr(discovery, "_org", lambda owner: (Api(cs["organizations"]), organization))
+    stub_discovery(stubs, principals={SOURCE: [ou, f"arn:aws:iam::{DEPARTED}:root"]})
+    stubs["organizations"].add_response("list_accounts_for_parent", {
+        "Accounts": [{"Id": CONSUMER, "State": "ACTIVE"}]}, {"ParentId": "ou-offline-first"})
+    stubs["organizations"].add_response("list_organizational_units_for_parent", {
+        "OrganizationalUnits": []}, {"ParentId": "ou-offline-first"})
+    stubs["organizations"].add_response("list_accounts", {"Accounts": [
+        {"Id": OWNER, "State": "ACTIVE"}, {"Id": CONSUMER, "State": "ACTIVE"}]}, {})
+    assert not discovery.inspect(OWNER, REGION).blocked
+    assert discovery.organization_principals == {SOURCE: [ou]}
+    direct = Discovery(OfflineRouter(cs), {CONSUMER}, MIGRATION, {}, {KIND.lower(): True})
+    stub_discovery(stubs)
+    assert not direct.inspect(OWNER, REGION).blocked
+    assert direct.organization_principals == {}
+
+
 @pytest.mark.parametrize("capabilities", [{}, {KIND.lower(): False}])
 def test_unsupported_or_unknown_external_type_blocks(clients, capabilities):
     cs, stubs = clients

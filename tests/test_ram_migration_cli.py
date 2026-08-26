@@ -32,6 +32,15 @@ HOME = "us-east-1"
 MIGRATION = "local-test"
 IPAM = "ec2:IpamPool"
 RESOLVER = "route53resolver:ResolverRule"
+# The local organization: every account directly under one root, with the AWS
+# managed FullAWSAccess SCP attached everywhere, RCPs not enabled and RAM sharing
+# with AWS Organizations enabled.
+MANAGER = "000000000090"
+ROOT = "r-local"
+FULL_ACCESS = "p-FullAWSAccess"
+FULL_ACCESS_DOCUMENT = {"Version": "2012-10-17",
+                        "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]}
+SCP = "SERVICE_CONTROL_POLICY"
 
 
 def denied(operation="GetResourceShares"):
@@ -159,7 +168,33 @@ class LocalClients:
         if org == "STANDALONE":
             raise ClientError({"Error": {"Code": "AWSOrganizationsNotInUseException",
                                          "Message": "not in an organization"}}, "DescribeOrganization")
-        return {"Organization": {"Id": org}}
+        return {"Organization": {"Id": org, "MasterAccountId": self.harness.org_manager,
+                                 "FeatureSet": self.harness.org_feature_set}}
+
+    # Organizations reads through the management account (the policy preflight).
+    def list_parents(self, ChildId, **_kwargs):
+        self.harness.org_read(self.account, "ListParents", ChildId)
+        identifier, kind = self.harness.org_parents.get(ChildId, (ROOT, "ROOT"))
+        return {"Parents": [{"Id": identifier, "Type": kind}]}
+
+    def list_policies_for_target(self, TargetId, Filter, **_kwargs):
+        self.harness.org_read(self.account, "ListPoliciesForTarget", TargetId, Filter)
+        identifiers = self.harness.org_attachments.get(
+            (TargetId, Filter), [FULL_ACCESS] if Filter == SCP else [])
+        return {"Policies": [{"Id": identifier, "Name": self.harness.org_policies[identifier][0],
+                              "Type": Filter, "AwsManaged": identifier == FULL_ACCESS}
+                             for identifier in identifiers]}
+
+    def describe_policy(self, PolicyId):
+        self.harness.org_read(self.account, "DescribePolicy", PolicyId)
+        name, document = self.harness.org_policies[PolicyId]
+        return {"Policy": {"PolicySummary": {"Id": PolicyId, "Name": name},
+                           "Content": json.dumps(document)}}
+
+    def list_aws_service_access_for_organization(self, **_kwargs):
+        self.harness.org_read(self.account, "ListAWSServiceAccessForOrganization", None)
+        return {"EnabledServicePrincipals": [{"ServicePrincipal": principal}
+                                             for principal in self.harness.org_services]}
 
     def list_resolver_rule_associations(self, **_kwargs):
         samples = self.harness.resolver_samples[self.account, self.region]
@@ -292,6 +327,15 @@ class Harness:
         self.deleted_shares = []
         self.deleted_stacks = []
         self.after_delete = None          # callback(harness, share_arn) run after a deletion
+        self.org_manager = MANAGER
+        self.org_feature_set = "ALL"
+        self.org_parents = {}             # child -> (parent ID, type); default: the root
+        self.org_attachments = {}         # (target, policy type) -> policy IDs; default above
+        self.org_policies = {FULL_ACCESS: ("FullAWSAccess", FULL_ACCESS_DOCUMENT)}
+        self.org_services = ["ram.amazonaws.com"]
+        self.org_errors = {}              # (operation, key) -> exception
+        self.org_after_confirmation = None  # callback(harness) run at the APPLY confirmation
+        self.organization_principals = {}  # discovery: original share -> OU/org principals
         harness = self
 
         class LocalRouter:
@@ -315,6 +359,7 @@ class Harness:
                 harness.calls.append(("discovery-inputs", consumers, overrides, capabilities))
                 harness.discovery_kwargs = kwargs
                 self.migration = migration
+                self.organization_principals = copy.deepcopy(harness.organization_principals)
 
             def inspect(self, owner, region):
                 harness.calls.append(("discovery", owner, region))
@@ -446,7 +491,15 @@ class Harness:
 
     def confirm(self, _prompt):
         self.calls.append(("confirmation",))
+        if self.org_after_confirmation:
+            self.org_after_confirmation(self)
         return f"APPLY {MIGRATION}"
+
+    def org_read(self, account, operation, *key):
+        self.calls.append(("org-read", account, operation, *key))
+        error = self.org_errors.get((operation, key[0] if key else None))
+        if error:
+            raise error
 
     def writes(self):
         return [call for call in self.calls if call[0] in ("write", "accept-write")]
@@ -3255,3 +3308,204 @@ def test_a_policy_created_share_is_its_own_blocker_category_with_the_promotion_s
     assert "promote-resource-share-created-from-policy" in line
     assert line.endswith("then re-run plan --record")
     assert read_record(migration_record)["plan"]["status"] == "BLOCKED"
+
+
+# Organization-policy preflight wiring (ram_migration_preflight; case 051/053/054)
+# ---------------------------------------------------------------------------
+GUARD = "p-coreguard1"
+BLOCK_EXTERNAL_CREATE = {
+    "Sid": "BlockExternalRAMCreate", "Effect": "Deny",
+    "Action": ["ram:CreateResourceShare", "ram:UpdateResourceShare"], "Resource": "*",
+    "Condition": {"Bool": {"ram:RequestedAllowsExternalPrincipals": "true"}}}
+WORK_OU = "ou-local-work0001"
+DESTINATION = f"arn:aws:organizations::{MANAGER}:ou/o-sourceorg01/{WORK_OU}"
+OU_PRINCIPAL = f"arn:aws:organizations::{MANAGER}:ou/o-sourceorg01/ou-local-apps0001"
+
+
+def guard(harness, *statements):
+    """A root SCP beside FullAWSAccess, as the Core root's guardrail policy is."""
+    harness.org_policies[GUARD] = ("Core guardrails", {
+        "Version": "2012-10-17", "Statement": list(statements or [BLOCK_EXTERNAL_CREATE])})
+    harness.org_attachments[ROOT, SCP] = [FULL_ACCESS, GUARD]
+
+
+def blocker_summary(output):
+    return [line for line in output.splitlines() if line.startswith("phase=blocker-summary")]
+
+
+def test_plan_records_the_organization_policy_preflight(harness, capsys, migration_record):
+    assert main(with_record(args(), migration_record)) == 0
+    output = capsys.readouterr().out
+    assert "phase=org-policy status=ALLOWED accounts=2 denies=0 gaps=0 unreadable=0" in output
+    assert f"phase=org-policy account={OWNER} roles=owner status=EVALUATED " \
+           f"organization=o-sourceorg01 path={ROOT}/{OWNER} scp=ENABLED rcp=NOT_ENABLED" in output
+    record = read_record(migration_record)
+    result = record["plan"]["organization_policy_preflight"]
+    assert (result["status"], result["destination_ou"], result["blockers"]) == ("ALLOWED", None, [])
+    assert [(a["account"], a["roles"]) for a in result["accounts"]] == [
+        (OWNER, ["owner"]), (CONSUMER, ["consumer"])]
+    assert len(result["organizations"]["o-sourceorg01"]["policies"][FULL_ACCESS]["sha256"]) == 64
+    # Read-only reads through the management account; the plan digest does not change.
+    reads = [call for call in harness.calls if call[0] == "org-read"]
+    assert reads and {call[1] for call in reads} == {MANAGER}
+    assert not any(call[0] == "client" and call[2] == "organizations" and call[4]
+                   for call in harness.calls)
+    assert record["plan"]["digest"] == record_module.plan_digest(harness.source[OWNER, REGION],
+                                                                 record["scope"])
+
+
+def test_a_denying_scp_blocks_plan_and_apply_before_confirmation(harness, capsys, migration_record):
+    guard(harness)
+    assert main(with_record(args(), migration_record)) == 1
+    output = capsys.readouterr().out
+    assert (f"phase=preflight status=BLOCKED phase=org-policy status=BLOCKED "
+            f"decision=EXPLICIT_DENY account={OWNER} role=owner organization=o-sourceorg01 "
+            f"regions={REGION} actions=ram:CreateResourceShare policy_type=SCP "
+            f"target={ROOT} policy={GUARD} policy_name=\"Core guardrails\" "
+            "sid=BlockExternalRAMCreate statement=1: ") in output
+    header, deny = blocker_summary(output)
+    assert header == "phase=blocker-summary status=BLOCKED blockers=1 categories=1"
+    assert deny.startswith("phase=blocker-summary category=organization-policy-deny blockers=1 "
+                           "accounts=1 policies=1 organizations=1 next_action=an SCP or RCP")
+    assert "obtain an approved exception" in deny and deny.endswith(
+        "then re-run plan --record; leaving the account out of this migration needs a new "
+        "reviewed plan")
+    record = read_record(migration_record)
+    assert record["plan"]["status"] == "BLOCKED"
+    assert record["plan"]["organization_policy_preflight"]["status"] == "BLOCKED"
+    assert record["plan"]["organization_policy_preflight"]["findings"][0]["sid"] == \
+        "BlockExternalRAMCreate"
+    assert main(with_record(args("apply"), migration_record),
+                input_fn=lambda _: pytest.fail("blocked before confirmation")) == 1
+    assert not harness.writes()
+
+
+def test_apply_rechecks_organization_policies_after_the_confirmation(
+        harness, capsys, migration_record):
+    """An SCP attached while the operator confirms blocks every write."""
+    assert quietly(with_record(args(), migration_record)) == 0
+    harness.calls.clear()
+    harness.org_after_confirmation = guard
+    assert main(with_record(args("apply"), migration_record), input_fn=harness.confirm) == 1
+    output = capsys.readouterr().out
+    assert not harness.writes() and not any(call[0] == "apply" for call in harness.calls)
+    assert ("phase=preflight status=BLOCKED post-confirmation phase=org-policy status=BLOCKED "
+            f"decision=EXPLICIT_DENY account={OWNER} role=owner") in output
+    assert (f"phase=org-policy status=POLICY_CHANGED organization=o-sourceorg01 policy={GUARD} "
+            "change=attached since the read before the confirmation; this run evaluated the "
+            "current policies") in output
+    reads = [call for call in harness.calls
+             if call[:4] == ("org-read", MANAGER, "DescribePolicy", FULL_ACCESS)]
+    assert len(reads) == 2  # before the confirmation, and fresh after it
+    deny, = [line for line in blocker_summary(output) if "category=" in line]
+    assert "category=organization-policy-deny" in deny
+    assert "then re-run apply with the same --record" in deny and "plan --record" not in deny
+    entry = read_record(migration_record)["history"][-1]
+    assert (entry["mode"], entry["status"], entry["phase"]) == (
+        "apply", "BLOCKED", "post-confirmation")
+
+
+@pytest.mark.parametrize("error,category", [
+    (denied("ListPoliciesForTarget"), "organization-policy-unreadable"),
+    (ClientError({"Error": {"Code": "ExpiredTokenException",
+                            "Message": "The security token included in the request is expired"},
+                  "ResponseMetadata": {"RequestId": "local-request-id"}}, "ListPoliciesForTarget"),
+     "authentication"),
+])
+def test_unreadable_organization_policies_are_named_blockers(harness, capsys, error, category):
+    harness.org_errors["ListPoliciesForTarget", ROOT] = error
+    assert main(args()) == 1
+    output = capsys.readouterr().out
+    code = error.response["Error"]["Code"]
+    for account, role in ((OWNER, "owner"), (CONSUMER, "consumer")):
+        assert (f"phase=org-policy status=BLOCKED decision=UNREADABLE account={account} "
+                f"roles={role} organization=o-sourceorg01 management_account={MANAGER}: "
+                f"operation=ListPoliciesForTarget {code}: ") in output
+    assert "phase=org-policy status=ALLOWED" not in output
+    unread, = [line for line in blocker_summary(output) if "category=" in line]
+    assert unread.startswith(f"phase=blocker-summary category={category} blockers=2 accounts=2 ")
+    if category == "organization-policy-unreadable":
+        assert "organizations=1 next_action=" in unread and "--account-map" in unread
+    # One failed read is not repeated for the second account.
+    assert len([call for call in harness.calls
+                if call[:4] == ("org-read", MANAGER, "ListPoliciesForTarget", ROOT)]) == 1
+
+
+def test_an_undecidable_statement_blocks_as_a_gap_listed_for_review(harness, capsys):
+    guard(harness, dict(BLOCK_EXTERNAL_CREATE, Condition={
+        **BLOCK_EXTERNAL_CREATE["Condition"],
+        "ArnNotLike": {"aws:PrincipalArn": "arn:aws:iam::*:role/RamMigration"}}))
+    assert main(args()) == 1
+    output = capsys.readouterr().out
+    assert "phase=org-policy status=GAP decision=UNDECIDED " in output
+    assert "(condition key aws:PrincipalArn is not evaluated)" in output
+    assert f"phase=org-policy status=REVIEW policy={GUARD} statement=1 text=" in output
+    gap, = [line for line in blocker_summary(output) if "category=" in line]
+    assert gap.startswith("phase=blocker-summary category=organization-policy-gap blockers=1 "
+                          "accounts=1 policies=1 organizations=1 next_action=")
+
+
+def test_destination_ou_is_validated_evaluated_recorded_and_must_match_at_apply(
+        harness, capsys, migration_record):
+    assert main(args() + ["--destination-ou", WORK_OU]) == 1
+    assert "status=BLOCKED --destination-ou must be an OU or root ARN" in capsys.readouterr().out
+    assert main(mode_args("verify", migration_record, "--destination-ou", DESTINATION)) == 1
+    assert "--destination-ou is supported only for plan and apply" in capsys.readouterr().out
+    harness.org_parents[WORK_OU] = (ROOT, "ROOT")
+    # The Work OU's allow-list omits route53resolver: the migrated consumer's reads fail there.
+    harness.org_policies["p-example0005"] = ("large_estate-work-deny-policy", {
+        "Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Resource": "*",
+            "Action": ["ec2:*", "ram:*", "acm-pca:*", "organizations:Describe*"]}]})
+    harness.org_attachments[WORK_OU, SCP] = ["p-example0005"]
+    assert main(with_record(args(), migration_record) + ["--destination-ou", DESTINATION]) == 1
+    output = capsys.readouterr().out
+    assert (f"decision=NO_ALLOW account={CONSUMER} role=destination organization=o-sourceorg01 "
+            f"regions={REGION} actions=route53resolver:") in output
+    assert f"target={WORK_OU} policies=p-example0005(\"large_estate-work-deny-policy\")" in output
+    assert "category=organization-policy-deny" in output
+    del harness.org_attachments[WORK_OU, SCP]
+    assert main(with_record(args(), migration_record) + ["--destination-ou", DESTINATION]) == 0
+    output = capsys.readouterr().out
+    assert f"phase=org-policy destination={DESTINATION} status=EVALUATED path={ROOT}/{WORK_OU}" \
+        in output
+    record = read_record(migration_record)
+    assert record["plan"]["organization_policy_preflight"]["destination_ou"] == DESTINATION
+    assert main(with_record(args("apply"), migration_record),
+                input_fn=lambda _: pytest.fail("blocked before confirmation")) == 1
+    output = capsys.readouterr().out
+    assert (f"phase=reviewed-record --destination-ou none differs from the destination "
+            f"{DESTINATION} that reviewed plan revision {record['revision']} evaluated") in output
+    assert "category=reviewed-record-mismatch" in output and not harness.writes()
+    assert main(with_record(args("apply"), migration_record) + ["--destination-ou", DESTINATION],
+                input_fn=harness.confirm) == 0
+    assert "status=SHARING_READY" in summary_line(capsys.readouterr().out)
+
+
+def test_ou_principal_shares_check_the_ram_organization_prerequisites(
+        harness, capsys, migration_record):
+    harness.organization_principals = {
+        ORIGINAL_SHARE: [OU_PRINCIPAL],
+        f"arn:aws:ram:{REGION}:{OWNER}:resource-share/not-planned": [OU_PRINCIPAL]}
+    harness.org_services = ["sso.amazonaws.com"]
+    assert main(with_record(args(), migration_record)) == 1
+    output = capsys.readouterr().out
+    assert ("phase=ram-org-prerequisites status=BLOCKED organization=o-sourceorg01 "
+            f"management_account={MANAGER} decision=NOT_MET prerequisite=ram-trusted-access "
+            "shares=1: ") in output
+    prerequisite, = [line for line in blocker_summary(output) if "category=" in line]
+    assert prerequisite.startswith("phase=blocker-summary category=ram-organization-prerequisites "
+                                   "blockers=1 organizations=1 next_action=")
+    assert "never enables them" in prerequisite
+    harness.org_services = ["ram.amazonaws.com"]
+    assert main(with_record(args(), migration_record)) == 0
+    entry, = read_record(migration_record)["plan"]["organization_policy_preflight"][
+        "ram_organization_prerequisites"]
+    assert (entry["organization"], entry["status"], entry["required_by"]) == (
+        "o-sourceorg01", "MET", [ORIGINAL_SHARE])
+
+
+def test_export_plan_includes_the_organization_policy_preflight(harness, tmp_path):
+    exported = tmp_path / "plan.json"
+    assert quietly(args() + ["--export-plan", str(exported)]) == 0
+    assert json.loads(exported.read_text())["organization_policy_preflight"]["status"] == "ALLOWED"

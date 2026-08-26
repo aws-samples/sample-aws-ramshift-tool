@@ -878,6 +878,11 @@ class Discovery:
         # the version it was created with, so a source share joining it is compared
         # with that version, not with the current default.
         self.deployed = copy.deepcopy(deployed or {})
+        # Original share ARN -> its OU and organization principals, configured or
+        # associated: where these shares rely on RAM sharing with AWS Organizations,
+        # whose prerequisites ram_migration_preflight checks.
+        self.organization_principals: dict[str, list[str]] = {}
+        self._principals_lock = threading.Lock()
 
     def _org(self, owner: str):
         member = self.router.client(owner, "organizations", "us-east-1")
@@ -1134,6 +1139,11 @@ class Discovery:
                                              parameters, template, pseudo))
             original = sorted(set(configured + live))
             validate_principal_scopes(sorted(set(configured + observed)), ram.meta.partition)
+            organizational = sorted({p for p in configured + observed
+                                     if ":ou/" in p or ":organization/" in p})
+            if organizational:
+                with self._principals_lock:
+                    self.organization_principals[arn] = organizational
             scope_evidence = configured or observed
             service_only = bool(scope_evidence) and all(
                 SERVICE_PRINCIPAL.fullmatch(p) for p in scope_evidence)
