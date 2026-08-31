@@ -118,7 +118,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--owners", "--accounts", dest="owners", nargs="+", action="append",
                         default=[], help="explicit owner/inspection account IDs; spaces or commas")
     parser.add_argument("--consumers", nargs="+", action="append", default=[],
-                        help="explicit migrating consumer account IDs; spaces or commas")
+                        help="plan/apply: explicit migrating consumer account IDs; monitor/"
+                             "complete: the migrating accounts of the record to act on; spaces "
+                             "or commas")
+    parser.add_argument("--all-accounts", action="store_true",
+                        help="monitor/complete: act on every migrating account in the migration "
+                             "record instead of the accounts named with --consumers")
+    parser.add_argument("--force", action="store_true",
+                        help="complete: retire the temporary access even when its safety checks "
+                             "(baseline coverage, intact original state, recorded failure drops, "
+                             "replacement access) fail. Each overridden check is reported and "
+                             "recorded, the confirmation is FORCE-COMPLETE <migration-id>, and "
+                             "identity and ownership checks are never overridden")
     parser.add_argument("--regions", nargs="+", action="append", default=[],
                         help="Regions to inspect; RAM global home us-east-1 is always included")
     parser.add_argument("--scan-enabled-regions", "--discover-regions", action="store_true",
@@ -219,9 +230,14 @@ class Options:
     detected_owners: list[str] = field(default_factory=list)
     # The reviewed plan revision and digest an apply consumed at its write gate.
     applied_plan: dict = field(default_factory=dict)
+    # monitor/complete: the migrating accounts named with --consumers; None with
+    # --all-accounts. selected_consumers() checks them against the record.
+    selected: list[str] | None = None
 
 
 MIGRATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+# Modes that act on migrating accounts chosen with --consumers or --all-accounts.
+SELECTING_MODES = ("complete",)
 MAX_REASON = 500
 
 
@@ -320,6 +336,18 @@ def options(args: argparse.Namespace, ask: Callable[[str], str]) -> Options:
     regions = split_values(args.regions)
     if any(not REGION.fullmatch(region) for region in regions):
         raise MigrationError("Regions must be AWS Region names")
+    if args.force and args.mode != "complete":
+        raise MigrationError("--force is supported only for complete")
+    if args.all_accounts and args.mode not in ("monitor", "complete"):
+        raise MigrationError("--all-accounts is supported only for monitor and complete")
+    selected = None
+    if args.mode in SELECTING_MODES:
+        if bool(consumers) == bool(args.all_accounts):
+            raise MigrationError(f"{args.mode} acts on chosen migrating accounts: supply --consumers "
+                                 "<account IDs>, or --all-accounts for every migrating account in "
+                                 "the migration record")
+        # The record supplies the scope; --consumers only selects within it.
+        selected, consumers = (None if args.all_accounts else consumers), []
     if args.mode != "monitor":
         if not args.migration_id or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}",
                                                     args.migration_id):
@@ -395,7 +423,7 @@ def options(args: argparse.Namespace, ask: Callable[[str], str]) -> Options:
     return Options(args, owners, consumers, sorted(set(regions) | {RAM_HOME_REGION}),
                    profiles, mappings, principals, capabilities,
                    json_object(args.monitor_config, "monitor-config"),
-                   excluded_regions=excluded, exclusion_reason=reason)
+                   excluded_regions=excluded, exclusion_reason=reason, selected=selected)
 
 
 class WriteGate:
@@ -1327,6 +1355,20 @@ def fill_scope_from_record(opts: Options, record: dict) -> dict[str, set[str]]:
     for row in [*record.get("shares", []), *(record.get("plan") or {}).get("groups", [])]:
         located[row["owner"]].add(row["region"])
     return dict(located)
+
+
+def selected_consumers(opts: Options, record: dict) -> list[str]:
+    """The migrating accounts monitor/complete act on, after fill_scope_from_record: the
+    accounts named with --consumers, each a migrating account of the record, or with
+    --all-accounts every one of them."""
+    population = sorted(set(opts.consumers))
+    if opts.selected is None:
+        return population
+    unknown = sorted(set(opts.selected) - set(population))
+    if unknown:
+        raise MigrationError(f"--consumers {','.join(unknown)}: not a migrating account of this "
+                             f"migration record; its migrating accounts are {','.join(population)}")
+    return sorted(set(opts.selected))
 
 
 def transient(exc: Exception, verification: bool = False) -> bool:
@@ -2656,6 +2698,7 @@ def run_complete(router: Router, opts: Options, ask: Callable[[str], str], repor
                     f"at={record['completion'].get('completed_at')}")
         return 0
     fill_scope_from_record(opts, record)
+    chosen = selected_consumers(opts, record)  # noqa: F841 - per-account completion follows
 
     def note(status: str, mutate: Callable[[dict], Any] = lambda _record: None,
              **details: Any) -> None:

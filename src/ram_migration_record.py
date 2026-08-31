@@ -113,6 +113,8 @@ def new_record(migration: str) -> dict:
         "shares": [],
         "verifications": [],
         "drops": [],
+        # complete's per-consumer retirement of temporary access; see retired_consumers.
+        "retirements": [],
         "completion": None,
         # Set only when a schema /1 record is upgraded; see _write.
         "legacy_history": None,
@@ -147,6 +149,21 @@ def add_drops(record: dict, drops: list[dict]) -> int:
             known.add(drop["id"])
             added += 1
     return added
+
+
+def retired_consumers(record: dict) -> set[str]:
+    """Migrating consumers whose temporary access complete has retired from every recorded
+    temporary share that served them. ``retirements`` holds one entry per (share,
+    consumer): {consumer, owner, region, logical_id, share_arn, action, at, forced}, where
+    action is PRINCIPAL_REMOVED (the share still serves other consumers) or SHARE_DELETED."""
+    done = {(row.get("share_arn"), row.get("consumer")) for row in record.get("retirements") or []}
+    serving: dict[str, set[str]] = {}
+    for share in record.get("shares", []):
+        if share.get("share_arn"):
+            for consumer in share.get("consumers", []):
+                serving.setdefault(consumer, set()).add(share["share_arn"])
+    return {consumer for consumer, arns in serving.items()
+            if all((arn, consumer) in done for arn in arns)}
 
 
 def failure_drops(record: dict) -> list[dict]:

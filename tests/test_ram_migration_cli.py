@@ -1800,9 +1800,11 @@ def entitlement_key(arn, consumer=CONSUMER, region=REGION):
 
 
 def mode_args(mode, path, *extra):
-    """verify/complete take owners, consumers and Regions from the record."""
+    """verify/complete take owners, consumers and Regions from the record; complete acts
+    on every migrating account unless a test names some."""
+    selection = ["--all-accounts"] if mode == "complete" and "--consumers" not in extra else []
     return [mode, "--migration-id", MIGRATION, "--profile", "explicit-source",
-            "--retry-limit", "2", "--record", str(path), *extra]
+            "--retry-limit", "2", "--record", str(path), *selection, *extra]
 
 
 def complete_args(path, *extra):
@@ -2509,9 +2511,7 @@ def test_complete_refuses_a_consumer_the_baseline_never_covered(harness, capsys,
             f"consumer {OTHER_CONSUMER} is not covered by the original baseline")
 
 
-@pytest.mark.parametrize("option,value", [
-    ("--owners", OTHER_OWNER), ("--consumers", OTHER_CONSUMER), ("--regions", "eu-west-1"),
-])
+@pytest.mark.parametrize("option,value", [("--owners", OTHER_OWNER), ("--regions", "eu-west-1")])
 def test_complete_refuses_explicit_scope_that_disagrees_with_the_record(
         harness, capsys, migration_record, option, value):
     record = applied(harness, migration_record)
@@ -2519,6 +2519,18 @@ def test_complete_refuses_explicit_scope_that_disagrees_with_the_record(
     assert main(complete_args(migration_record, option, value),
                 input_fn=lambda _: pytest.fail("must not confirm")) == 1
     assert f"{option} differs from the migration record scope" in capsys.readouterr().out
+    assert [call[0] for call in harness.calls] == ["router"]
+    assert read_record(migration_record)["revision"] == record["revision"]
+
+
+def test_complete_refuses_a_selected_account_outside_the_record(harness, capsys, migration_record):
+    record = applied(harness, migration_record)
+    capsys.readouterr()
+    assert main(mode_args("complete", migration_record, "--settle-seconds", "0",
+                          "--consumers", OTHER_CONSUMER),
+                input_fn=lambda _: pytest.fail("must not confirm")) == 1
+    assert f"--consumers {OTHER_CONSUMER}: not a migrating account of this migration record" \
+        in capsys.readouterr().out
     assert [call[0] for call in harness.calls] == ["router"]
     assert read_record(migration_record)["revision"] == record["revision"]
 
@@ -3509,3 +3521,30 @@ def test_export_plan_includes_the_organization_policy_preflight(harness, tmp_pat
     exported = tmp_path / "plan.json"
     assert quietly(args() + ["--export-plan", str(exported)]) == 0
     assert json.loads(exported.read_text())["organization_policy_preflight"]["status"] == "ALLOWED"
+
+
+@pytest.mark.parametrize("argv, message", [
+    (["complete"], "complete acts on chosen migrating accounts: supply --consumers"),
+    (["complete", "--all-accounts", "--consumers", CONSUMER],
+     "complete acts on chosen migrating accounts: supply --consumers"),
+    (["verify", "--force"], "--force is supported only for complete"),
+    (["verify", "--all-accounts"], "--all-accounts is supported only for monitor and complete"),
+])
+def test_account_selection_options(harness, capsys, tmp_path, argv, message):
+    record = tmp_path / "record.json"
+    assert main([*argv, "--migration-id", MIGRATION, "--profile", "explicit-source",
+                 "--record", str(record)]) == 1
+    assert message in capsys.readouterr().out
+    assert not harness.calls
+
+
+def test_selected_consumers_must_be_migrating_accounts_of_the_record(tmp_path):
+    args = cli.build_parser().parse_args(["complete", "--consumers", CONSUMER])
+    opts = cli.Options(args, [], [CONSUMER, "444455556666"], [], [], {}, {}, None, {},
+                       selected=[CONSUMER])
+    assert cli.selected_consumers(opts, {}) == [CONSUMER]
+    opts.selected = None
+    assert cli.selected_consumers(opts, {}) == sorted([CONSUMER, "444455556666"])
+    opts.selected = ["999988887777"]
+    with pytest.raises(MigrationError, match="999988887777: not a migrating account"):
+        cli.selected_consumers(opts, {})

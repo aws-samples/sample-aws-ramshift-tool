@@ -753,3 +753,16 @@ def test_approval_rejects_request_from_another_migration():
     request, = rec.permission_requests("other-migration", [change(SHARE_1)])
     with pytest.raises(MigrationError, match="another migration"):
         rec.approve_permission_change(record, request)
+
+
+def test_retired_consumers_need_every_serving_share_retired():
+    record = {"shares": [
+        {"share_arn": "arn:a", "consumers": ["111111111111", "222222222222"]},
+        {"share_arn": "arn:b", "consumers": ["111111111111"]},
+        {"logical_id": "unproven", "consumers": ["333333333333"]}],
+        "retirements": [{"share_arn": "arn:a", "consumer": "111111111111"},
+                        {"share_arn": "arn:a", "consumer": "222222222222"}]}
+    assert rec.retired_consumers(record) == {"222222222222"}
+    record["retirements"].append({"share_arn": "arn:b", "consumer": "111111111111"})
+    assert rec.retired_consumers(record) == {"111111111111", "222222222222"}
+    assert rec.retired_consumers({}) == set()
