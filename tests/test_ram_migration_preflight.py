@@ -36,7 +36,7 @@ BLOCK_EXTERNAL_ACCEPT = {
     "Sid": "BlockExternalRAMAccept", "Effect": "Deny",
     "Action": "ram:AcceptResourceShareInvitation", "Resource": "*",
     "Condition": {"StringNotEquals": {"aws:ResourceOrgID": [CORE, MNA]}}}
-RESOLVER_READS = ["route53resolver:GetResolverEndpoint", "route53resolver:GetResolverRule",
+RESOLVER_READS = ["route53resolver:GetResolverEndpoint",
                   "route53resolver:ListResolverEndpointIpAddresses",
                   "route53resolver:ListResolverRuleAssociations",
                   "route53resolver:ListResolverRules"]

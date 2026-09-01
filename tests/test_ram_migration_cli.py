@@ -207,6 +207,17 @@ class FakeVerification:
     def __init__(self, harness):
         self.harness = harness
 
+    def origin(self, g, consumer, arn):
+        """The planned or deployed group granting this consumer this resource; an
+        observation group, such as the monitor's baseline groups, need not be one."""
+        h = self.harness
+        key = g.owner, g.region
+        for candidate in [g, *getattr(h, "stored", {}).get(key, []),
+                          *getattr(h, "source", {}).get(key, [])]:
+            if candidate.permissions and consumer in candidate.consumers and arn in candidate.resources:
+                return candidate
+        return g
+
     def items(self, groups, temporary, pop=True):
         h = self.harness
         items = []
@@ -219,10 +230,11 @@ class FakeVerification:
                     samples[key] = (queue.pop(0) if pop and len(queue) > 1 else queue[0])
                 for arn, kind in sorted(g.resources.items()):
                     site = (consumer, g.region, arn)
-                    other = [] if site in h.original_lost else sorted(set(g.source_shares))
+                    granted = self.origin(g, consumer, arn)
+                    other = [] if site in h.original_lost else sorted(set(granted.source_shares))
                     if site in h.replacement:
                         other = sorted(set(other) | {f"arn:aws:ram:{g.region}:{g.owner}:resource-share/permanent"})
-                    temp = Harness.share(g)["resourceShareArn"]
+                    temp = Harness.share(granted)["resourceShareArn"]
                     via_temp = [temp] if temp in temporary and temp not in h.deleted_shares else []
                     items.append({"kind": "entitlement", "key": f"entitlement|{consumer}|{g.region}|{arn}",
                                   "consumer": consumer, "owner": g.owner, "region": g.region,
@@ -269,7 +281,8 @@ class FakeVerification:
         gaps = list(observation.gaps)
         status = "LOSS" if missing or degraded else ("INCONCLUSIVE" if gaps else "INTACT")
         return SimpleNamespace(present=present, missing=missing, degraded=degraded,
-                               added=[k for k in current if k not in keys], gaps=gaps, status=status)
+                               added=[k for k in current if k not in keys], gaps=gaps,
+                               unobserved=[], status=status)
 
     def replacement_access(self, router, groups, temporary_shares, *, workers=4):
         covered, uncovered = [], []
@@ -1474,40 +1487,6 @@ def test_discovery_may_not_broaden_requested_consumer_population(harness, capsys
     assert not harness.writes()
 
 
-@pytest.mark.parametrize("return_code", [0, 1, 2])
-def test_monitor_delegates_config_and_exit_code_without_share_work(harness, monkeypatch, return_code):
-    config = {"scope": {"consumer": CONSUMER}, "evidence_directory": "local-evidence"}
-    calls = []
-    def monitor(router, received):
-        calls.append((router, received))
-        return return_code
-    monkeypatch.setitem(sys.modules, "ram_migration_monitor", SimpleNamespace(monitor=monitor))
-    assert main(["monitor", "--profile", "explicit-source",
-                     "--monitor-config", json.dumps(config)]) == return_code
-    assert calls == [(harness.router, config)]
-    assert [call[0] for call in harness.calls] == ["router"]
-
-
-def test_monitor_receives_the_record_and_migration_id(harness, monkeypatch, tmp_path):
-    received = []
-    monkeypatch.setitem(sys.modules, "ram_migration_monitor",
-                        SimpleNamespace(monitor=lambda router, config: received.append(config) or 0))
-    record = tmp_path / "record.json"
-    base = ["monitor", "--profile", "explicit-source", "--record", str(record),
-            "--migration-id", MIGRATION]
-    assert main(base + ["--monitor-config", json.dumps({"evidence_directory": "e"})]) == 0
-    assert received[-1] == {"evidence_directory": "e", "record": str(record), "migration_id": MIGRATION}
-    clash = json.dumps({"evidence_directory": "e", "record": str(tmp_path / "other.json")})
-    assert main(base + ["--monitor-config", clash]) == 1
-    assert len(received) == 1
-
-
-def test_monitor_missing_configuration_fails_before_authentication(harness, capsys):
-    assert main(["monitor", "--profile", "explicit-source"]) == 1
-    assert "monitor requires --monitor-config" in capsys.readouterr().out
-    assert not harness.calls
-
-
 @pytest.mark.parametrize("mode", ["verify", "monitor"])
 def test_plan_export_is_rejected_for_other_modes(harness, tmp_path, mode):
     assert main(args(mode) + ["--export-plan", str(tmp_path / "unused.json")]) == 1
@@ -1800,9 +1779,9 @@ def entitlement_key(arn, consumer=CONSUMER, region=REGION):
 
 
 def mode_args(mode, path, *extra):
-    """verify/complete take owners, consumers and Regions from the record; complete acts
-    on every migrating account unless a test names some."""
-    selection = ["--all-accounts"] if mode == "complete" and "--consumers" not in extra else []
+    """verify/monitor/complete take owners, consumers and Regions from the record; monitor
+    and complete act on every migrating account unless a test names some."""
+    selection = ["--all-accounts"] if mode in ("monitor", "complete") and "--consumers" not in extra else []
     return [mode, "--migration-id", MIGRATION, "--profile", "explicit-source",
             "--retry-limit", "2", "--record", str(path), *selection, *extra]
 
@@ -1960,7 +1939,9 @@ def test_verify_baseline_loss_fails_and_records_a_verify_drop(
     assert "status=FAILED" in summary_line(output)
     assert f"migration_status=FAILED {reason}: {subject}" in output
     after = read_record(migration_record)
-    drop, = after["drops"]
+    drop, = record_module.failure_drops(after)
+    # A lost original share is recorded too, as an informational drop.
+    assert {d["kind"] for d in after["drops"] if d["severity"] == "informational"} <= {"original_share"}
     assert (drop["kind"], drop["severity"], drop["detected_by"], drop["subject"]) == (
         kind, "failure", "verify", subject)
     assert (drop["consumer"], drop["owner"], drop["region"]) == (CONSUMER, OWNER, REGION)
@@ -3087,7 +3068,8 @@ def test_region_exclusions_need_a_reason_and_are_refused_before_authentication(
 def test_region_exclusions_are_refused_where_nothing_is_inspected(harness, capsys,
                                                                  migration_record, mode):
     argv = ["approve", "--record", str(migration_record)] if mode == "approve" else [
-        "monitor", "--profile", "explicit-source", "--monitor-config", "{}"]
+        "monitor", "--profile", "explicit-source", "--record", str(migration_record),
+        "--migration-id", MIGRATION, "--all-accounts"]
     assert main(argv + EXCLUSION) == 1
     assert "supported only for plan, apply, verify and complete" in capsys.readouterr().out
     assert not harness.calls
@@ -3525,6 +3507,7 @@ def test_export_plan_includes_the_organization_policy_preflight(harness, tmp_pat
 
 @pytest.mark.parametrize("argv, message", [
     (["complete"], "complete acts on chosen migrating accounts: supply --consumers"),
+    (["monitor"], "monitor acts on chosen migrating accounts: supply --consumers"),
     (["complete", "--all-accounts", "--consumers", CONSUMER],
      "complete acts on chosen migrating accounts: supply --consumers"),
     (["verify", "--force"], "--force is supported only for complete"),
@@ -3540,7 +3523,7 @@ def test_account_selection_options(harness, capsys, tmp_path, argv, message):
 
 def test_selected_consumers_must_be_migrating_accounts_of_the_record(tmp_path):
     args = cli.build_parser().parse_args(["complete", "--consumers", CONSUMER])
-    opts = cli.Options(args, [], [CONSUMER, "444455556666"], [], [], {}, {}, None, {},
+    opts = cli.Options(args, [], [CONSUMER, "444455556666"], [], [], {}, {}, None,
                        selected=[CONSUMER])
     assert cli.selected_consumers(opts, {}) == [CONSUMER]
     opts.selected = None
@@ -3548,3 +3531,106 @@ def test_selected_consumers_must_be_migrating_accounts_of_the_record(tmp_path):
     opts.selected = ["999988887777"]
     with pytest.raises(MigrationError, match="999988887777: not a migrating account"):
         cli.selected_consumers(opts, {})
+
+
+# ---------------------------------------------------------------------------
+# monitor: an on-demand report of what changed since the pre-migration baseline
+# ---------------------------------------------------------------------------
+
+def monitor_run(path, *extra, code=0):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert main(mode_args("monitor", path, *extra)) == code
+    return out.getvalue()
+
+
+def test_monitor_right_after_apply_reports_no_change_and_writes_nothing(harness, migration_record):
+    applied(harness, migration_record)
+    output = monitor_run(migration_record)
+    assert f"status=UNCHANGED migration={MIGRATION} phase=monitor consumers={CONSUMER}" in output
+    assert "exit_code=0" in output and not harness.writes()
+    record = read_record(migration_record)
+    last = record["verifications"][-1]
+    assert (last["mode"], last["monitor_status"], last["consumers"]) == ("monitor", "UNCHANGED", [CONSUMER])
+    assert (record["history"][-1]["mode"], record["history"][-1]["status"]) == ("monitor", "UNCHANGED")
+
+
+def test_monitor_records_an_original_share_drop_once(harness, migration_record):
+    record = applied(harness, migration_record)
+    original = f"arn:aws:ram:{REGION}:{OWNER}:resource-share/original"
+    harness.original_lost.add((CONSUMER, REGION, POOL))  # the temporary share still grants it
+    output = monitor_run(migration_record)
+    assert (f"consumer={CONSUMER} region={REGION} owner={OWNER} resource={POOL} phase=monitor "
+            f"change=ORIGINAL_SHARE_DROPPED share={original} access=TEMPORARY_ONLY") in output
+    assert "status=CHANGED" in output and "original_share_drops=1" in output
+    assert "recorded_drops=1" in output
+    drops = read_record(migration_record)["drops"]
+    assert [(d["kind"], d["severity"], d["subject"], d["resources"], d["detected_by"])
+            for d in drops] == [("original_share", "informational", original, [POOL], "monitor")]
+    again = monitor_run(migration_record)
+    assert "recorded_drops=0" in again and len(read_record(migration_record)["drops"]) == 1
+    assert record["shares"][0]["share_arn"] not in {d["subject"] for d in drops}
+
+
+def test_monitor_reports_a_loss_with_exit_1_and_a_failure_drop(harness, migration_record):
+    record = applied(harness, migration_record)
+    harness.original_lost.add((CONSUMER, REGION, POOL))
+    harness.deleted_shares.append(record["shares"][0]["share_arn"])  # nothing grants it now
+    output = monitor_run(migration_record, code=1)
+    assert f"phase=monitor change=DEGRADED key={entitlement_key(POOL)}" in output
+    assert "status=LOSS" in output and "degraded=1" in output and "exit_code=1" in output
+    failures = record_module.failure_drops(read_record(migration_record))
+    assert [(d["kind"], d["subject"], d["detected_by"]) for d in failures] == [
+        ("entitlement", entitlement_key(POOL), "monitor")]
+
+
+def test_monitor_reports_the_consumer_organization_change(harness, migration_record):
+    applied(harness, migration_record)
+    harness.organizations[CONSUMER] = "o-destination1"
+    output = monitor_run(migration_record)
+    assert (f"consumer={CONSUMER} phase=monitor organization_at_baseline=o-sourceorg01 "
+            "organization_now=o-destination1 organization_change=CHANGED") in output
+    assert "status=CHANGED" in output
+    assert read_record(migration_record)["verifications"][-1]["consumer_organizations"] == {
+        CONSUMER: "o-destination1"}
+
+
+def test_monitor_without_a_baseline_is_inconclusive_before_any_aws_read(harness, migration_record):
+    assert quietly(with_record(args(), migration_record)) == 0
+    harness.calls.clear()
+    output = monitor_run(migration_record, code=3)
+    assert "status=INCONCLUSIVE" in output and "no original baseline is recorded" in output
+    assert [call[0] for call in harness.calls] == ["router"]
+    assert read_record(migration_record)["verifications"][-1]["monitor_status"] == "INCONCLUSIVE"
+
+
+def test_monitor_observes_only_the_chosen_accounts(harness, migration_record):
+    harness.source[OWNER, REGION].append(group(consumer=OTHER_CONSUMER))
+    applied(harness, migration_record, args(consumers=f"{CONSUMER},{OTHER_CONSUMER}"))
+    harness.original_lost.add((OTHER_CONSUMER, REGION, POOL))
+    output = monitor_run(migration_record, "--consumers", CONSUMER)
+    assert "status=UNCHANGED" in output and OTHER_CONSUMER not in output
+    collected = [call for call in harness.calls if call[0] == "collect"]
+    assert [call[1] for call in collected] == [1]
+    everyone = monitor_run(migration_record)
+    assert f"consumer={OTHER_CONSUMER} region={REGION} owner={OWNER} resource={POOL}" in everyone
+    assert f"consumers={CONSUMER},{OTHER_CONSUMER}" in everyone
+
+
+def test_monitor_refuses_an_account_outside_the_record(harness, migration_record):
+    applied(harness, migration_record)
+    output = monitor_run(migration_record, "--consumers", "999988887777", code=1)
+    assert "--consumers 999988887777: not a migrating account of this migration record" in output
+    assert [call[0] for call in harness.calls] == ["router"]
+
+
+def test_verify_records_original_share_drops_as_informational(harness, migration_record):
+    applied(harness, migration_record)
+    harness.original_lost.add((CONSUMER, REGION, POOL))
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert main(mode_args("verify", migration_record)) == 0
+    assert "phase=verification change=ORIGINAL_SHARE_DROPPED" in out.getvalue()
+    record = read_record(migration_record)
+    assert [(d["kind"], d["severity"]) for d in record["drops"]] == [("original_share", "informational")]
+    assert record["verifications"][-1]["migration_status"] == "PENDING_MIGRATION"

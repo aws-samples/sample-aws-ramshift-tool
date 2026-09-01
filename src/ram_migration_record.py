@@ -40,7 +40,7 @@ LEGACY_SCHEMA = "ram-migration-record/1"
 SOURCES = (
     "temporary_migration_ram_shares.py", "ram_migration_common.py",
     "ram_migration_discovery.py", "ram_migration_stacks.py",
-    "ram_migration_monitor.py", "ram_migration_record.py",
+    "ram_migration_record.py",
     "ram_migration_verification.py", "ram_migration_preflight.py",
 )
 # Plan revisions whose scope apply may consume.
@@ -133,8 +133,11 @@ def drop_id(kind: str, consumer: str | None, region: str | None, subject: str,
 
 
 def add_drops(record: dict, drops: list[dict]) -> int:
-    """Append drop events once each; failure drops are permanent evidence."""
+    """Append each drop once; failure drops are permanent evidence. A drop of the same
+    kind, consumer, Region and subject as a recorded one keeps the first detection, so
+    repeated verify and monitor runs never duplicate it."""
     known = {d["id"] for d in record.setdefault("drops", [])}
+    known |= {_drop_identity(d) for d in record["drops"]}
     added = 0
     for drop in drops:
         if drop.get("kind") not in DROP_KINDS or drop.get("severity") not in (
@@ -144,11 +147,15 @@ def add_drops(record: dict, drops: list[dict]) -> int:
             raise MigrationError("Original-share drops are informational")
         if drop["kind"] != "original_share" and drop["severity"] != "failure":
             raise MigrationError("Association and resource drops are failures")
-        if drop["id"] not in known:
+        if drop["id"] not in known and _drop_identity(drop) not in known:
             record["drops"].append(dict(drop))
-            known.add(drop["id"])
+            known |= {drop["id"], _drop_identity(drop)}
             added += 1
     return added
+
+
+def _drop_identity(drop: dict) -> tuple:
+    return (drop.get("kind"), drop.get("consumer"), drop.get("region"), drop.get("subject"))
 
 
 def retired_consumers(record: dict) -> set[str]:

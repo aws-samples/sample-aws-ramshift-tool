@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import importlib
 import json
 import os
 import random
@@ -47,7 +46,8 @@ from ram_migration_discovery import (
 from ram_migration_record import (
     APPLICABLE, CHANGE_FIELDS, add_drops, approval_for, approve_owner_scope,
     approve_permission_change, approved_owners, drop_id, failure_drops, latest, new_record,
-    owner_scope_request, pending_requests, permission_requests, plan_digest, tool_identity,
+    owner_scope_request, pending_requests, permission_requests, plan_digest, retired_consumers,
+    tool_identity,
 )
 from ram_migration_preflight import (
     destination_target, organization_preflight, policy_changes, recorded_destination,
@@ -114,7 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--migration-id", help="stable identifier for this migration")
     parser.add_argument("--record", type=Path,
                         help="versioned migration record: written by plan and approve, "
-                             "required by apply and verify")
+                             "required by apply, verify, monitor and complete")
     parser.add_argument("--owners", "--accounts", dest="owners", nargs="+", action="append",
                         default=[], help="explicit owner/inspection account IDs; spaces or commas")
     parser.add_argument("--consumers", nargs="+", action="append", default=[],
@@ -178,7 +178,6 @@ def build_parser() -> argparse.ArgumentParser:
                              "deletion before deleting the next one")
     parser.add_argument("--export-plan", type=Path,
                         help="optional local JSON plan export (plan/apply only)")
-    parser.add_argument("--monitor-config", help="JSON object/file passed to ram_migration_monitor.monitor")
     parser.add_argument("--interactive", action="store_true",
                         help="prompt for missing inputs even when stdin is not a terminal")
     return parser
@@ -218,7 +217,6 @@ class Options:
     mappings: dict[str, str]
     principals: dict[str, list[str]]
     capabilities: dict[str, bool] | None
-    monitor_config: dict
     known_enabled_regions: dict[str, set[str]] = field(default_factory=dict)
     # Set by apply when its write gate opens: reads back, through a closed gate, the
     # temporary shares the run created and returns the record update for them.
@@ -237,7 +235,7 @@ class Options:
 
 MIGRATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 # Modes that act on migrating accounts chosen with --consumers or --all-accounts.
-SELECTING_MODES = ("complete",)
+SELECTING_MODES = ("monitor", "complete")
 MAX_REASON = 500
 
 
@@ -313,12 +311,12 @@ def options(args: argparse.Namespace, ask: Callable[[str], str]) -> Options:
             raise MigrationError("Supply a valid --migration-id or omit it to use the record's")
         excluded_regions(args, [])
         return Options(args, [], [], [], [], {}, {}, None, {})
-    if args.mode in ("apply", "verify", "complete") and not args.record:
+    if args.mode in ("apply", "verify", "monitor", "complete") and not args.record:
         raise MigrationError(f"{args.mode} requires --record: the reviewed migration record "
                              "written by plan")
-    from_record = args.mode in ("verify", "complete")
+    from_record = args.mode in ("verify", "monitor", "complete")
     interactive = args.interactive or sys.stdin.isatty()
-    if args.mode != "monitor" and interactive:
+    if interactive:
         if not args.migration_id:
             args.migration_id = ask("Migration identifier: ").strip()
         if not args.owners and not from_record:
@@ -348,26 +346,20 @@ def options(args: argparse.Namespace, ask: Callable[[str], str]) -> Options:
                                  "the migration record")
         # The record supplies the scope; --consumers only selects within it.
         selected, consumers = (None if args.all_accounts else consumers), []
-    if args.mode != "monitor":
-        if not args.migration_id or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}",
-                                                    args.migration_id):
-            raise MigrationError("Supply --migration-id (1-128 letters, digits, dots, underscores or hyphens)")
-        if not owners and not from_record:
-            raise MigrationError("Supply explicit --owners/--accounts")
-        if args.mode in ("plan", "apply") and not consumers:
-            raise MigrationError("Supply explicit --consumers")
-        if not regions and not args.scan_enabled_regions and not from_record:
-            raise MigrationError("Supply --regions or --scan-enabled-regions")
+    if not args.migration_id or not MIGRATION_ID.fullmatch(args.migration_id):
+        raise MigrationError("Supply --migration-id (1-128 letters, digits, dots, underscores or hyphens)")
+    if not owners and not from_record:
+        raise MigrationError("Supply explicit --owners/--accounts")
+    if args.mode in ("plan", "apply") and not consumers:
+        raise MigrationError("Supply explicit --consumers")
+    if not regions and not args.scan_enabled_regions and not from_record:
+        raise MigrationError("Supply --regions or --scan-enabled-regions")
     if args.export_plan and args.mode not in ("plan", "apply"):
         raise MigrationError("--export-plan is supported only for plan/apply")
     if args.export_plan and args.record and aliases_record(args.export_plan, args.record):
         raise MigrationError(f"--export-plan {args.export_plan} would overwrite the migration record "
                              f"{args.record} or its lock or temporary file; choose another path")
     excluded, reason = excluded_regions(args, regions)
-    if args.monitor_config and args.mode != "monitor":
-        raise MigrationError("--monitor-config requires monitor mode")
-    if args.mode == "monitor" and not args.monitor_config:
-        raise MigrationError("monitor requires --monitor-config JSON or a JSON file")
 
     mappings: dict[str, str] = {}
     for label in ("account_map", "profile_map", "role_map"):
@@ -422,7 +414,6 @@ def options(args: argparse.Namespace, ask: Callable[[str], str]) -> Options:
         capabilities = {key.lower(): value for key, value in capabilities.items()}
     return Options(args, owners, consumers, sorted(set(regions) | {RAM_HOME_REGION}),
                    profiles, mappings, principals, capabilities,
-                   json_object(args.monitor_config, "monitor-config"),
                    excluded_regions=excluded, exclusion_reason=reason, selected=selected)
 
 
@@ -1278,6 +1269,49 @@ def drops_from(comparison: Any, observation: Any, organizations: dict, detected_
                       "consumer_organization_at_detection": organizations.get(consumer, "UNKNOWN"),
                       "evidence": evidence, "reason": loss["reason"]})
     return drops
+
+
+def share_changes(baseline_items: list[dict], observation: Any,
+                  temporary: frozenset[str]) -> tuple[list[dict], list[dict]]:
+    """Per observed baseline entitlement: each original share that no longer lists the
+    resource for its consumer (dropped), and each share other than a temporary share of
+    this migration that lists it now but did not before migration (added). An unobserved
+    entitlement is judged by compare(), never here."""
+    now = {item["key"]: item for item in value(observation, "items")}
+    dropped, added = [], []
+    for before in baseline_items:
+        after = now.get(before["key"]) if before["kind"] == "entitlement" else None
+        if after is None:
+            continue
+        original, current = set(before.get("via_shares", [])) - temporary, set(after.get("via_shares", []))
+        access = ("ORIGINAL" if original & current else
+                  "REPLACEMENT" if current - temporary else
+                  "TEMPORARY_ONLY" if current else "NONE")
+        dropped += [{"item": before, "share": share, "access": access}
+                    for share in sorted(original - current)]
+        added += [{"item": before, "share": share, "access": access}
+                  for share in sorted(current - temporary - original)]
+    return dropped, added
+
+
+def original_share_drops(dropped: list[dict], observation: Any, organizations: dict,
+                         detected_by: str, last_present_at: str, evidence: str) -> list[dict]:
+    """Informational drop events: one per original share and consumer, naming the
+    resources it no longer lists for that consumer."""
+    first_absent = value(observation, "observed_at")
+    resources: dict[tuple[str, str, str, str], set[str]] = defaultdict(set)
+    for row in dropped:
+        item = row["item"]
+        resources[item["consumer"], item["owner"], item["region"], row["share"]].add(item["resource_arn"])
+    return [{"id": drop_id("original_share", consumer, region, share, first_absent),
+             "kind": "original_share", "severity": "informational", "consumer": consumer,
+             "owner": owner, "region": region, "subject": share, "resources": sorted(arns),
+             "last_present_at": last_present_at, "first_absent_at": first_absent,
+             "detected_by": detected_by,
+             "consumer_organization_at_detection": organizations.get(consumer, "UNKNOWN"),
+             "evidence": evidence,
+             "reason": "the original share no longer lists these resources for the consumer"}
+            for (consumer, owner, region, share), arns in sorted(resources.items())]
 
 
 def migration_status(record: dict, comparison: Any | None, organizations: dict,
@@ -2590,7 +2624,8 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
 
     # Every current observation is compared with the one recorded original baseline.
     phase = "post-apply" if args.mode == "apply" else "verification"
-    final = observe(readonly, plan.groups, temporary_share_arns(record, shares), opts, report, phase)
+    temporary = temporary_share_arns(record, shares)
+    final = observe(readonly, plan.groups, temporary, opts, report, phase)
     organizations_now, errors = consumer_organizations(readonly, consumers_in_scope, opts)
     baseline = record.get("baseline")
     comparison = verifier().compare(scoped_items(baseline["items"], plan.groups), final) \
@@ -2598,6 +2633,17 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
     new_drops = drops_from(comparison, final, organizations_now, args.mode,
                            baseline["captured_at"] if baseline else "",
                            f"record revision {record['revision']}")
+    if baseline:
+        # Original shares that stopped reaching a consumer are expected while it moves;
+        # they are recorded as informational drops and never change the status.
+        dropped, _ = share_changes(scoped_items(baseline["items"], plan.groups), final, temporary)
+        for row in dropped:
+            report.emit(f"consumer={row['item']['consumer']} region={row['item']['region']} "
+                        f"resource={row['item']['resource_arn']} phase={phase} "
+                        f"change=ORIGINAL_SHARE_DROPPED share={row['share']} access={row['access']}")
+        new_drops += original_share_drops(dropped, final, organizations_now, args.mode,
+                                          baseline["captured_at"],
+                                          f"record revision {record['revision']}")
     projected = dict(record, drops=list(record.get("drops", [])) + new_drops)
     status_now, reasons = migration_status(projected, comparison, organizations_now, plan.groups)
     reasons += errors
@@ -2912,6 +2958,147 @@ def record_failure(args: argparse.Namespace, report: Reporter, opts: Options, fa
     return 1
 
 
+def baseline_groups(baseline: dict, consumers: list[str]) -> list[Group]:
+    """One observation group per owner, Region and consumer, from the baseline's
+    entitlements: the monitor observes exactly what the pre-migration snapshot holds."""
+    resources: dict[tuple[str, str, str], dict[str, str]] = defaultdict(dict)
+    for item in baseline.get("items", []):
+        if item["kind"] == "entitlement" and item.get("consumer") in consumers:
+            if not item.get("type"):
+                raise MigrationError(f"baseline entitlement {item['key']} records no resource type")
+            resources[item["owner"], item["region"], item["consumer"]][item["resource_arn"]] = item["type"]
+    return [Group(owner, region, (consumer,), {}, dict(sorted(arns.items())))
+            for (owner, region, consumer), arns in sorted(resources.items())]
+
+
+MONITOR_EXIT = {"UNCHANGED": 0, "CHANGED": 0, "INCONCLUSIVE": 3, "LOSS": 1}
+
+
+def run_monitor(router: Router, opts: Options, report: Reporter) -> int:
+    """On demand and read-only in AWS: what changed for the chosen migrating accounts
+    since the pre-migration baseline. Each run is recorded with its new drop events.
+
+    UNCHANGED or CHANGED (only expected changes: an original share no longer reaching
+    a consumer, a share added, an item added, a new organization) exit 0; INCONCLUSIVE
+    (no complete baseline, a read gap, an unknown organization) exits 3; LOSS (a
+    baseline item missing or degraded) exits 1."""
+    args = opts.args
+    record = load_record(args.record, args.migration_id)
+    migration = record["migration_id"]
+    fill_scope_from_record(opts, record)
+    chosen = selected_consumers(opts, record)
+    excluded = exclusion_text(exclusion_scope(opts))
+    baseline = record.get("baseline")
+    retired = retired_consumers(record)
+    reasons: list[str] = []
+    if baseline is None:
+        reasons.append("no original baseline is recorded; apply captures it before its first write")
+    elif not baseline.get("complete"):
+        reasons += [f"the original baseline is incomplete: {gap.get('collector')} {gap.get('account')} "
+                    f"{gap.get('region')} {gap.get('reason')}" for gap in baseline.get("gaps", [])] \
+            or ["the original baseline is incomplete"]
+    before = (baseline or {}).get("consumer_organizations", {})
+    reasons += [f"consumer {consumer} is not covered by the original baseline"
+                for consumer in chosen if baseline is not None and consumer not in before]
+    groups = baseline_groups(baseline, chosen) if baseline is not None else []
+
+    def finish(status: str, details: dict) -> int:
+        nonlocal record
+        code = MONITOR_EXIT[status]
+        entry = {"at": details.pop("at", timestamp()), "mode": "monitor", "consumers": chosen,
+                 "monitor_status": status, "reasons": sorted(set(reasons)), **details}
+        drops = entry.pop("new_drops", [])
+
+        def mutate(current: dict) -> None:
+            entry["recorded_drops"] = add_drops(current, drops)
+            current.setdefault("verifications", []).append(entry)
+        for reason in sorted(set(reasons)):
+            report.emit(f"phase=monitor status={status} {reason}")
+        record = update_record(args.record, migration, mutate, mode="monitor", status=status,
+                               consumers=chosen, drops=len(drops))
+        counts = " ".join(f"{name}={len(entry.get('changes', {}).get(name, []))}" for name in (
+            "original_share_drops", "shares_added", "lost", "degraded", "added", "unobserved"))
+        report.emit(f"status={status} migration={migration} phase=monitor consumers={','.join(chosen)} "
+                    f"{counts} gaps={entry.get('gaps', 0)} recorded_drops={entry['recorded_drops']} "
+                    f"revision={record['revision']} exit_code={code}{excluded}")
+        return code
+
+    report.emit(f"migration={migration} phase=monitor status=STARTED consumers={','.join(chosen)} "
+                f"baseline_captured_at={(baseline or {}).get('captured_at')} "
+                f"baseline_items={len((baseline or {}).get('items', []))}{excluded}")
+    if baseline is None or not baseline.get("complete"):
+        return finish("INCONCLUSIVE", {})
+    blocked = authenticate(router, {g.owner for g in groups} | set(chosen), opts, report)
+    if blocked:
+        reasons += blocked
+        return finish("INCONCLUSIVE", {})
+    gate = WriteGate(router)  # never opened: the monitor only reads AWS
+    temporary = temporary_share_arns(record, {})
+    items = scoped_items(baseline["items"], groups)
+    observation = observe(gate, groups, temporary, opts, report, "monitor") if groups else \
+        {"observed_at": timestamp(), "items": [], "gaps": []}
+    comparison = verifier().compare(items, observation)
+    organizations, errors = consumer_organizations(gate, chosen, opts)
+    reasons += errors
+    for consumer in chosen:
+        now = organizations.get(consumer, "UNKNOWN")
+        change = "UNKNOWN" if consumer not in organizations or consumer not in before else \
+            "UNCHANGED" if now == before[consumer] else "CHANGED"
+        if change == "UNKNOWN" and consumer in before:
+            reasons.append(f"current organization of {consumer} is unknown")
+        report.emit(f"consumer={consumer} phase=monitor organization_at_baseline="
+                    f"{before.get(consumer, 'NOT_RECORDED')} organization_now={now} "
+                    f"organization_change={change}"
+                    + (" temporary_access=RETIRED" if consumer in retired else ""))
+    dropped, gained = share_changes(items, observation, temporary)
+    for label, rows in (("ORIGINAL_SHARE_DROPPED", dropped), ("SHARE_ADDED", gained)):
+        for row in rows:
+            item = row["item"]
+            report.emit(f"consumer={item['consumer']} region={item['region']} owner={item['owner']} "
+                        f"resource={item['resource_arn']} phase=monitor change={label} "
+                        f"share={row['share']} access={row['access']}")
+    for entry in value(comparison, "missing"):
+        report.emit(f"phase=monitor change=LOST key={entry['key']} {describe_item(entry['item'])}")
+    for entry in value(comparison, "degraded"):
+        report.emit(f"phase=monitor change=DEGRADED key={entry['key']} "
+                    f"reasons={json.dumps(entry['reasons'])} {describe_item(entry['after'])}")
+    current = {item["key"]: item for item in value(observation, "items")}
+    for key in value(comparison, "added"):
+        report.emit(f"phase=monitor change=ADDED key={key} {describe_item(current[key])}")
+    for entry in value(comparison, "unobserved"):
+        report.emit(f"phase=monitor change=UNOBSERVED key={entry['key']} "
+                    f"reasons={json.dumps(entry['reasons'])}")
+    evidence = f"record revision {record['revision']}"
+    drops = drops_from(comparison, observation, organizations, "monitor", baseline["captured_at"],
+                       evidence)
+    drops += original_share_drops(dropped, observation, organizations, "monitor",
+                                  baseline["captured_at"], evidence)
+    # (consumer, key) per change; owner-side items such as Resolver endpoints have no consumer.
+    found = {"original_share_drops": [(r["item"]["consumer"], f"{r['item']['key']}|{r['share']}")
+                                      for r in dropped],
+             "shares_added": [(r["item"]["consumer"], f"{r['item']['key']}|{r['share']}")
+                              for r in gained],
+             "lost": [(e["item"].get("consumer"), e["key"]) for e in value(comparison, "missing")],
+             "degraded": [(e["before"].get("consumer"), e["key"])
+                          for e in value(comparison, "degraded")],
+             "added": [(current[key].get("consumer"), key) for key in value(comparison, "added")],
+             "unobserved": [(e["before"].get("consumer"), e["key"])
+                            for e in value(comparison, "unobserved")]}
+    changes = {name: sorted(key for _, key in rows) for name, rows in found.items()}
+    state = value(comparison, "status")
+    moved = any(organizations.get(c) not in (None, before.get(c)) for c in chosen)
+    status = "LOSS" if state == "LOSS" else "INCONCLUSIVE" if state != "INTACT" or reasons else \
+        "CHANGED" if moved or any(changes[name] for name in (
+            "original_share_drops", "shares_added", "added")) else "UNCHANGED"
+    for consumer in chosen:
+        report.emit(f"consumer={consumer} phase=monitor " + " ".join(
+            f"{name}={sum(who == consumer for who, _ in rows)}" for name, rows in found.items()))
+    return finish(status, {"at": value(observation, "observed_at"), "baseline_status": state,
+                           "gaps": len(value(observation, "gaps")), "changes": changes,
+                           "consumer_organizations": organizations, "new_drops": drops,
+                           "retired_consumers": sorted(retired & set(chosen))})
+
+
 def main(argv: list[str] | None = None, *, input_fn: Callable[[str], str] | None = None) -> int:
     report = Reporter()
     args = opts = None
@@ -2928,26 +3115,7 @@ def main(argv: list[str] | None = None, *, input_fn: Callable[[str], str] | None
         if args.mode == "complete":
             return run_complete(router, opts, ask, report)
         if args.mode == "monitor":
-            try:
-                module = importlib.import_module("ram_migration_monitor")
-            except ImportError as exc:
-                raise MigrationError("monitor requires the ram_migration_monitor module") from exc
-            # The monitor owns read-only probe/evidence validation; its config passes
-            # through intact, except that --record/--migration-id name the reviewed
-            # record it must consume and write drop events into.
-            config = dict(opts.monitor_config)
-            for key, given in (("record", str(args.record) if args.record else None),
-                               ("migration_id", args.migration_id)):
-                if given is None:
-                    continue
-                if config.get(key) not in (None, given):
-                    raise MigrationError(f"--{key.replace('_', '-')} differs from the monitor "
-                                         f"config {key}")
-                config[key] = given
-            result = module.monitor(router, config)
-            code = result if type(result) is int else (1 if result is False else 0)
-            report.emit(f"phase=monitor status={'FINISHED' if code == 0 else 'INCOMPLETE'} exit_code={code}")
-            return code
+            return run_monitor(router, opts, report)
         return run_shares(router, opts, ask, report)
     except KeyboardInterrupt:
         report.emit("status=INCOMPLETE Interrupted; existing temporary shares are retained")

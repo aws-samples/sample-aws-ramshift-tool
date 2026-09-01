@@ -126,7 +126,7 @@ CONSUMER_ACTIONS = (
     Action("ram:AcceptResourceShareInvitation", resource="owner"),
     Action("ram:GetResourceShareInvitations"),
 )
-# What verify and the monitor read in a migrated account after the move.
+# What verify and monitor read in a migrated account after the move.
 DESTINATION_ACTIONS = (
     Action("ram:GetResourceShares"),
     Action("ram:ListResources"),
@@ -136,15 +136,11 @@ DESTINATION_ACTIONS = (
     Action("ram:GetPermission"),
     Action("route53resolver:ListResolverRules"),
     Action("route53resolver:ListResolverRuleAssociations"),
-    Action("route53resolver:GetResolverRule"),
     Action("route53resolver:GetResolverEndpoint"),
     Action("route53resolver:ListResolverEndpointIpAddresses"),
     Action("ec2:DescribeTransitGatewayAttachments"),
     Action("ec2:DescribeTransitGatewayVpcAttachments"),
-    Action("ec2:DescribeTransitGatewayRouteTables"),
     Action("ec2:DescribeRouteTables"),
-    Action("ec2:DescribeInstances"),
-    Action("ec2:SearchTransitGatewayRoutes"),
     Action("ec2:GetIpamPoolAllocations"),
     Action("ec2:DescribeRegions", region=ORGANIZATIONS_REGION),
     Action("acm-pca:DescribeCertificateAuthority"),
