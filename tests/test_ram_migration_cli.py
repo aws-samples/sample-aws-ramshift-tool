@@ -3634,3 +3634,15 @@ def test_verify_records_original_share_drops_as_informational(harness, migration
     record = read_record(migration_record)
     assert [(d["kind"], d["severity"]) for d in record["drops"]] == [("original_share", "informational")]
     assert record["verifications"][-1]["migration_status"] == "PENDING_MIGRATION"
+
+
+def test_monitor_that_cannot_record_still_reports_and_never_exits_0(harness, migration_record, monkeypatch):
+    applied(harness, migration_record)
+    revision = read_record(migration_record)["revision"]
+    def refuse(*_args, **_kwargs):
+        raise MigrationError("record changed concurrently")
+    monkeypatch.setattr(cli, "update_record", refuse)
+    output = monitor_run(migration_record, code=1)
+    assert "phase=record status=NOT_RECORDED record changed concurrently" in output
+    assert "status=UNCHANGED" in output and "recorded=false exit_code=1" in output
+    assert read_record(migration_record)["revision"] == revision

@@ -3014,13 +3014,18 @@ def run_monitor(router: Router, opts: Options, report: Reporter) -> int:
             current.setdefault("verifications", []).append(entry)
         for reason in sorted(set(reasons)):
             report.emit(f"phase=monitor status={status} {reason}")
-        record = update_record(args.record, migration, mutate, mode="monitor", status=status,
-                               consumers=chosen, drops=len(drops))
+        try:
+            record = update_record(args.record, migration, mutate, mode="monitor", status=status,
+                                   consumers=chosen, drops=len(drops))
+            recorded = f"recorded_drops={entry['recorded_drops']} revision={record['revision']}"
+        except MigrationError as exc:
+            # The report stands, but its drops are not evidence for complete: never exit 0.
+            report.emit(f"phase=record status=NOT_RECORDED {failure_text(exc)}")
+            recorded, code = "recorded=false", code or 1
         counts = " ".join(f"{name}={len(entry.get('changes', {}).get(name, []))}" for name in (
             "original_share_drops", "shares_added", "lost", "degraded", "added", "unobserved"))
         report.emit(f"status={status} migration={migration} phase=monitor consumers={','.join(chosen)} "
-                    f"{counts} gaps={entry.get('gaps', 0)} recorded_drops={entry['recorded_drops']} "
-                    f"revision={record['revision']} exit_code={code}{excluded}")
+                    f"{counts} gaps={entry.get('gaps', 0)} {recorded} exit_code={code}{excluded}")
         return code
 
     report.emit(f"migration={migration} phase=monitor status=STARTED consumers={','.join(chosen)} "
