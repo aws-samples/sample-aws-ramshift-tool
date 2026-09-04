@@ -1,4 +1,5 @@
 """Migration-record integrity, authentication, durability, history and approval tests (offline)."""
+import copy
 import errno
 import fcntl
 import hashlib
@@ -26,6 +27,23 @@ CHANGE = {"permission_arn": "arn:aws:ram::aws:permission/AWSRAMDefaultPermission
           "from_policy_sha256": "a" * 64, "to_policy_sha256": "b" * 64}
 SHARE_1 = "arn:aws:ram:us-west-2:000000000001:resource-share/one"
 SHARE_2 = "arn:aws:ram:us-west-2:000000000001:resource-share/two"
+# A permission-change request and its approval as earlier releases wrote them. This release
+# writes neither and never reads them; a record that holds them still loads.
+LEGACY_REQUEST = {"id": "pc-0f1e2d3c4b5a6978", "migration_id": MIGRATION, **CHANGE,
+                  "shares": [SHARE_1], "owners": ["000000000001"], "regions": ["us-west-2"],
+                  "difference": {"actions_added": ["Allow ec2:CreateClientVpnEndpoint"]},
+                  "from_policy": {"Statement": []}, "to_policy": {"Statement": []}}
+LEGACY_APPROVAL = {"approval_id": LEGACY_REQUEST["id"], "migration_id": MIGRATION, **CHANGE,
+                   "shares": [SHARE_1], "difference_sha256": "c" * 64,
+                   "approved_at": "2026-10-14T00:00:00+00:00",
+                   "approved_by": {"user": "approver", "host": "workstation"},
+                   "approved_in_revision": 2,
+                   "basis": "interactive confirmation of the displayed policy comparison"}
+# Owner-scope proposal evidence, as plan builds it for an owner outside the scope.
+PROPOSED = {"000000000004": {"consumers": ["000000000002"], "regions": ["us-west-2"],
+                             "shares": [SHARE_1], "pending_shares": [],
+                             "resource_types": {"ec2:IpamPool": 2}, "unique_resources": 2,
+                             "observations": 2}}
 
 
 @pytest.fixture(autouse=True)
@@ -33,12 +51,6 @@ def no_record_key(monkeypatch):
     """Every test starts without a record key, whatever the caller's environment holds."""
     monkeypatch.delenv(rec.KEY_ENV, raising=False)
     monkeypatch.delenv(rec.KEY_FILE_ENV, raising=False)
-
-
-def change(share, **override):
-    return {**CHANGE, "owner": "000000000001", "region": "us-west-2", "share": share,
-            "difference": {"actions_added": ["Allow ec2:CreateClientVpnEndpoint"]},
-            "from_policy": {"Statement": []}, "to_policy": {"Statement": []}, **override}
 
 
 def written(tmp_path, record=None, *, migration=MIGRATION, name="record.json"):
@@ -53,10 +65,10 @@ def verified(path):
 
 
 def approved(tmp_path, name="record.json"):
-    """plan --record with one permission change, then approve it, as the CLI does."""
-    request, = rec.permission_requests(MIGRATION, [change(SHARE_1)])
-    path = written(tmp_path, {"permission_change_requests": [request]}, name=name)
-    rec.update(path, MIGRATION, lambda r: rec.approve_permission_change(r, request),
+    """plan --record with an owner-scope proposal, then approve it, as the CLI does."""
+    request = rec.owner_scope_request(MIGRATION, PROPOSED)
+    path = written(tmp_path, {"owner_scope_request": request}, name=name)
+    rec.update(path, MIGRATION, lambda r: rec.approve_owner_scope(r, request),
                mode="approve", status="APPROVED", approved=[request["id"]])
     return path
 
@@ -134,7 +146,7 @@ def test_every_entry_verifies_on_its_own_with_the_documented_digests(tmp_path):
 def test_record_edited_outside_the_tool_is_refused(tmp_path):
     path = written(tmp_path)
     data = json.loads(path.read_text())
-    data["approvals"]["permission_changes"].append({"approval_id": "forged"})
+    data["approvals"]["owner_scope"].append({"approval_id": "forged"})
     path.write_text(json.dumps(data))
     with pytest.raises(MigrationError, match="integrity check failed"):
         rec.load(path, MIGRATION)
@@ -157,40 +169,39 @@ def test_approvals_moved_to_another_migration_are_refused_despite_a_recomputed_c
 
     def retarget(data):
         data["migration_id"] = OTHER_MIGRATION
-        for approval in data["approvals"]["permission_changes"]:
+        for approval in data["approvals"]["owner_scope"]:
             approval["migration_id"] = OTHER_MIGRATION
         data["history"][1]["operator"] = {"user": "someone-else", "host": "elsewhere"}
         rehash_content(data)
     data = edited(path, retarget)
-    assert rec.approval_for(data["approvals"]["permission_changes"], OTHER_MIGRATION,
-                            change(SHARE_1)) is not None  # the forgery would cover the change
+    assert rec.approved_owners(data) == set(PROPOSED)  # the forgery would expand the scope
     with pytest.raises(MigrationError, match="integrity check failed"):
         rec.load(path, OTHER_MIGRATION)
 
 
 def test_approvals_copied_between_records_are_refused_despite_a_recomputed_content_hash(tmp_path):
     source = approved(tmp_path, name="source.json")
-    request, = rec.permission_requests(OTHER_MIGRATION, [change(SHARE_1)])
-    target = written(tmp_path, {"permission_change_requests": [request]},
+    request = rec.owner_scope_request(OTHER_MIGRATION, PROPOSED)
+    target = written(tmp_path, {"owner_scope_request": request},
                      migration=OTHER_MIGRATION, name="target.json")
     copied = [{**approval, "migration_id": OTHER_MIGRATION}
-              for approval in rec.load(source, MIGRATION)["approvals"]["permission_changes"]]
+              for approval in rec.load(source, MIGRATION)["approvals"]["owner_scope"]]
 
     def paste(data):
-        data["approvals"]["permission_changes"] = copied
+        data["approvals"]["owner_scope"] = copied
         rehash_content(data)
-    edited(target, paste)
-    assert rec.approval_for(copied, OTHER_MIGRATION, change(SHARE_1)) is not None
+    data = edited(target, paste)
+    assert rec.approved_owners(data) == set(PROPOSED)
     with pytest.raises(MigrationError, match="body_sha256 does not match the record"):
         rec.load(target, OTHER_MIGRATION)
 
 
 def test_request_pasted_as_an_approval_is_refused_despite_a_recomputed_content_hash(tmp_path):
-    request, = rec.permission_requests(MIGRATION, [change(SHARE_1)])
-    path = written(tmp_path, {"permission_change_requests": [request]})
+    request = rec.owner_scope_request(MIGRATION, PROPOSED)
+    path = written(tmp_path, {"owner_scope_request": request})
 
     def paste(data):
-        data["approvals"]["permission_changes"].append(dict(request))
+        data["approvals"]["owner_scope"].append(dict(request))
         rehash_content(data)
     edited(path, paste)
     with pytest.raises(MigrationError, match="integrity check failed"):
@@ -617,13 +628,13 @@ def legacy_write(path, migration, mutate, *, mode, status, create=False, **detai
 
 
 def legacy_record(tmp_path):
-    """plan, then approve, written by the previous release."""
+    """plan, then approve a permission change, written by the previous release."""
     path = tmp_path / "record.json"
-    request, = rec.permission_requests(MIGRATION, [change(SHARE_1)])
-    legacy_write(path, MIGRATION, lambda r: r.update(permission_change_requests=[request]),
+    legacy_write(path, MIGRATION, lambda r: r.update(permission_change_requests=[LEGACY_REQUEST]),
                  mode="plan", status="PLANNED", create=True, plan_digest="d" * 64)
-    legacy_write(path, MIGRATION, lambda r: rec.approve_permission_change(r, request),
-                 mode="approve", status="APPROVED", approved=[request["id"]])
+    legacy_write(path, MIGRATION, lambda r: r["approvals"]["permission_changes"].append(
+                     copy.deepcopy(LEGACY_APPROVAL)),
+                 mode="approve", status="APPROVED", approved=[LEGACY_REQUEST["id"]])
     return path
 
 
@@ -631,11 +642,14 @@ def test_previous_format_record_loads_and_the_next_write_upgrades_it(tmp_path):
     path = legacy_record(tmp_path)
     legacy = rec.load(path, MIGRATION)
     assert legacy["schema"] == rec.LEGACY_SCHEMA and legacy["revision"] == 2
-    assert rec.approval_for(legacy["approvals"]["permission_changes"], MIGRATION,
-                            change(SHARE_1)) is not None
+    assert legacy["approvals"]["permission_changes"] == [LEGACY_APPROVAL]
     upgraded = verified(path)
     record = rec.load(path, MIGRATION)
     assert record == upgraded and record["schema"] == rec.SCHEMA and record["revision"] == 3
+    # The permission-change request and approval are kept as written, and never read.
+    assert record["permission_change_requests"] == [LEGACY_REQUEST]
+    assert record["approvals"] == {"permission_changes": [LEGACY_APPROVAL], "owner_scope": []}
+    assert rec.approved_owners(record) == set()
     assert record["history"][:2] == legacy["history"]  # entries are never rewritten
     assert record["legacy_history"] == {"schema": rec.LEGACY_SCHEMA, "revisions": 2,
                                         "sha256": documented_sha256(legacy["history"])}
@@ -705,54 +719,28 @@ def test_previous_format_entry_after_an_upgrade_is_refused(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Approval binding
+# Approval binding: owner scope only; a permission difference needs no approval
 # ---------------------------------------------------------------------------
 
-def test_permission_requests_bind_versions_hashes_shares_and_migration():
-    requests = rec.permission_requests(MIGRATION, [change(SHARE_1), change(SHARE_2)])
-    request, = requests
-    assert request["shares"] == [SHARE_1, SHARE_2]
-    assert request["id"].startswith("pc-")
-    other = rec.permission_requests("other-migration", [change(SHARE_1), change(SHARE_2)])
-    assert other[0]["id"] != request["id"]
-    narrower = rec.permission_requests(MIGRATION, [change(SHARE_1)])
-    assert narrower[0]["id"] != request["id"]
+def test_a_new_record_has_owner_scope_approvals_only():
+    record = rec.new_record(MIGRATION)
+    assert record["approvals"] == {"owner_scope": []} and record["owner_scope_request"] is None
+    assert "permission_change_requests" not in record
 
 
-def test_approval_covers_only_the_exact_change():
-    record = {"migration_id": MIGRATION, "revision": 3, "approvals": {"permission_changes": []}}
-    request, = rec.permission_requests(MIGRATION, [change(SHARE_1)])
-    approval = rec.approve_permission_change(record, request)
-    approvals = record["approvals"]["permission_changes"]
+def test_owner_scope_approval_binds_the_migration_and_the_proposed_owners():
+    record = {"migration_id": MIGRATION, "revision": 3, "approvals": {"owner_scope": []}}
+    request = rec.owner_scope_request(MIGRATION, PROPOSED)
+    assert request["id"].startswith("os-") and request["owners"] == sorted(PROPOSED)
+    assert rec.owner_scope_request(OTHER_MIGRATION, PROPOSED)["id"] != request["id"]
+    assert rec.owner_scope_request(MIGRATION, {}) is None
+    approval = rec.approve_owner_scope(record, request)
     assert approval["approved_in_revision"] == 4 and approval["approved_by"]["user"]
-    assert rec.approval_for(approvals, MIGRATION, change(SHARE_1)) is approval
-    assert rec.approval_for(approvals, MIGRATION, change(SHARE_2)) is None
-    assert rec.approval_for(approvals, "prod-scope", change(SHARE_1)) is None
-    for field, value in (("to_version", "4"), ("from_version", "1"),
-                         ("to_policy_sha256", "c" * 64), ("from_policy_sha256", "d" * 64),
-                         ("permission_arn", "arn:aws:ram::aws:permission/Other")):
-        assert rec.approval_for(approvals, MIGRATION, change(SHARE_1, **{field: value})) is None
-
-
-def test_pending_requests_reflect_uncovered_shares():
-    record = {"migration_id": MIGRATION, "revision": 1,
-              "approvals": {"permission_changes": []},
-              "permission_change_requests": rec.permission_requests(
-                  MIGRATION, [change(SHARE_1)])}
-    assert len(rec.pending_requests(record)) == 1
-    rec.approve_permission_change(record, record["permission_change_requests"][0])
-    assert rec.pending_requests(record) == []
-    # A later plan that adds a share produces a new request the old approval cannot cover.
-    record["permission_change_requests"] = rec.permission_requests(
-        MIGRATION, [change(SHARE_1), change(SHARE_2)])
-    assert len(rec.pending_requests(record)) == 1
-
-
-def test_approval_rejects_request_from_another_migration():
-    record = {"migration_id": MIGRATION, "revision": 0, "approvals": {"permission_changes": []}}
-    request, = rec.permission_requests("other-migration", [change(SHARE_1)])
+    assert approval["evidence_sha256"] == rec.sha256(request["evidence"])
+    assert rec.approved_owners(record) == set(PROPOSED)
+    assert rec.approved_owners({**record, "migration_id": OTHER_MIGRATION}) == set()
     with pytest.raises(MigrationError, match="another migration"):
-        rec.approve_permission_change(record, request)
+        rec.approve_owner_scope(record, rec.owner_scope_request(OTHER_MIGRATION, PROPOSED))
 
 
 def test_retired_consumers_need_every_serving_share_retired():

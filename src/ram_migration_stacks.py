@@ -14,7 +14,7 @@ from ram_migration_common import (
 )
 from ram_migration_discovery import (
     ApprovedGroup, LookupCache, cached_permission, failure_text, permission_snapshot,
-    policy_semantics, policy_sha256, read_template,
+    policy_semantics, read_template,
 )
 
 # AWS RAM quotas per resource share, from "AWS Resource Access Manager endpoints and
@@ -80,7 +80,8 @@ def template_for(groups: list[Group], migration: str) -> dict:
             raise MigrationError("Migration group has no source lineage")
         if group.logical_id in resources:
             raise MigrationError("Duplicate group identity; merge compatible groups before templating")
-        changes = _changes_metadata(group)
+        # Metadata records what the share attaches (PermissionSnapshots), not how that differs
+        # from its original shares: plan reports a difference, a template never holds one.
         resources[group.logical_id] = {
             "Type": "AWS::RAM::ResourceShare",
             "DeletionPolicy": "Retain",
@@ -109,39 +110,9 @@ def template_for(groups: list[Group], migration: str) -> dict:
                 "PermissionSnapshots": copy.deepcopy(getattr(group, "permission_snapshots", {})),
             },
         }
-        if changes:
-            resources[group.logical_id]["Metadata"]["PermissionChanges"] = changes
     return {"AWSTemplateFormatVersion": "2010-09-09",
             "Description": "Additive RAM migration sharing; underlying resources are never created here.",
             "Resources": resources}
-
-
-CHANGE_KEYS = ("SourceShareArn", "PermissionArn", "ResourceType", "FromVersion",
-               "ToVersion", "FromPolicySha256", "ToPolicySha256", "ApprovalId")
-_CHANGE_FIELDS = ("share", "permission_arn", "resource_type", "from_version",
-                  "to_version", "from_policy_sha256", "to_policy_sha256", "approval_id")
-
-
-def row_key(row: dict) -> tuple[str, str, str, str]:
-    """A metadata row's identity; the template form of ram_migration_common.change_key."""
-    return (row["SourceShareArn"], row["PermissionArn"], row["FromVersion"], row["ToVersion"])
-
-
-def _changes_metadata(group: Group) -> list[dict]:
-    """Owner-side, durable evidence of each approved permission change."""
-    rows = []
-    for change in getattr(group, "permission_changes", []):
-        row = dict(zip(CHANGE_KEYS, (change[f] for f in _CHANGE_FIELDS)))
-        if row["SourceShareArn"] not in group.source_shares or \
-                group.permissions.get(row["ResourceType"]) != row["PermissionArn"]:
-            raise MigrationError("Approved permission change does not belong to its entitlement group")
-        rows.append(row)
-    return sorted(rows, key=row_key)
-
-
-def changes_from_metadata(metadata: dict) -> list[dict]:
-    return [dict(zip(_CHANGE_FIELDS, (row[k] for k in CHANGE_KEYS)))
-            for row in metadata.get("PermissionChanges", [])]
 
 
 def _owner_arn(arn: str, owner: str) -> None:
@@ -217,27 +188,6 @@ def _validate_resource(logical: str, item: dict, migration: str,
             raise MigrationError(f"{logical}: permission approval does not match its approved scope")
         for snapshot in snapshots.values():
             policy_semantics(snapshot["Policy"])
-    changes = metadata.get("PermissionChanges", [])
-    if not isinstance(changes, list) or any(
-            not isinstance(row, dict) or set(row) != set(CHANGE_KEYS) or
-            any(not isinstance(row[key], str) or not row[key] for key in CHANGE_KEYS) or
-            row["SourceShareArn"] not in lineage or
-            permissions.get(row["ResourceType"]) != row["PermissionArn"] or
-            row["FromVersion"] == row["ToVersion"]
-            for row in changes):
-        raise MigrationError(f"{logical}: permission-change approval metadata does not match its scope")
-    if snapshots:
-        # Every change ends at the version the share attaches; its policy hash is the
-        # hash of that recorded policy. The original side cannot be checked here: the
-        # template holds only what the temporary share attaches.
-        for row in changes:
-            snapshot = snapshots.get(row["ResourceType"], {})
-            if snapshot.get("Version") != row["ToVersion"] or \
-                    policy_sha256(snapshot["Policy"]) != row["ToPolicySha256"]:
-                raise MigrationError(f"{logical}: permission-change approval metadata does not match "
-                                     "its permission snapshot")
-    if len({row_key(row) for row in changes}) != len(changes):
-        raise MigrationError(f"{logical}: duplicate permission-change approval metadata")
 
 
 def _validate_template(template: dict, migration: str, owner: str | None = None) -> None:
@@ -286,20 +236,9 @@ def additive_template(old: dict, new: dict, migration: str) -> dict:
                 raise MigrationError(f"{logical}: approved managed permission policy changed")
         if not before and after:
             raise MigrationError(f"{logical}: existing permission approval missing; reconcile explicitly")
-        # Recorded changes are evidence of what the share was created or extended under;
-        # they are kept, and a later change of the same share is added beside them.
-        recorded = {row_key(row): row for row in prior_metadata.get("PermissionChanges", [])}
-        for row in fresh_metadata.get("PermissionChanges", []):
-            key = row_key(row)
-            if key in recorded and recorded[key] != row:
-                raise MigrationError(
-                    f"{logical}: recorded permission-change approval differs: the stack records "
-                    f"{recorded[key]['ApprovalId']} for {key[0]} v{key[2]}->v{key[3]}, this plan "
-                    f"{row['ApprovalId']}; run with the migration record that approved "
-                    f"{recorded[key]['ApprovalId']}")
-            recorded[key] = row
-        if recorded:
-            prior_metadata["PermissionChanges"] = [recorded[k] for k in sorted(recorded)]
+        # PermissionChanges rows, which earlier versions recorded with the approval ID of
+        # each permission difference, stay as they are: history this version neither reads
+        # nor writes, so a deployed share's template never changes for its metadata format.
     return result
 
 
@@ -407,8 +346,8 @@ class Stacks:
 
     def prepare(self, owner: str, region: str, groups: list[Group], *,
                 fresh: bool = False) -> tuple[dict, dict | None]:
-        """Every permission is always reread, so approval evidence is compared with AWS,
-        never with discovery's cached read of it. A new share receives the current
+        """Every permission is always reread, so the permission snapshots are compared with
+        AWS, never with discovery's cached read of them. A new share receives the current
         default version, so its group is checked against the current default. A share
         already in the migration stack keeps the version it was created with: its group
         must carry exactly that snapshot, which is checked against that version, and a
@@ -455,7 +394,8 @@ class Stacks:
                     raise MigrationError(f"{arn}: permission resource type/default version differs")
                 if approved is not None and (approved["Arn"] != arn or
                                              approved["Policy"] != current["Policy"]):
-                    raise MigrationError(f"{arn}: managed permission changed since plan approval")
+                    raise MigrationError(f"{arn}: the default managed permission changed since "
+                                         "discovery read it")
                 snapshots[kind] = current
         body = proposed if previous is None else additive_template(previous, proposed,
                                                                     self.migration)
@@ -505,8 +445,7 @@ class Stacks:
                 raise MigrationError(f"{logical}: permission type metadata differs from RAM permissions")
             group = ApprovedGroup(owner, region, tuple(sorted(properties["Principals"])),
                                   permissions, resources, metadata["SourceShareArns"], snapshots,
-                                  metadata.get("SourceStackIds", []),
-                                  permission_changes=changes_from_metadata(metadata))
+                                  metadata.get("SourceStackIds", []))
             if group.logical_id != logical:
                 raise MigrationError(f"{logical}: template entitlement identity does not match approved grants")
             groups.append(group)

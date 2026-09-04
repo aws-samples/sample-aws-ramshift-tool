@@ -1,12 +1,12 @@
 """Versioned migration record shared by plan, approve, apply, verify and monitor.
 
 One JSON document per migration ID. ``plan`` writes the reviewed scope and its
-blockers, ``approve`` adds bound approvals, ``apply`` captures the original
-baseline once and records created shares, ``verify`` appends verification
-results. Every write is a new revision in a hash-chained history. Each history
-entry carries the digest of the record as written in its revision and hashes
-only its own fields, and ``load`` re-verifies the whole chain and the current
-content before anything uses the record.
+blockers, ``approve`` adds bound owner-scope approvals, ``apply`` captures the
+original baseline once and records created shares, ``verify`` appends
+verification results. Every write is a new revision in a hash-chained history.
+Each history entry carries the digest of the record as written in its revision
+and hashes only its own fields, and ``load`` re-verifies the whole chain and the
+current content before anything uses the record.
 
 Plain SHA-256 makes the record tamper-evident against accidental edits only:
 anyone who can write the file can recompute every hash. With a record key in
@@ -26,7 +26,6 @@ import hmac
 import json
 import os
 import socket
-from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable
 
@@ -106,9 +105,10 @@ def new_record(migration: str) -> dict:
         "tool": tool_identity(),
         "scope": None,
         "plan": None,
-        "permission_change_requests": [],
         "owner_scope_request": None,
-        "approvals": {"permission_changes": [], "owner_scope": []},
+        # Records of earlier versions also hold permission_change_requests and
+        # approvals.permission_changes; they load, and are kept as history but never read.
+        "approvals": {"owner_scope": []},
         "baseline": None,
         "shares": [],
         "verifications": [],
@@ -516,8 +516,6 @@ def group_identity(group: Any) -> dict:
         "permissions": dict(sorted(group.permissions.items())),
         "resources": dict(sorted(group.resources.items())),
         "source_shares": sorted(set(group.source_shares)),
-        "permission_changes": sorted({c["approval_id"] for c in
-                                      getattr(group, "permission_changes", [])}),
     }
 
 
@@ -529,74 +527,7 @@ def plan_digest(groups: list, scope: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Permission-change approvals
-# ---------------------------------------------------------------------------
-
-CHANGE_FIELDS = ("permission_arn", "resource_type", "from_version", "to_version",
-                 "from_policy_sha256", "to_policy_sha256")
-
-
-def permission_requests(migration: str, changes: list[dict]) -> list[dict]:
-    """Aggregate per-share changes into approval requests bound to their shares."""
-    grouped: dict[tuple, list[dict]] = defaultdict(list)
-    for change in changes:
-        grouped[tuple(change[f] for f in CHANGE_FIELDS)].append(change)
-    requests = []
-    for key, items in sorted(grouped.items()):
-        body = {"migration_id": migration, **dict(zip(CHANGE_FIELDS, key)),
-                "shares": sorted({item["share"] for item in items})}
-        requests.append({
-            "id": "pc-" + sha256(body)[:16], **body,
-            "owners": sorted({item["owner"] for item in items}),
-            "regions": sorted({item["region"] for item in items}),
-            "difference": items[0]["difference"],
-            "from_policy": items[0]["from_policy"],
-            "to_policy": items[0]["to_policy"],
-        })
-    return requests
-
-
-def approval_for(approvals: list[dict], migration: str, change: dict) -> dict | None:
-    """An approval covers a change only for the same migration, exact versions,
-    exact policy hashes and an explicitly listed share."""
-    for approval in approvals:
-        if approval.get("migration_id") == migration and \
-                all(approval.get(f) == change.get(f) for f in CHANGE_FIELDS) and \
-                change.get("share") in approval.get("shares", []):
-            return approval
-    return None
-
-
-def pending_requests(record: dict) -> list[dict]:
-    approvals = record.get("approvals", {}).get("permission_changes", [])
-    pending = []
-    for request in record.get("permission_change_requests", []):
-        uncovered = [s for s in request["shares"]
-                     if approval_for(approvals, record["migration_id"],
-                                     {**request, "share": s}) is None]
-        if uncovered:
-            pending.append(request)
-    return pending
-
-
-def approve_permission_change(record: dict, request: dict) -> dict:
-    if request.get("migration_id") != record.get("migration_id"):
-        raise MigrationError("Permission change request belongs to another migration")
-    approval = {
-        "approval_id": request["id"],
-        **{f: request[f] for f in ("migration_id", *CHANGE_FIELDS, "shares")},
-        "difference_sha256": sha256(request["difference"]),
-        "approved_at": timestamp(),
-        "approved_by": operator(),
-        "approved_in_revision": record.get("revision", 0) + 1,
-        "basis": "interactive confirmation of the displayed policy comparison",
-    }
-    record.setdefault("approvals", {}).setdefault("permission_changes", []).append(approval)
-    return approval
-
-
-# ---------------------------------------------------------------------------
-# Owner-scope approvals
+# Owner-scope approvals, the only approvals: a managed-permission difference needs none
 # ---------------------------------------------------------------------------
 
 def owner_scope_request(migration: str, proposed: dict[str, dict]) -> dict | None:

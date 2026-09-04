@@ -18,10 +18,9 @@ from botocore.exceptions import ClientError, EndpointConnectionError, NoCredenti
 
 import temporary_migration_ram_shares as cli
 from ram_migration_common import Group, MigrationError, Plan
-from ram_migration_discovery import ApprovedGroup, approved_change, permission_change
-from ram_migration_record import approval_for
+from ram_migration_discovery import ApprovedGroup, permission_change
 import ram_migration_record as record_module
-from ram_migration_stacks import Readback, check_quotas, template_for
+from ram_migration_stacks import Readback, additive_template, check_quotas, template_for
 
 OWNER = "000000000001"
 CONSUMER = "000000000002"
@@ -382,21 +381,11 @@ class Harness:
                 plan = Plan(self.migration, groups=copy.deepcopy(harness.source.get((owner, region), [])),
                             excluded=["local empty share"] if region == HOME else [],
                             external_access=copy.deepcopy(
-                                harness.external_access.get((owner, region), [])))
-                approvals = harness.discovery_kwargs.get("approved_changes", [])
-                for change in harness.permission_changes.get((owner, region), []):
-                    granted = approval_for(approvals, self.migration, change)
-                    item = dict(change, status="APPROVED" if granted else "APPROVAL_REQUIRED")
-                    plan.permission_changes.append(item)
-                    if granted:
-                        item["approval_id"] = granted["approval_id"]
-                        for g in plan.groups:
-                            if change["share"] in g.source_shares:
-                                g.permission_changes = [approved_change(item)]
-                    else:
-                        plan.groups = [g for g in plan.groups if change["share"] not in g.source_shares]
-                        plan.blocked.append(f"{change['share']}: Non-default permission differs "
-                                            "from the current default and requires approval")
+                                harness.external_access.get((owner, region), [])),
+                            # Like Discovery: a difference is reported and its share is still
+                            # planned, with the version its temporary share attaches.
+                            permission_changes=copy.deepcopy(
+                                harness.permission_changes.get((owner, region), [])))
                 return plan
 
         class LocalStacks:
@@ -1508,129 +1497,125 @@ def test_parallelism_and_time_limits_are_validated(harness, option, value):
 
 
 # ---------------------------------------------------------------------------
-# Reviewed record and permission-change approvals (v0.2.0)
+# Reviewed record; managed-permission differences are information, never approved
 # ---------------------------------------------------------------------------
 IPAM_PERMISSION = f"arn:aws:ram::aws:permission/{IPAM}"
 ORIGINAL_SHARE = f"arn:aws:ram:{REGION}:{OWNER}:resource-share/original"
 V2 = {"Effect": "Allow", "Action": ["ec2:DescribeTransitGateways"]}
 V3 = {"Effect": "Allow", "Action": ["ec2:DescribeTransitGateways", "ec2:CreateClientVpnEndpoint"]}
+NEW_SHARE = "new temporary share (receives the current default)"
 
 
-def tgw_like_change():
+def tgw_like_change(before=("2", V2), after=("3", V3)):
+    """The original share attaches ``before``; its temporary share attaches ``after``."""
     from ram_migration_discovery import policy_semantics
-    prior = {"Arn": IPAM_PERMISSION, "Version": "2", "ResourceType": IPAM,
-             "Policy": policy_semantics(V2), "DefaultVersion": False}
-    default = {"Arn": IPAM_PERMISSION, "Version": "3", "ResourceType": IPAM,
-               "Policy": policy_semantics(V3), "DefaultVersion": True}
-    return permission_change(OWNER, REGION, ORIGINAL_SHARE, prior, default)
+    (old, old_policy), (new, new_policy) = before, after
+    prior = {"Arn": IPAM_PERMISSION, "Version": old, "ResourceType": IPAM,
+             "Policy": policy_semantics(old_policy), "DefaultVersion": False}
+    target = {"Arn": IPAM_PERMISSION, "Version": new, "ResourceType": IPAM,
+              "Policy": policy_semantics(new_policy), "DefaultVersion": True}
+    return permission_change(OWNER, REGION, ORIGINAL_SHARE, prior, target)
 
 
 def with_record(argv, path):
     return list(argv) + ["--record", str(path)]
 
 
-@pytest.fixture
-def revalidations(monkeypatch):
-    seen = []
-    monkeypatch.setattr(cli, "revalidate_change",
-                        lambda client, change, existing=None: seen.append(change))
-    return seen
+def permission_lines(output):
+    return [line for line in output.splitlines() if line.startswith("phase=permission-change ")]
 
 
-def plan_and_approve(harness, path, capsys):
-    harness.permission_changes[OWNER, REGION] = [tgw_like_change()]
-    assert main(with_record(args(), path)) == 1
-    request, = record_module.load(path, MIGRATION)["permission_change_requests"]
-    token = f"APPROVE {MIGRATION} {request['id']}"
-    assert main(["approve", "--record", str(path)], input_fn=lambda _prompt: token) == 0
-    assert main(with_record(args(), path)) == 0
-    capsys.readouterr()
-    return request
-
-
-def test_plan_record_shows_comparison_and_blocks_until_approved(harness, capsys, migration_record):
-    harness.permission_changes[OWNER, REGION] = [tgw_like_change()]
-    assert main(with_record(args(), migration_record)) == 1
+def test_a_v2_to_v3_difference_plans_as_information_and_the_record_keeps_it(
+        harness, capsys, migration_record, tmp_path):
+    """The temporary share attaches the current default, v3. The difference is shown, never
+    blocks and needs no approval; the record's plan and the export keep it for reviewers."""
+    change = dict(tgw_like_change(), applies_to=NEW_SHARE)
+    harness.permission_changes[OWNER, REGION] = [change]
+    export = tmp_path / "plan.json"
+    assert main(with_record(args(), migration_record) + ["--export-plan", str(export)]) == 0
     output = capsys.readouterr().out
-    assert "phase=permission-change" in output and "status=APPROVAL_REQUIRED" in output
-    assert "version=2->3" in output
-    assert "actions added: Allow ec2:CreateClientVpnEndpoint" in output
-    assert f"share={ORIGINAL_SHARE}" in output
+    assert permission_lines(output) == [
+        f"phase=permission-change status=INFO permission={IPAM_PERMISSION} resource_type={IPAM} "
+        f"version=2->3 from_policy_sha256={change['from_policy_sha256']} "
+        f"to_policy_sha256={change['to_policy_sha256']} shares=1"]
+    assert "  grants more: Allow ec2:CreateClientVpnEndpoint" in output
+    assert "  actions added: Allow ec2:CreateClientVpnEndpoint" in output
+    assert f"  share={ORIGINAL_SHARE} applies_to={NEW_SHARE}" in output
+    assert "APPROVAL_REQUIRED" not in output and "phase=blocker-summary" not in output
+    assert "status=PLANNED" in summary_line(output) and "blockers=0" in summary_line(output)
+    record = read_record(migration_record)
+    assert record["plan"]["status"] == "PLANNED" and record["plan"]["blocked"] == []
+    assert record["plan"]["permission_changes"] == [change]
+    assert record["history"][-1]["permission_changes"] == 1
+    assert "permission_change_requests" not in record and record["approvals"] == {"owner_scope": []}
+    assert json.loads(export.read_text())["permission_changes"] == [change]
+    planned, = record["plan"]["groups"]
+    assert planned["source_shares"] == [ORIGINAL_SHARE] and "permission_changes" not in planned
     assert not harness.writes()
-    record = record_module.load(migration_record, MIGRATION)
-    assert record["plan"]["status"] == "BLOCKED" and record["revision"] == 1
-    request, = record["permission_change_requests"]
-    assert request["shares"] == [ORIGINAL_SHARE] and request["to_version"] == "3"
-    assert record["approvals"]["permission_changes"] == []
 
 
-def test_approve_needs_the_exact_token_and_no_aws_access(harness, capsys, migration_record):
+def test_a_difference_that_narrows_access_is_also_a_warning(harness, capsys):
+    """The original attaches v3; its temporary share attaches v2, which grants less."""
+    harness.permission_changes[OWNER, REGION] = [tgw_like_change(before=("3", V3), after=("2", V2))]
+    assert main(args()) == 0
+    output = capsys.readouterr().out
+    info, warning = permission_lines(output)
+    assert info.startswith(f"phase=permission-change status=INFO permission={IPAM_PERMISSION} "
+                           f"resource_type={IPAM} version=3->2 ")
+    assert warning == (
+        f"phase=permission-change status=WARNING permission={IPAM_PERMISSION} "
+        f"resource_type={IPAM} version=3->2 shares=1 the temporary share grants less than the "
+        "original share (Allow ec2:CreateClientVpnEndpoint); once the original share stops "
+        "applying, the migrating consumers keep only what the temporary share grants")
+    assert "  grants less: Allow ec2:CreateClientVpnEndpoint" in output
+    assert "status=PLANNED" in summary_line(output)
+
+
+def test_apply_proceeds_without_any_permission_approval(harness, capsys, migration_record):
     harness.permission_changes[OWNER, REGION] = [tgw_like_change()]
-    assert main(with_record(args(), migration_record)) == 1
-    harness.calls.clear()
-    assert main(["approve", "--record", str(migration_record)],
-                input_fn=lambda _prompt: f"APPROVE {MIGRATION}") == 2
-    assert "status=NOT_APPROVED" in capsys.readouterr().out
-    assert record_module.load(migration_record, MIGRATION)["approvals"]["permission_changes"] == []
-    request, = record_module.load(migration_record, MIGRATION)["permission_change_requests"]
+    assert main(with_record(args(), migration_record)) == 0
+    capsys.readouterr()
     prompts = []
-    token = f"APPROVE {MIGRATION} {request['id']}"
-    assert main(["approve", "--record", str(migration_record)],
-                input_fn=lambda prompt: prompts.append(prompt) or token) == 0
+    assert main(with_record(args("apply"), migration_record),
+                input_fn=lambda prompt: prompts.append(prompt) or harness.confirm(prompt)) == 0
     output = capsys.readouterr().out
-    assert "actions added: Allow ec2:CreateClientVpnEndpoint" in output
-    assert "Original shares are not modified" in output and token in prompts[0]
-    assert not any(call[0] in ("router", "authentication", "client") for call in harness.calls)
-    approval, = record_module.load(migration_record, MIGRATION)["approvals"]["permission_changes"]
-    assert approval["shares"] == [ORIGINAL_SHARE] and approval["migration_id"] == MIGRATION
-    assert (approval["from_version"], approval["to_version"]) == ("2", "3")
-    assert main(["approve", "--record", str(migration_record)],
-                input_fn=lambda _p: pytest.fail("nothing left to approve")) == 0
-
-
-def test_approved_change_is_revalidated_then_applied_and_recorded(harness, capsys, migration_record,
-                                                                 revalidations):
-    request = plan_and_approve(harness, migration_record, capsys)
-    record = record_module.load(migration_record, MIGRATION)
-    assert record["plan"]["status"] == "PLANNED"
-    template = record["plan"]["migration_stacks"][0]["template"]
-    row, = next(iter(template["Resources"].values()))["Metadata"]["PermissionChanges"]
-    assert row["ApprovalId"] == request["id"] and row["SourceShareArn"] == ORIGINAL_SHARE
-    assert main(with_record(args("apply"), migration_record), input_fn=harness.confirm) == 0
-    output = capsys.readouterr().out
-    assert "phase=permission-revalidation status=VERIFIED" in output
-    assert [c["approval_id"] for c in revalidations] == [request["id"]]
+    assert len(prompts) == 1 and f"APPLY {MIGRATION}" in prompts[0]
+    assert permission_lines(output)[0].startswith("phase=permission-change status=INFO ")
+    assert "permission-revalidation" not in output and "status=SHARING_READY" in summary_line(output)
     confirmation = harness.calls.index(("confirmation",))
     first_write = harness.calls.index(next(c for c in harness.calls if c[0] == "write"))
     assert confirmation < first_write
-    record = record_module.load(migration_record, MIGRATION)
+    record = read_record(migration_record)
     assert [(h["mode"], h["status"]) for h in record["history"]] == [
-        ("plan", "BLOCKED"), ("approve", "APPROVED"), ("plan", "PLANNED"),
-        ("apply", "BASELINE_CAPTURED"), ("apply", "STACK_COMPLETE"), ("apply", "SHARING_READY")]
+        ("plan", "PLANNED"), ("apply", "BASELINE_CAPTURED"), ("apply", "STACK_COMPLETE"),
+        ("apply", "SHARING_READY")]
     # Every apply entry names the reviewed plan it consumed.
     assert {(h["plan_revision"], h["plan_digest"]) for h in record["history"]
-            if h["mode"] == "apply"} == {(3, record["plan"]["digest"])}
+            if h["mode"] == "apply"} == {(1, record["plan"]["digest"])}
+    template = record["plan"]["migration_stacks"][0]["template"]
+    assert "PermissionChanges" not in next(iter(template["Resources"].values()))["Metadata"]
     share, = record["shares"]
     assert share["share_arn"].startswith(f"arn:aws:ram:{REGION}:{OWNER}:resource-share/temporary-")
 
 
-def test_permission_drift_after_approval_blocks_every_write(harness, capsys, migration_record,
-                                                            monkeypatch):
-    plan_and_approve(harness, migration_record, capsys)
-
-    def drifted(_client, change, existing=None):
-        raise cli.MigrationError(f"{change['permission_arn']}: permission changed since approval")
-    monkeypatch.setattr(cli, "revalidate_change", drifted)
-    assert main(with_record(args("apply"), migration_record), input_fn=harness.confirm) == 1
-    assert "post-confirmation permission revalidation" in capsys.readouterr().out
-    assert not harness.writes()
-    last = record_module.load(migration_record, MIGRATION)["history"][-1]
-    assert (last["mode"], last["status"], last["phase"]) == ("apply", "BLOCKED", "post-confirmation")
+def test_approve_has_nothing_to_approve_for_a_permission_difference(harness, capsys,
+                                                                    migration_record):
+    harness.permission_changes[OWNER, REGION] = [tgw_like_change()]
+    assert main(with_record(args(), migration_record)) == 0
+    before = read_record(migration_record)
+    harness.calls.clear()
+    capsys.readouterr()
+    assert main(["approve", "--record", str(migration_record)],
+                input_fn=lambda _p: pytest.fail("a permission difference needs no approval")) == 0
+    assert f"migration={MIGRATION} phase=approve status=NOTHING_PENDING" in capsys.readouterr().out
+    assert not any(call[0] in ("router", "authentication", "client") for call in harness.calls)
+    assert read_record(migration_record) == before
 
 
 def test_apply_refuses_a_blocked_reviewed_plan(harness, capsys, migration_record):
-    harness.permission_changes[OWNER, REGION] = [tgw_like_change()]
+    harness.discovery_errors[OWNER, HOME] = "a blocker the reviewed plan found"
     assert main(with_record(args(), migration_record)) == 1
+    del harness.discovery_errors[OWNER, HOME]  # resolved, but never reviewed
     assert main(with_record(args("apply"), migration_record),
                 input_fn=lambda _: pytest.fail("blocked record must not confirm")) == 1
     assert "reviewed plan (revision 1) is BLOCKED" in capsys.readouterr().out
@@ -1745,11 +1730,11 @@ def test_uncovered_received_dependency_from_a_selected_owner_blocks(harness, cap
 
 def test_coverage_does_not_repeat_an_upstream_discovery_blocker(harness, capsys):
     harness.discovery_errors[OWNER, REGION] = MigrationError(
-        f"{ORIGINAL_SHARE}: Non-default permission differs and requires approval")
+        f"{ORIGINAL_SHARE}: owner={OWNER} region={REGION} source status PENDING")
     harness.receive()
     assert main(args()) == 1
     output = capsys.readouterr().out
-    assert "requires approval" in output and "not covered by any planned" not in output
+    assert "source status PENDING" in output and "not covered by any planned" not in output
 
 
 def test_record_scope_distinguishes_account_roles(harness, migration_record):
@@ -2692,55 +2677,93 @@ def test_already_complete_record_is_a_no_op(harness, capsys, migration_record):
 
 
 # ---------------------------------------------------------------------------
-# Recorded change history, the locked write gate, per-stack recording, migrating
-# owners found by their shares, Region exclusions, export safety, baseline coverage
+# Records and stacks from the permission-approval era, the locked write gate,
+# per-stack recording, migrating owners found by their shares, Region exclusions,
+# export safety, baseline coverage
 # ---------------------------------------------------------------------------
 from ram_migration_discovery import policy_semantics  # noqa: E402
 
 
-def what_the_real_check_raises_now(monkeypatch):
-    """revalidate_change against an original share that left the approved version."""
-    seen = []
+def earlier_permission_approval():
+    """What earlier versions wrote for an approved v2 -> v3 difference: a request and its
+    approval in the record, and a PermissionChanges row naming that approval in the
+    migration stack's template."""
+    change = tgw_like_change()
+    fields = {key: change[key] for key in ("permission_arn", "resource_type", "from_version",
+                                           "to_version", "from_policy_sha256", "to_policy_sha256")}
+    bound = {"migration_id": MIGRATION, **fields, "shares": [ORIGINAL_SHARE]}
+    request = {"id": "pc-" + record_module.sha256(bound)[:16], **bound,
+               "owners": [OWNER], "regions": [REGION],
+               "difference": change["difference"], "from_policy": change["from_policy"],
+               "to_policy": change["to_policy"]}
+    approval = {"approval_id": request["id"], "migration_id": MIGRATION, **fields,
+                "shares": [ORIGINAL_SHARE],
+                "difference_sha256": record_module.sha256(change["difference"]),
+                "approved_at": "2026-10-14T00:00:00+00:00",
+                "approved_by": {"user": "approver", "host": "workstation"},
+                "approved_in_revision": 2,
+                "basis": "interactive confirmation of the displayed policy comparison"}
+    row = {"SourceShareArn": ORIGINAL_SHARE, "PermissionArn": IPAM_PERMISSION,
+           "ResourceType": IPAM, "FromVersion": "2", "ToVersion": "3",
+           "FromPolicySha256": change["from_policy_sha256"],
+           "ToPolicySha256": change["to_policy_sha256"], "ApprovalId": request["id"]}
+    return request, approval, row
 
-    def revalidate(_client, change, existing=None):
-        seen.append(change)
-        raise MigrationError(f"{change['share']}: attached permission version changed since "
-                             f"approval {change['approval_id']}; re-run plan --record, review it "
-                             "and approve any request it shows")
-    monkeypatch.setattr(cli, "revalidate_change", revalidate)
-    return seen
 
+@pytest.mark.parametrize("held", [True, False])
+def test_a_record_and_stack_with_earlier_permission_approvals_still_work_to_completion(
+        harness, capsys, migration_record, monkeypatch, held):
+    """Earlier versions recorded each permission difference as an approval in the record and
+    as a PermissionChanges row naming it in the stack's template. Both are history: whether
+    or not the record holds the approval the row names, the record plans, applies, verifies
+    and completes, approve finds nothing to approve, and apply sees the deployed template
+    unchanged, so it writes nothing and never reports that the plan changed."""
+    harness.permission_changes[OWNER, REGION] = [tgw_like_change()]
+    applied(harness, migration_record)
+    request, approval, row = earlier_permission_approval()
+    rewrite(migration_record, permission_change_requests=[request] if held else [],
+            approvals={"permission_changes": [approval] if held else [], "owner_scope": []})
+    stored, = harness.stored[OWNER, REGION]
+    deployed = template_for([stored], MIGRATION)
+    deployed["Resources"][stored.logical_id]["Metadata"]["PermissionChanges"] = [row]
+    prepared = []
 
-@pytest.mark.parametrize("original", ["upgraded", "deleted"])
-def test_an_applied_permission_change_is_history_and_never_blocks_a_later_apply(
-        harness, capsys, migration_record, revalidations, monkeypatch, original):
-    """Findings 2 and 21: the change was approved and applied, then the owner moved the
-    original share to the default version or deleted it."""
-    request = plan_and_approve(harness, migration_record, capsys)
-    assert main(with_record(args("apply"), migration_record), input_fn=harness.confirm) == 0
-    assert [c["approval_id"] for c in revalidations] == [request["id"]]
-    harness.permission_changes.clear()          # discovery reports no change any more
-    if original == "deleted":
-        harness.source = {}
-    seen = what_the_real_check_raises_now(monkeypatch)
+    class EarlierStacks(cli.Stacks):
+        """The migration stack holds the template an earlier version wrote."""
+        def prepare(self, owner, region, groups, fresh=False):
+            body, old = super().prepare(owner, region, groups, fresh)
+            prepared.append(additive_template(deployed, body, MIGRATION))
+            return prepared[-1], old
+    monkeypatch.setattr(cli, "Stacks", EarlierStacks)
+    capsys.readouterr()
     assert main(with_record(args(), migration_record)) == 0
+    assert "status=PLANNED" in summary_line(capsys.readouterr().out)
     assert main(["approve", "--record", str(migration_record)],
                 input_fn=lambda _p: pytest.fail("nothing is pending")) == 0
+    assert "status=NOTHING_PENDING" in capsys.readouterr().out
     harness.calls.clear()
-    capsys.readouterr()
     assert main(with_record(args("apply"), migration_record), input_fn=harness.confirm) == 0
     output = capsys.readouterr().out
-    assert (f"share={ORIGINAL_SHARE} phase=permission-revalidation status=ALREADY_APPLIED "
-            f"approval={request['id']}") in output
-    assert "status=SHARING_READY" in summary_line(output)
-    assert seen == [] and not harness.writes()
+    assert "status=SHARING_READY" in summary_line(output) and "plan changed" not in output
+    assert not harness.writes()
+    assert len(prepared) == 3 and all(body == deployed for body in prepared)
+    assert main(mode_args("verify", migration_record)) == 0
+    assert "status=PENDING_MIGRATION" in summary_line(capsys.readouterr().out)
+    sites = {(CONSUMER, REGION, arn) for arn in stored.resources}
+    harness.original_lost |= sites   # the original organization share no longer applies,
+    harness.replacement |= sites     # a permanent share from the new landing zone does
+    harness.organizations[CONSUMER] = "o-destination1"
+    assert main(complete_args(migration_record), input_fn=confirm_complete(harness)) == 0
+    record = read_record(migration_record)
+    assert record["completion"] is not None
+    assert record["permission_change_requests"] == ([request] if held else [])
+    assert record["approvals"]["permission_changes"] == ([approval] if held else [])
 
 
-def test_a_new_change_joining_an_existing_share_is_revalidated_against_its_kept_version(
-        harness, capsys, migration_record, monkeypatch):
-    """A second original share joins an existing temporary share and needs an approved
-    change. The change is new, so it is revalidated, against the version the existing
-    share keeps rather than the current default."""
+def test_a_share_joining_an_existing_temporary_share_needs_no_approval_for_its_difference(
+        harness, capsys, migration_record):
+    """A second original share joins an existing temporary share, which keeps the version it
+    was created with: the difference to that version is reported and apply proceeds."""
     kept_v3 = {"Arn": IPAM_PERMISSION, "Version": "3", "ResourceType": IPAM,
                "Policy": policy_semantics(V3), "DefaultVersion": True}
     first = ApprovedGroup(OWNER, REGION, (CONSUMER,), {IPAM: IPAM_PERMISSION}, {POOL: IPAM},
@@ -2751,48 +2774,18 @@ def test_a_new_change_joining_an_existing_share_is_revalidated_against_its_kept_
     joining = copy.deepcopy(first)
     joining.source_shares = [second]            # the same entitlement through another original
     harness.source[OWNER, REGION] = [first, joining]
-    harness.permission_changes[OWNER, REGION] = [dict(tgw_like_change(), share=second)]
-    assert quietly(with_record(args(), migration_record)) == 1
-    request, = read_record(migration_record)["permission_change_requests"]
-    token = f"APPROVE {MIGRATION} {request['id']}"
-    assert quietly(["approve", "--record", str(migration_record)], lambda _p: token) == 0
+    existing = f"existing temporary share {first.logical_id} (keeps version 3)"
+    harness.permission_changes[OWNER, REGION] = [dict(tgw_like_change(), share=second,
+                                                      applies_to=existing)]
     assert quietly(with_record(args(), migration_record)) == 0
-    seen = []
-    monkeypatch.setattr(cli, "revalidate_change",
-                        lambda _client, change, existing=None: seen.append((change["share"], existing)))
     capsys.readouterr()
     assert main(with_record(args("apply"), migration_record), input_fn=harness.confirm) == 0
-    assert seen == [(second, kept_v3)]
-    assert (f"share={second} phase=permission-revalidation status=VERIFIED "
-            f"approval={request['id']}") in capsys.readouterr().out
-
-
-@pytest.mark.parametrize("mode", ["plan", "apply", "verify", "new-record"])
-def test_stack_change_evidence_must_be_approved_by_this_record(
-        harness, capsys, migration_record, revalidations, tmp_path, mode):
-    """Finding 6: a migration stack row naming an approval this record does not hold, or
-    that differs from it, is never trusted, in any mode that reads the stacks."""
-    plan_and_approve(harness, migration_record, capsys)
-    assert main(with_record(args("apply"), migration_record), input_fn=harness.confirm) == 0
-    stored, = harness.stored[OWNER, REGION]
-    approval_id = stored.permission_changes[0]["approval_id"]
-    if mode != "new-record":                     # the stack metadata was edited
-        approval_id = "pc-anything"
-        stored.permission_changes = [dict(stored.permission_changes[0], approval_id=approval_id)]
-    harness.calls.clear()
-    capsys.readouterr()
-    argv = {"plan": with_record(args(), migration_record),
-            "apply": with_record(args("apply"), migration_record),
-            "verify": mode_args("verify", migration_record),
-            "new-record": with_record(args(), tmp_path / "started-again.json")}[mode]
-    assert main(argv, input_fn=lambda _: pytest.fail("blocked before confirmation")) == 1
     output = capsys.readouterr().out
-    assert (f"phase=approval-evidence owner={OWNER} region={REGION} share={ORIGINAL_SHARE} "
-            f"migration stack share {stored.logical_id} records permission change {approval_id} "
-            f"({IPAM_PERMISSION} v2->v3), which this migration record does not approve") in output
-    assert "category=approval-evidence blockers=1 " in output
-    assert "approvals never transfer between records" in output
-    assert not harness.writes()
+    assert f"  share={second} applies_to={existing}" in output
+    assert "status=SHARING_READY" in summary_line(output)
+    stored, = harness.stored[OWNER, REGION]
+    assert stored.source_shares == [ORIGINAL_SHARE, second]
+    assert stored.permission_snapshots == {IPAM: kept_v3}
 
 
 @pytest.mark.parametrize("concurrent", ["blocked", "identical", "changed"])

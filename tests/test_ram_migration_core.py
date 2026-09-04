@@ -546,14 +546,20 @@ def test_semantically_equivalent_permission_versions_are_supported(clients):
     assert result.groups[0].permission_snapshots[KIND]["Version"] == "2"
 
 
-def test_broader_default_permission_is_not_substituted(clients):
+def test_a_broader_default_permission_is_attached_and_the_difference_reported(clients):
+    """AWS attaches only the default to a new share. A broader default is used, never an
+    older version pinned, and the difference never blocks: the share is temporary."""
     cs, stubs = clients
     narrower = copy.deepcopy(POLICY)
     narrower["Statement"][0]["Action"] = ["route53resolver:GetResolverRule"]
     stub_discovery(stubs, attached_version="1", attached_policy=narrower)
     result = inspect(cs)
-    assert not result.groups
-    assert "Non-default permission differs" in result.blocked[0]
+    assert not result.blocked
+    assert result.groups[0].permission_snapshots[KIND]["Version"] == "2"
+    change, = result.permission_changes
+    assert (change["from_version"], change["to_version"]) == ("1", "2")
+    assert change["difference"]["summary"] == \
+        "grants more: Allow route53resolver:AssociateResolverRule"
 
 
 def test_compatible_grouping_merges_resources_and_preserves_sources(clients):
@@ -814,7 +820,8 @@ def test_changed_managed_policy_blocks_before_changeset_creation(clients):
     broader["Statement"][0]["Action"] = "*"
     stubs["ram"].add_response("get_permission", {"permission": permission("3", broader)},
                              {"permissionArn": PERMISSION})
-    with pytest.raises(MigrationError, match="changed since plan approval"):
+    with pytest.raises(MigrationError, match="default managed permission changed since "
+                                             "discovery read it"):
         Stacks(OfflineRouter(cs), MIGRATION).apply(OWNER, REGION, [approved])
 
 
@@ -1292,12 +1299,11 @@ def test_verification_accepts_live_owner_rows_but_consumer_view_must_be_availabl
 
 
 # ---------------------------------------------------------------------------
-# Permission-change approvals (v0.2.0)
+# Managed-permission differences: reported, never approved; earlier versions' stack rows
 # ---------------------------------------------------------------------------
 from ram_migration_discovery import (  # noqa: E402
-    describe_difference, permission_change, policy_difference, policy_sha256, revalidate_change,
+    describe_difference, grants_less, permission_change, policy_difference, policy_sha256,
 )
-from ram_migration_record import approve_permission_change, permission_requests  # noqa: E402
 from ram_migration_stacks import _validate_template  # noqa: E402
 
 TGW_ACTIONS = ["ec2:CreateTransitGatewayVpcAttachment", "ec2:DeleteTransitGatewayVpcAttachment",
@@ -1346,62 +1352,36 @@ def expected_change():
     return permission_change(OWNER, REGION, SOURCE, prior, default)
 
 
-def approval(migration=MIGRATION, changes=None):
-    record = {"migration_id": migration, "revision": 0, "approvals": {"permission_changes": []}}
-    request, = permission_requests(migration, changes or [expected_change()])
-    return approve_permission_change(record, request)
-
-
-def inspect_with(clients, approvals):
-    return Discovery(OfflineRouter(clients), {CONSUMER}, MIGRATION, {}, {KIND.lower(): True},
-                     approved_changes=approvals).inspect(OWNER, REGION)
-
-
-def test_permission_change_blocks_with_comparison_until_approved(clients):
+def test_a_permission_difference_plans_the_default_and_is_reported_without_approval(clients):
+    """The original attaches v1. The temporary share receives the default, v2; the
+    difference is the plan's information, never a blocker or an approval request."""
     cs, stubs = clients
     stub_changed_share(stubs)
-    result = inspect_with(cs, [])
-    assert not result.groups
-    assert "requires approval" in result.blocked[0]
-    assert "actions added: Allow route53resolver:AssociateResolverRule" in result.blocked[0]
-    change, = result.permission_changes
-    assert change["status"] == "APPROVAL_REQUIRED"
-    assert (change["share"], change["from_version"], change["to_version"]) == (SOURCE, "1", "2")
-
-
-def test_bound_approval_admits_the_change_onto_the_temporary_share_only(clients):
-    cs, stubs = clients
-    stub_changed_share(stubs)
-    granted = approval()
-    result = inspect_with(cs, [granted])
+    result = inspect(cs)
     assert not result.blocked
     g, = result.groups
     assert g.permission_snapshots[KIND]["Version"] == "2"      # temporary share gets the default
-    evidence, = g.permission_changes
-    assert evidence["approval_id"] == granted["approval_id"] and evidence["share"] == SOURCE
-    assert result.permission_changes[0]["status"] == "APPROVED"
+    assert not hasattr(g, "permission_changes")                 # a group carries no approval
+    change, = result.permission_changes
+    assert change == dict(expected_change(),
+                          applies_to="new temporary share (receives the current default)")
+    assert describe_difference(change["difference"])[:2] == [
+        "grants more: Allow route53resolver:AssociateResolverRule",
+        "BROADENED Allow route53resolver:AssociateResolverRule: before not granted; "
+        "after on * unconditionally"]
+    assert grants_less(change["difference"]) == []
 
 
-@pytest.mark.parametrize("mutation", [
-    {"migration": "earlier-openfinance-migration"},
-    {"field": ("to_version", "3")},
-    {"field": ("from_policy_sha256", "0" * 64)},
-    {"share": SOURCE + "-other"},
-])
-def test_approvals_for_other_scopes_never_authorize_this_change(clients, mutation):
+def test_a_share_blocked_after_its_comparison_reports_no_difference(clients):
+    """Only a planned share reports a difference; this one fails its capability check."""
     cs, stubs = clients
     stub_changed_share(stubs)
-    change = expected_change()
-    if "field" in mutation:
-        change[mutation["field"][0]] = mutation["field"][1]
-    if "share" in mutation:
-        change["share"] = mutation["share"]
-    granted = approval(mutation.get("migration", MIGRATION), [change])
-    result = inspect_with(cs, [granted])
-    assert not result.groups and "requires approval" in result.blocked[0]
+    result = inspect(cs, capabilities={})
+    assert not result.groups and "external-sharing capability" in result.blocked[0]
+    assert not result.permission_changes
 
 
-def test_permission_type_mismatch_is_never_approvable(clients):
+def test_permission_type_mismatch_still_blocks(clients):
     cs, stubs = clients
     stubs["ram"].add_response("get_resource_shares", {"resourceShares": [
         {"resourceShareArn": SOURCE, "owningAccountId": OWNER, "status": "ACTIVE", "tags": []}]},
@@ -1419,89 +1399,88 @@ def test_permission_type_mismatch_is_never_approvable(clients):
     stubs["ram"].add_response("get_permission", {"permission": permission(
         "1", NARROWER, default=False, kind="ec2:TransitGateway")},
         {"permissionArn": PERMISSION, "permissionVersion": 1})
-    result = inspect_with(cs, [approval()])
+    result = inspect(cs)
     assert not result.groups and "type differs" in result.blocked[0]
+    assert not result.permission_changes
 
 
-def compact(granted):
-    change = expected_change()
-    return {k: (granted["approval_id"] if k == "approval_id" else change[k]) for k in (
-        "share", "permission_arn", "resource_type", "from_version", "to_version",
-        "from_policy_sha256", "to_policy_sha256", "approval_id")}
-
-
-def stub_revalidation(stubs, attached="1", default_version="2", default_policy=None):
-    stubs["ram"].add_response("list_resource_share_permissions", {"permissions": [{
-        "arn": PERMISSION, "version": attached, "resourceType": KIND,
-        "defaultVersion": attached == default_version}]}, {"resourceShareArn": SOURCE})
-    if attached != "1":
-        return
-    stubs["ram"].add_response("get_permission", {"permission": permission("1", NARROWER, default=False)},
-                              {"permissionArn": PERMISSION, "permissionVersion": 1})
-    stubs["ram"].add_response("get_permission", {"permission": permission(
-        default_version, default_policy)}, {"permissionArn": PERMISSION})
-
-
-def test_revalidation_accepts_unchanged_approved_change(clients):
-    cs, stubs = clients
-    stub_revalidation(stubs)
-    revalidate_change(Api(cs["ram"]), compact(approval()))
-
-
-@pytest.mark.parametrize("kwargs,message", [
-    ({"attached": "2"}, "attached permission version changed"),
-    ({"default_version": "3"}, "permission changed since approval"),
-    ({"default_policy": TGW_V3}, "permission changed since approval"),
-])
-def test_revalidation_voids_approval_on_any_drift(clients, kwargs, message):
-    cs, stubs = clients
-    stub_revalidation(stubs, **kwargs)
-    with pytest.raises(MigrationError, match=message):
-        revalidate_change(Api(cs["ram"]), compact(approval()))
-
-
-def approved_group(granted):
-    g = group(approved=True)
-    g.permission_changes = [compact(granted)]
-    return g
-
-
-def test_template_records_approved_change_and_rejects_tampered_evidence():
-    granted = approval()
-    g = approved_group(granted)
+def earlier_template(g):
+    """The template an earlier version wrote for a share created under an approved v1 -> v2
+    difference: its metadata also holds a PermissionChanges row naming that approval (the ID
+    that version derived for expected_change)."""
     template = template_for([g], MIGRATION)
-    metadata = template["Resources"][g.logical_id]["Metadata"]
-    row, = metadata["PermissionChanges"]
-    assert (row["SourceShareArn"], row["FromVersion"], row["ToVersion"], row["ApprovalId"]) == \
-        (SOURCE, "1", "2", granted["approval_id"])
-    _validate_template(template, MIGRATION)
-    for key, value in (("ToVersion", "3"), ("SourceShareArn", SOURCE + "-unlisted"),
-                       ("PermissionArn", "arn:aws:ram::aws:permission/Other")):
-        tampered = copy.deepcopy(template)
-        tampered["Resources"][g.logical_id]["Metadata"]["PermissionChanges"][0][key] = value
-        with pytest.raises(MigrationError, match="permission-change approval metadata"):
-            _validate_template(tampered, MIGRATION)
+    change = expected_change()
+    template["Resources"][g.logical_id]["Metadata"]["PermissionChanges"] = [{
+        "SourceShareArn": SOURCE, "PermissionArn": PERMISSION, "ResourceType": KIND,
+        "FromVersion": "1", "ToVersion": "2", "FromPolicySha256": change["from_policy_sha256"],
+        "ToPolicySha256": change["to_policy_sha256"], "ApprovalId": "pc-7e317668eab8c023"}]
+    return template
 
 
-def test_unapproved_change_cannot_enter_a_template():
+def test_a_template_records_what_a_share_attaches_and_no_permission_difference():
     g = group(approved=True)
-    g.permission_changes = [dict(compact(approval()), share=SOURCE + "-elsewhere")]
-    with pytest.raises(MigrationError, match="does not belong"):
-        template_for([g], MIGRATION)
+    metadata = template_for([g], MIGRATION)["Resources"][g.logical_id]["Metadata"]
+    assert set(metadata) == {"SourceShareArns", "SourceStackIds", "OwnerRegion",
+                             "ResourceTypes", "PermissionTypes", "PermissionSnapshots"}
 
 
-def test_additive_template_merges_change_evidence_and_rejects_conflicts():
-    granted = approval()
-    plain = group(approved=True)
-    old = template_for([plain], MIGRATION)
-    new = template_for([approved_group(granted)], MIGRATION)
-    merged = additive_template(old, new, MIGRATION)
-    assert merged["Resources"][plain.logical_id]["Metadata"]["PermissionChanges"] == \
-        new["Resources"][plain.logical_id]["Metadata"]["PermissionChanges"]
-    conflicting = copy.deepcopy(new)
-    conflicting["Resources"][plain.logical_id]["Metadata"]["PermissionChanges"][0]["ApprovalId"] = "pc-other"
-    with pytest.raises(MigrationError, match="approval differs"):
-        additive_template(merged, conflicting, MIGRATION)
+def test_earlier_permission_change_rows_are_kept_verbatim_and_never_change_a_template():
+    """The rows are history: never read, so never validated or rewritten. This version's
+    template of the same share merges into the deployed one without any change, and the rows
+    stay as they are when the share grows."""
+    g = group(approved=True)
+    deployed = earlier_template(g)
+    _validate_template(deployed, MIGRATION)
+    assert additive_template(deployed, template_for([g], MIGRATION), MIGRATION) == deployed
+    grown = additive_template(deployed, template_for([group(
+        resources={RESOURCE + "2": KIND}, sources=[SOURCE + "2"], approved=True)], MIGRATION),
+        MIGRATION)
+    item = grown["Resources"][g.logical_id]
+    assert item["Properties"]["ResourceArns"] == [RESOURCE, RESOURCE + "2"]
+    assert item["Metadata"]["SourceShareArns"] == [SOURCE, SOURCE + "2"]
+    assert item["Metadata"]["PermissionChanges"] == \
+        deployed["Resources"][g.logical_id]["Metadata"]["PermissionChanges"]
+    unread = copy.deepcopy(deployed)
+    unread["Resources"][g.logical_id]["Metadata"]["PermissionChanges"][0]["ToVersion"] = "9"
+    _validate_template(unread, MIGRATION)
+
+
+def test_a_stack_with_earlier_permission_change_rows_is_read_verified_and_not_rewritten(clients):
+    """persisted_groups recovers the group without the rows, the share verifies against the
+    version it keeps, prepare returns the deployed template unchanged, and apply finds
+    nothing to write (strict stubs: no change set is created)."""
+    cs, stubs = clients
+    g = group(approved=True)
+    deployed = earlier_template(g)
+    cfn, ram, name = stubs["cloudformation"], stubs["ram"], stack_name(MIGRATION, OWNER, REGION)
+    read = {"StackName": STACK_ID, "TemplateStage": "Processed"}
+    stacks = Stacks(OfflineRouter(cs), MIGRATION)
+
+    def deployed_stack():
+        cfn.add_response("describe_stacks", {"Stacks": [stack_info()]}, {"StackName": name})
+        cfn.add_response("get_template", {"TemplateBody": json.dumps(deployed)}, read)
+        ram.add_response("get_permission", {"permission": permission()},  # the kept version
+                         {"permissionArn": PERMISSION, "permissionVersion": 2})
+    deployed_stack()
+    ram.add_response("list_resources", {"resources": [resource()]},
+                     {"resourceOwner": "SELF", "resourceArns": [RESOURCE]})
+    recovered, = stacks.persisted_groups(OWNER, REGION)
+    assert recovered == g and not hasattr(recovered, "permission_changes")
+    stub_verification(ram, recovered)
+    consumer = botocore.session.get_session().create_client(
+        "ram", region_name=REGION, config=Config(signature_version=UNSIGNED))
+    with Stubber(consumer) as stub:
+        stub.add_response("list_resources", {"resources": [resource()]},
+                          {"resourceOwner": "OTHER-ACCOUNTS", "resourceShareArns": [TEMP]})
+        verify_group(OfflineRouter(cs, consumer=consumer), recovered, migration_share(recovered),
+                     MIGRATION)
+        stub.assert_no_pending_responses()
+    deployed_stack()
+    body, old = stacks.prepare(OWNER, REGION, [recovered], fresh=True)
+    assert body == deployed and old["StackId"] == STACK_ID
+    deployed_stack()
+    cfn.add_response("get_template", {"TemplateBody": json.dumps(deployed)}, read)  # apply's reread
+    assert stacks.apply(OWNER, REGION, [recovered]) == name
 
 
 # ---------------------------------------------------------------------------
@@ -1575,18 +1554,6 @@ def test_real_tgw_v2_to_v3_reports_exactly_client_vpn_endpoint_as_a_broadening()
         "Allow ec2:DeleteTransitGatewayVpcAttachment, Allow ec2:DescribeTransitGateways, "
         "Allow ec2:ModifyTransitGatewayVpcAttachment, Allow network-firewall:CreateFirewall",
         "actions added: Allow ec2:CreateClientVpnEndpoint"]
-
-
-def test_discovery_blocker_and_recorded_change_lead_with_the_direction(clients):
-    cs, stubs = clients
-    stub_changed_share(stubs)
-    result = inspect_with(cs, [])
-    change, = result.permission_changes
-    assert change["difference"]["summary"] == \
-        "grants more: Allow route53resolver:AssociateResolverRule"
-    assert (f"{PERMISSION} v1->v2 (grants more: Allow route53resolver:AssociateResolverRule, "
-            "BROADENED Allow route53resolver:AssociateResolverRule: before not granted; "
-            "after on * unconditionally, ") in result.blocked[0]
 
 
 def test_dropped_condition_is_shown_as_a_broadening_with_both_bindings():
@@ -1846,17 +1813,27 @@ def test_statements_outside_the_analysis_count_as_possible_broadenings():
 
 
 def test_a_comparison_without_statement_analysis_never_claims_no_difference():
-    # A difference recorded by an earlier tool version has facets only.
+    # A difference made without the statement-level analysis has facets only.
     first = ("grants more: not ruled out; this comparison has no statement-level analysis, "
-             "re-run plan --record before approving")
+             "re-run plan --record")
     assert describe_difference({"actions_added": [], "statements_added": [allow("a:X")]}) == [first]
     assert describe_difference({"actions_added": ["Allow a:X"]}) == [
         first, "actions added: Allow a:X"]
+    assert grants_less({"actions_added": ["Allow a:X"]}) == [
+        "not ruled out without the statement-level analysis"]
 
 
-def test_statement_analysis_leaves_policy_hashes_and_approval_binding_unchanged():
-    from ram_migration_record import sha256 as record_sha256
-    # Pinned before the statement-level analysis existed; approvals bind these hashes.
+def test_grants_less_lists_what_the_later_policy_narrows_or_changes():
+    before = {"Statement": [allow(["a:One", "a:Two", "a:Three"])]}
+    after = {"Statement": [allow(["a:One"]), allow(["a:Three"], Condition=ORG),
+                           allow(["a:Four"])]}
+    assert grants_less(policy_difference(before, after)) == ["Allow a:Three", "Allow a:Two"]
+    assert grants_less(policy_difference(after, after)) == []
+    assert grants_less(policy_difference(TGW_V2, TGW_V3)) == []
+
+
+def test_statement_analysis_leaves_the_policy_hashes_unchanged():
+    # Pinned before the statement-level analysis existed; plan shows and records them.
     assert (policy_sha256(TGW_V2), policy_sha256(TGW_V3)) == (
         "64e8120f3145bc9c1c1e1a7bc2d8e128279857821fabbc992da813be98c778e3",
         "365d19f67b097460189056474e8d18cdf27c8330f733e28f2ec5a397b74dd08c")
@@ -1864,16 +1841,7 @@ def test_statement_analysis_leaves_policy_hashes_and_approval_binding_unchanged(
     assert (change["from_policy_sha256"], change["to_policy_sha256"]) == (
         "44ddeb77e186963124f751a3a4f51f4f4017d9adeeaf7c34a424e7250b55a27c",
         "5a209dca3e4277c7d7b835f1b1aed878897e3da43ce1134cff256444c235fd1f")
-    request, = permission_requests(MIGRATION, [change])
-    assert request["id"] == "pc-7e317668eab8c023"
-    granted = approve_permission_change({"migration_id": MIGRATION, "revision": 0}, request)
-    assert sorted(granted) == [
-        "approval_id", "approved_at", "approved_by", "approved_in_revision", "basis",
-        "difference_sha256", "from_policy_sha256", "from_version", "migration_id",
-        "permission_arn", "resource_type", "shares", "to_policy_sha256", "to_version"]
-    # The approval still hashes the comparison it displayed, now including the summary.
-    assert granted["difference_sha256"] == record_sha256(request["difference"])
-    assert request["difference"]["summary"] == \
+    assert change["difference"]["summary"] == \
         "grants more: Allow route53resolver:AssociateResolverRule"
 
 
@@ -1940,21 +1908,21 @@ def test_run_cache_reads_each_permission_and_owning_template_once(clients):
 
 
 def test_default_permission_drift_after_discovery_blocks_plan_preflight_and_recheck(clients):
+    """What the template would attach is reread, never taken from discovery's cached read: a
+    default changed after this run's discovery blocks the preflight and the recheck."""
     cs, stubs = clients
     stub_changed_share(stubs)
     cache = LookupCache()
     result = Discovery(OfflineRouter(cs), {CONSUMER}, MIGRATION, {}, {KIND.lower(): True},
-                       approved_changes=[approval()], cache=cache).inspect(OWNER, REGION)
+                       cache=cache).inspect(OWNER, REGION)
     g, = result.groups
     # SetDefaultPermissionVersion after discovery; the cache still holds discovery's read.
-    stub_revalidation(stubs, default_policy=TGW_V3)
-    with pytest.raises(MigrationError, match="permission changed since approval"):
-        revalidate_change(Api(cs["ram"]), g.permission_changes[0])
     for fresh in (False, True):  # the plan-time preflight, then the post-confirmation recheck
         no_stack(stubs["cloudformation"])
         stubs["ram"].add_response("get_permission", {"permission": permission(policy=TGW_V3)},
                                   {"permissionArn": PERMISSION})
-        with pytest.raises(MigrationError, match="managed permission changed since plan approval"):
+        with pytest.raises(MigrationError, match="the default managed permission changed since "
+                                                 "discovery read it"):
             Stacks(OfflineRouter(cs), MIGRATION, cache=cache).prepare(OWNER, REGION, [g],
                                                                      fresh=fresh)
 
@@ -2051,7 +2019,7 @@ def test_sdk_retries_throttled_reads_with_a_bounded_attempt_count(monkeypatch, c
 
 # ---------------------------------------------------------------------------
 # Existing temporary shares keep their version; overrides never hide a migrating
-# owner's stationary consumers; stack change evidence is self-consistent
+# owner's stationary consumers
 # ---------------------------------------------------------------------------
 BROADER = {"Version": "2012-10-17", "Statement": [{
     "Effect": "Allow", "Action": ["route53resolver:GetResolverRule",
@@ -2090,10 +2058,10 @@ def stub_version(stubs, version, policy):
                                            "permissionVersion": int(version)})
 
 
-def discover_with(clients, deployed=None, approvals=None):
+def discover_with(clients, deployed=None):
     cs, _ = clients
     return Discovery(OfflineRouter(cs), {CONSUMER}, MIGRATION, {}, {KIND.lower(): True},
-                     approved_changes=approvals, deployed=deployed).inspect(OWNER, REGION)
+                     deployed=deployed).inspect(OWNER, REGION)
 
 
 def test_a_newer_default_is_not_a_change_to_an_existing_temporary_share(clients):
@@ -2104,57 +2072,45 @@ def test_a_newer_default_is_not_a_change_to_an_existing_temporary_share(clients)
     assert not result.blocked and not result.permission_changes
     g, = result.groups
     assert g.key == group().key and g.permission_snapshots == {KIND: kept("2")}
-    assert not g.permission_changes
-    note, = result.notes  # reported explicitly, without an approval request or a blocker
+    note, = result.notes  # reported explicitly, as a note and never a blocker
     assert f"{SOURCE}: owner={OWNER} region={REGION} permission={PERMISSION} " \
            "status=DEFAULT_CHANGED" in note
     assert f"existing temporary share {g.logical_id} keeps version 2" in note
     assert "the current default is version 3 and the original share attaches version 2" in note
-    assert "needs no approval" in note
+    assert "so the default change does not affect it" in note
 
 
-def test_a_new_share_still_needs_approval_for_a_newer_default(clients):
-    """Control for finding 3: nothing is deployed, so a new share would receive v3."""
+def test_a_new_share_receives_a_newer_default_and_reports_the_difference(clients):
+    """Control for finding 3: nothing is deployed, so a new share receives v3."""
     _, stubs = clients
     stub_attached_share(stubs, attached="2", default="3")
     stub_version(stubs, "2", POLICY)
     result = discover_with(clients)
-    assert not result.groups and not result.notes
-    assert result.blocked[0].startswith(f"{SOURCE}: owner={OWNER} region={REGION} Non-default "
-                                        "permission differs from the current default and "
-                                        "requires approval")
+    assert not result.blocked and not result.notes
+    g, = result.groups
+    assert g.permission_snapshots[KIND]["Version"] == "3"
     change, = result.permission_changes
-    assert (change["from_version"], change["to_version"], change["status"]) == (
-        "2", "3", "APPROVAL_REQUIRED")
+    assert (change["from_version"], change["to_version"]) == ("2", "3")
     assert change["applies_to"] == "new temporary share (receives the current default)"
+    assert change["difference"]["summary"] == \
+        "grants more: Allow route53resolver:DisassociateResolverRule"
 
 
 def test_an_original_upgraded_past_its_temporary_share_is_compared_with_the_kept_version(clients):
-    """The owner moved the original to v3 after its temporary share was created at v2: the
-    temporary share cannot reproduce it, so the exact v3 -> v2 difference needs approval."""
+    """The owner moved the original to v3 after its temporary share was created at v2. The
+    temporary share keeps v2, which grants less; the share still joins it, and plan says so."""
     _, stubs = clients
     stub_attached_share(stubs, attached="3", default="3")
     stub_version(stubs, "3", BROADER)
     result = discover_with(clients, deployed={group().key: {KIND: kept("2")}})
-    assert not result.groups
-    logical = group().logical_id
-    assert f"Attached permission differs from the version its existing temporary share {logical} " \
-           "keeps and requires approval" in result.blocked[0]
-    assert f"{PERMISSION} v3->v2 (grants less: " in result.blocked[0]
+    assert not result.blocked
+    g, = result.groups
+    assert g.permission_snapshots == {KIND: kept("2")}
     change, = result.permission_changes
     assert (change["from_version"], change["to_version"]) == ("3", "2")
     assert change["to_policy_sha256"] == policy_sha256(POLICY)
-    assert change["applies_to"] == f"existing temporary share {logical} (keeps version 2)"
-    # The bound approval admits it onto the existing share, which keeps v2.
-    stub_attached_share(stubs, attached="3", default="3")
-    stub_version(stubs, "3", BROADER)
-    granted = approval(changes=[change])
-    approved = discover_with(clients, deployed={group().key: {KIND: kept("2")}}, approvals=[granted])
-    g, = approved.groups
-    assert g.permission_snapshots == {KIND: kept("2")}
-    row, = g.permission_changes
-    assert (row["approval_id"], row["from_version"], row["to_version"]) == (
-        granted["approval_id"], "3", "2")
+    assert change["applies_to"] == f"existing temporary share {g.logical_id} (keeps version 2)"
+    assert grants_less(change["difference"]) == ["Allow route53resolver:DisassociateResolverRule"]
 
 
 def existing_stack(stubs, groups):
@@ -2166,8 +2122,8 @@ def existing_stack(stubs, groups):
 
 
 def test_preflight_checks_an_existing_share_against_its_kept_version_not_the_default(clients):
-    """Finding 3: prepare no longer reports 'changed since plan approval' for a deployed
-    share whose version is no longer the default; it rereads that version instead."""
+    """Finding 3: prepare never reports a changed default permission for a deployed share
+    whose version is no longer the default; it rereads that version instead."""
     cs, stubs = clients
     g = group(approved=True)              # the deployed snapshot is v2
     existing_stack(stubs, [g])
@@ -2180,45 +2136,6 @@ def test_preflight_checks_an_existing_share_against_its_kept_version_not_the_def
     with pytest.raises(MigrationError, match=r"permission evidence differs from existing "
                                              r"temporary share .*keeps version 2"):
         Stacks(OfflineRouter(cs), MIGRATION).prepare(OWNER, REGION, [stale], fresh=True)
-
-
-def existing_change():
-    prior = {"Arn": PERMISSION, "Version": "3", "ResourceType": KIND,
-             "Policy": policy_semantics(BROADER), "DefaultVersion": True}
-    change = permission_change(OWNER, REGION, SOURCE, prior, kept("2"))
-    return {**{k: change[k] for k in (
-        "share", "permission_arn", "resource_type", "from_version", "to_version",
-        "from_policy_sha256", "to_policy_sha256")}, "approval_id": "pc-existing"}
-
-
-def stub_existing_revalidation(stubs, attached="3", kept_policy=None):
-    stubs["ram"].add_response("list_resource_share_permissions", {"permissions": [{
-        "arn": PERMISSION, "version": attached, "resourceType": KIND, "defaultVersion": True}]},
-        {"resourceShareArn": SOURCE})
-    if attached != "3":
-        return
-    stub_version(stubs, "3", BROADER)
-    stub_version(stubs, "2", kept_policy or POLICY)
-
-
-def test_revalidation_of_a_change_onto_an_existing_share_reads_its_kept_version(clients):
-    cs, stubs = clients
-    stub_existing_revalidation(stubs)     # the current default is not read at all
-    revalidate_change(Api(cs["ram"]), existing_change(), existing=kept("2"))
-
-
-@pytest.mark.parametrize("drift,message", [
-    ({"attached": "4"}, "attached permission version changed since approval pc-existing"),
-    ({"kept_policy": BROADER}, "permission changed since approval pc-existing"),
-    ({"existing": "3"}, "permission changed since approval pc-existing"),
-])
-def test_revalidation_onto_an_existing_share_voids_the_approval_on_any_drift(clients, drift, message):
-    cs, stubs = clients
-    existing = kept(drift.pop("existing", "2"))
-    stub_existing_revalidation(stubs, **drift)
-    with pytest.raises(MigrationError, match=message) as raised:
-        revalidate_change(Api(cs["ram"]), existing_change(), existing=existing)
-    assert "re-run plan --record, review it and approve any request it shows" in str(raised.value)
 
 
 @pytest.mark.parametrize("live,configured", [
@@ -2240,34 +2157,3 @@ def test_a_principal_map_override_never_hides_a_migrating_owners_stationary_cons
     assert f"migrating owner {OWNER} shares with stationary consumers ['{OTHER}']" in reason
     assert "a principal-map override does not remove the share's live or owning-template " \
            "principals from this check" in reason
-
-
-def test_change_evidence_must_end_at_the_recorded_snapshot_and_be_a_real_change():
-    """Finding 6: ToPolicySha256 is checked against the permission snapshot."""
-    g = approved_group(approval())
-    template = template_for([g], MIGRATION)
-    _validate_template(template, MIGRATION)
-    for key, value in (("ToPolicySha256", "f" * 64), ("FromVersion", "2")):
-        tampered = copy.deepcopy(template)
-        tampered["Resources"][g.logical_id]["Metadata"]["PermissionChanges"][0][key] = value
-        with pytest.raises(MigrationError, match="permission-change approval metadata"):
-            _validate_template(tampered, MIGRATION)
-
-
-def test_a_later_change_of_the_same_share_is_recorded_beside_the_first():
-    """An original that moves to another version after its temporary share exists needs a
-    second, separately approved change; the first stays as evidence."""
-    first = approved_group(approval())
-    old = template_for([first], MIGRATION)
-    later = copy.deepcopy(first)
-    later.permission_changes = [dict(first.permission_changes[0], from_version="3",
-                                     from_policy_sha256="e" * 64, approval_id="pc-later")]
-    merged = additive_template(old, template_for([later], MIGRATION), MIGRATION)
-    rows = merged["Resources"][first.logical_id]["Metadata"]["PermissionChanges"]
-    assert [(row["FromVersion"], row["ApprovalId"]) for row in rows] == [
-        ("1", first.permission_changes[0]["approval_id"]), ("3", "pc-later")]
-    _validate_template(merged, MIGRATION)
-    duplicate = copy.deepcopy(merged)
-    duplicate["Resources"][first.logical_id]["Metadata"]["PermissionChanges"].append(rows[0])
-    with pytest.raises(MigrationError, match="duplicate permission-change approval metadata"):
-        _validate_template(duplicate, MIGRATION)

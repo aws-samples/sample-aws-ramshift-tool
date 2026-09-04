@@ -98,15 +98,6 @@ class Group:
         return "Share" + self.key
 
 
-def change_key(change: dict) -> tuple[str, str, str, str]:
-    """Identity of one approved permission change in a group and in stack metadata.
-
-    A source share can need more than one change over a migration's life (an
-    original share moved to another version after its temporary share was
-    created), so both versions are part of the identity."""
-    return (change["share"], change["permission_arn"], change["from_version"], change["to_version"])
-
-
 @dataclass
 class Plan:
     migration: str
@@ -114,8 +105,10 @@ class Plan:
     blocked: list[str] = field(default_factory=list)
     excluded: list[str] = field(default_factory=list)
     existing: list[dict] = field(default_factory=list)
-    # Per-share managed-permission differences (original attached version ->
-    # the version the temporary share attaches), whether or not an approval covers them.
+    # Per-share managed-permission differences of planned source shares: the version the
+    # original attaches -> the version its temporary share attaches (the current default,
+    # or the one an existing temporary share keeps). Information only: a difference never
+    # blocks and needs no approval.
     permission_changes: list[dict] = field(default_factory=list)
     # Informational findings that neither block nor exclude anything, for example a
     # newer default permission version that an existing temporary share does not attach.
@@ -134,11 +127,6 @@ class Plan:
                 prior = grouped[group.key]
                 prior.resources.update(group.resources)
                 prior.source_shares = sorted(set(prior.source_shares + group.source_shares))
-                if hasattr(prior, "permission_changes") or hasattr(group, "permission_changes"):
-                    merged = {change_key(c): c for c in
-                              getattr(prior, "permission_changes", [])
-                              + getattr(group, "permission_changes", [])}
-                    prior.permission_changes = [merged[k] for k in sorted(merged)]
             else:
                 self.groups.append(group)
                 grouped[group.key] = group

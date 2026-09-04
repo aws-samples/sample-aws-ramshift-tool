@@ -20,7 +20,6 @@ from ram_migration_common import (
     ACCOUNT, Group, MigrationError, Plan, Router, account_id, error_text,
     managed, pages, tags,
 )
-from ram_migration_record import approval_for
 
 CATALOG = "https://docs.aws.amazon.com/ram/latest/userguide/shareable.md"
 ACCOUNT_ROOT = re.compile(r"^arn:([a-z0-9-]+):iam::([0-9]{12}):root$")
@@ -116,8 +115,8 @@ class LookupCache:
 
     Keys name the account and Region of the read. Concurrent callers of one key
     share a single read, failures are never kept, and every caller receives its
-    own copy. Planning reads through it; revalidation, the post-confirmation
-    recheck and every write path read fresh by not passing it.
+    own copy. Planning reads through it; the post-confirmation recheck and every
+    write path read fresh by not passing it.
     """
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -211,11 +210,9 @@ def feature_set_problem(owner: str, region: str, arn: str, feature: Any) -> str:
 
 @dataclass
 class ApprovedGroup(Group):
-    """Compatible Group carrying the policy and source-stack approval evidence."""
+    """Compatible Group carrying the reviewed permission policies and source stacks."""
     permission_snapshots: dict[str, dict] = field(default_factory=dict)
     source_stacks: list[str] = field(default_factory=list)
-    # Approved original-version -> current-default changes, one per source share.
-    permission_changes: list[dict] = field(default_factory=list)
 
 
 def policy_semantics(policy: str | dict) -> Any:
@@ -663,28 +660,18 @@ def policy_difference(before: Any, after: Any) -> dict:
     return result
 
 
-def permission_change(owner: str, region: str, share: str, prior: dict, default: dict) -> dict:
-    """One original share's attached version -> the current default AWS attaches."""
+def permission_change(owner: str, region: str, share: str, prior: dict, target: dict) -> dict:
+    """One original share's attached version -> the version its temporary share attaches:
+    the current default, or the version an existing temporary share keeps."""
     return {
         "owner": owner, "region": region, "share": share,
-        "permission_arn": default["Arn"], "resource_type": default["ResourceType"],
-        "from_version": prior["Version"], "to_version": default["Version"],
+        "permission_arn": target["Arn"], "resource_type": target["ResourceType"],
+        "from_version": prior["Version"], "to_version": target["Version"],
         "from_policy_sha256": policy_sha256(prior["Policy"]),
-        "to_policy_sha256": policy_sha256(default["Policy"]),
-        "from_policy": prior["Policy"], "to_policy": default["Policy"],
-        "difference": policy_difference(prior["Policy"], default["Policy"]),
+        "to_policy_sha256": policy_sha256(target["Policy"]),
+        "from_policy": prior["Policy"], "to_policy": target["Policy"],
+        "difference": policy_difference(prior["Policy"], target["Policy"]),
     }
-
-
-APPROVED_CHANGE_FIELDS = ("share", "permission_arn", "resource_type", "from_version",
-                          "to_version", "from_policy_sha256", "to_policy_sha256", "approval_id")
-
-
-def approved_change(change: dict) -> dict:
-    """Compact, template-safe evidence of an approved change."""
-    if change.get("status") != "APPROVED" or not change.get("approval_id"):
-        raise MigrationError("Only approved permission changes can join an entitlement group")
-    return {key: change[key] for key in APPROVED_CHANGE_FIELDS}
 
 
 def describe_difference(difference: dict) -> list[str]:
@@ -702,9 +689,9 @@ def describe_difference(difference: dict) -> list[str]:
               for value in difference.get(f"{facet}_{verb}", [])]
     access = difference.get("access")
     if not isinstance(access, list) or not all(isinstance(e, dict) for e in access):
-        # Recorded without the statement-level analysis: bindings are unknown.
+        # Made without the statement-level analysis: bindings are unknown.
         return ["grants more: not ruled out; this comparison has no statement-level "
-                "analysis, re-run plan --record before approving", *facets]
+                "analysis, re-run plan --record", *facets]
     lines = [_access_summary(access)]
     lines += [_access_line(e) for e in access if e.get("status") != "UNCHANGED"]
     unchanged = [_access_label(e) for e in access if e.get("status") == "UNCHANGED"]
@@ -716,6 +703,16 @@ def describe_difference(difference: dict) -> list[str]:
         lines.append("statements differ only in structure; every action keeps the same "
                      "resources and conditions")
     return lines
+
+
+def grants_less(difference: dict) -> list[str]:
+    """What the later policy of a comparison grants less than the earlier one: the labels
+    of describe_difference's 'grants less:' (NARROWED entries, and CHANGED ones, which also
+    grant more). A comparison without the statement-level analysis cannot rule it out."""
+    access = difference.get("access")
+    if not isinstance(access, list) or not all(isinstance(e, dict) for e in access):
+        return ["not ruled out without the statement-level analysis"]
+    return [_access_label(e) for e in access if e.get("status") in ("NARROWED", "CHANGED")]
 
 
 def permission_snapshot(ram: Any, arn: str, version: str | None = None) -> dict:
@@ -746,40 +743,6 @@ def cached_permission(cache: LookupCache | None, account: str, region: str, ram:
                       arn: str, version: str | None = None) -> dict:
     return lookup(cache, ("permission", account, region, arn, version),
                   lambda: permission_snapshot(ram, arn, version))
-
-
-RENEW_APPROVAL = "re-run plan --record, review it and approve any request it shows"
-
-
-def revalidate_change(ram: Any, change: dict, existing: dict | None = None) -> None:
-    """Re-read both sides of an approved change that this apply is about to write.
-
-    The original share must still attach the approved version. The other side is
-    what the temporary share attaches: for a new share the current default, which
-    must still be the approved version with the approved policy; for a share
-    already in the migration stack (``existing``, its recorded permission snapshot)
-    the version it keeps. Any drift voids the approval and a renewed approval is
-    required. Never cached. A change already recorded in the migration stack is
-    history and is not revalidated: its share already attaches the approved version.
-    """
-    attached = [p for p in pages(ram, "list_resource_share_permissions", "permissions",
-                                 resourceShareArn=change["share"])
-                if p.get("arn") == change["permission_arn"]]
-    if len(attached) != 1 or attached[0].get("version") != change["from_version"]:
-        raise MigrationError(f"{change['share']}: attached permission version changed since "
-                             f"approval {change['approval_id']}; {RENEW_APPROVAL}")
-    prior = permission_snapshot(ram, change["permission_arn"], change["from_version"])
-    if existing is None:
-        target = permission_snapshot(ram, change["permission_arn"])
-        current = target["DefaultVersion"] and target["Version"] == change["to_version"]
-    else:
-        target = permission_snapshot(ram, change["permission_arn"], change["to_version"])
-        current = existing.get("Version") == change["to_version"] and \
-            policy_sha256(existing["Policy"]) == change["to_policy_sha256"]
-    if not current or policy_sha256(prior["Policy"]) != change["from_policy_sha256"] or \
-            policy_sha256(target["Policy"]) != change["to_policy_sha256"]:
-        raise MigrationError(f"{change['permission_arn']}: permission changed since approval "
-                             f"{change['approval_id']}; {RENEW_APPROVAL}")
 
 
 def resolve(value: Any, parameters: dict, template: dict, pseudo: dict) -> Any:
@@ -859,7 +822,6 @@ def flatten(value: Any) -> list[str]:
 class Discovery:
     def __init__(self, router: Router, consumers: set[str], migration: str,
                  overrides: dict, capabilities: dict[str, bool],
-                 approved_changes: list[dict] | None = None,
                  migrating_owners: set[str] | None = None,
                  share_workers: int = 1, cache: LookupCache | None = None,
                  deployed: dict[str, dict[str, dict]] | None = None):
@@ -869,8 +831,6 @@ class Discovery:
             raise MigrationError("share_workers must be an integer between 1 and 16")
         self.router, self.consumers, self.migration = router, consumers, migration
         self.overrides, self.capabilities = overrides, capabilities
-        # Approvals come only from this migration's record; see ram_migration_record.
-        self.approved_changes = list(approved_changes or [])
         self.migrating_owners = set(migrating_owners or ())
         self.share_workers, self.cache = share_workers, cache
         # Entitlement key -> {resource type: permission snapshot} of each temporary share
@@ -1065,7 +1025,6 @@ class Discovery:
                group: ApprovedGroup | None) -> None:
         plan.excluded.extend(part.excluded)
         plan.existing.extend(part.existing)
-        plan.permission_changes.extend(part.permission_changes)
         plan.blocked.extend(part.blocked)
         plan.notes.extend(part.notes)
         plan.external_access.extend(part.external_access)
@@ -1075,13 +1034,14 @@ class Discovery:
             prior_group = next((g for g in plan.groups if g.key == group.key), None)
             if prior_group is not None:
                 if prior_group.permission_snapshots != group.permission_snapshots:
-                    raise MigrationError("Permission approval changed during discovery")
+                    raise MigrationError("Permission snapshot changed during discovery")
                 prior_group.source_stacks = sorted(set(prior_group.source_stacks
                                                        + group.source_stacks))
                 if any(a in prior_group.resources and prior_group.resources[a] != k
                        for a, k in group.resources.items()):
                     raise MigrationError("Conflicting RAM types for the same source resource")
             plan.merge(Plan(self.migration, groups=[group]))
+            plan.permission_changes.extend(part.permission_changes)
         except Exception as exc:
             plan.blocked.append(share_blocker(owner, region, arn, exc))
 
@@ -1251,9 +1211,10 @@ class Discovery:
                     raise MigrationError(f"{kind}: attached managed permission version missing")
                 permission_map[kind] = permission["arn"]
                 attached[kind] = permission, default
-            # A new temporary share receives the current default version. A temporary
-            # share already in the migration stack keeps the version it was created with,
-            # so a source share that joins it is compared with that version.
+            # A new temporary share receives the current default version: AWS attaches
+            # nothing else, so an older version is never pinned. A temporary share already
+            # in the migration stack keeps the version it was created with, so a source
+            # share that joins it is compared with that version.
             candidate = Group(owner, region, tuple(sorted(consumers)), permission_map)
             existing, logical = self.deployed.get(candidate.key), candidate.logical_id
             snapshots: dict[str, dict] = {}
@@ -1274,38 +1235,23 @@ class Discovery:
                             f"version {target['Version']}; the current default is version "
                             f"{default['Version']} and the original share attaches version "
                             f"{permission['version']}. Nothing this tool writes attaches the new "
-                            "default to that share, so the default change needs no approval")
+                            "default to that share, so the default change does not affect it")
                 if target["Version"] != permission["version"]:
                     prior = cached_permission(self.cache, owner, region, ram, permission["arn"],
                                               permission["version"])
                     if prior["ResourceType"] != kind:
                         raise MigrationError(f"Non-default permission type differs: {permission['arn']}")
                     if prior["Policy"] != policy_semantics(target["Policy"]):
-                        # The temporary share cannot reproduce the original grant. Never
-                        # pin or bypass: the difference needs an approval bound to this
-                        # exact change.
+                        # The temporary share grants what its own version grants, which can be
+                        # more or less than the original's. The difference is reported for the
+                        # reviewer and never blocks or needs approval: the share is temporary.
                         change = permission_change(owner, region, arn, prior, target)
                         change["applies_to"] = (
                             f"existing temporary share {logical} (keeps version {target['Version']})"
                             if existing is not None else
                             "new temporary share (receives the current default)")
-                        approval = approval_for(self.approved_changes, self.migration, change)
-                        change["status"] = "APPROVED" if approval else "APPROVAL_REQUIRED"
-                        if approval:
-                            change["approval_id"] = approval["approval_id"]
                         changes.append(change)
                 snapshots[kind] = target
-            part.permission_changes.extend(changes)
-            pending = [c for c in changes if c["status"] == "APPROVAL_REQUIRED"]
-            if pending:
-                reason = (f"Attached permission differs from the version its existing temporary "
-                          f"share {logical} keeps" if existing is not None else
-                          "Non-default permission differs from the current default")
-                raise MigrationError(
-                    f"{reason} and requires approval: " + "; ".join(
-                        f"{c['permission_arn']} v{c['from_version']}->v{c['to_version']} "
-                        f"({', '.join(describe_difference(c['difference']))})" for c in pending)
-                    + ". Record this plan with --record, review it, then run approve")
             available: dict[str, str] = {}
             for resource in resources:
                 resource_arn, kind = resource["arn"], resource["type"]
@@ -1324,8 +1270,9 @@ class Discovery:
             if set(permission_map) != kinds:
                 raise MigrationError("Source permissions do not exactly match its resource types")
             group = ApprovedGroup(owner, region, tuple(sorted(consumers)),
-                                  permission_map, available, [arn], snapshots, source_stacks,
-                                  permission_changes=[approved_change(c) for c in changes])
+                                  permission_map, available, [arn], snapshots, source_stacks)
+            # Only a share that is planned reports its difference.
+            part.permission_changes.extend(changes)
             return part, group
         except Exception as exc:
             part.blocked.append(share_blocker(owner, region, arn, exc))

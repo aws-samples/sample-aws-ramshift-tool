@@ -70,7 +70,7 @@ def expired(operation: str) -> ClientError:
 def estate() -> dict[str, dict]:
     """Nine source shares: one four-share group from one owning stack, a two-consumer
     pool, an empty share, a service-only share, an unsupported type and a share
-    whose attached permission version needs approval."""
+    whose attached permission version differs from the default, which joins the group."""
     shares = {share_arn(i): {"resources": {rule(i): RESOLVER}, "principals": [CONSUMER],
                              "permission": (RULE_PERMISSION, "2"), "stack": f"Share{i}"}
               for i in range(1, 5)}
@@ -218,14 +218,16 @@ def test_concurrent_discovery_is_deterministic_for_any_listing_or_completion_ord
     assert plan_digest(sequential.groups, SCOPE) == plan_digest(forward.groups, SCOPE) == \
         plan_digest(backward.groups, SCOPE)
     rules, pool = sorted(sequential.groups, key=lambda g: len(g.consumers))
-    assert list(rules.resources) == [rule(i) for i in range(1, 5)]  # merged in share-ARN order
-    assert rules.source_shares == arns[:4] and rules.source_stacks == [ORIGINAL_STACK]
+    # Merged in share-ARN order; share 9's v1 -> v2 difference never keeps it out.
+    assert list(rules.resources) == [rule(i) for i in (1, 2, 3, 4, 9)]
+    assert rules.source_shares == arns[:4] + [share_arn(9)]
+    assert rules.source_stacks == [ORIGINAL_STACK]
     assert pool.consumers == (CONSUMER, OTHER_CONSUMER)
     assert sequential.excluded == [f"{share_arn(6)}: empty share",
                                    f"{share_arn(7)}: service-principal-only share"]
-    assert [reason.split(": ")[0] for reason in sequential.blocked] == [share_arn(8), share_arn(9)]
+    assert [reason.split(": ")[0] for reason in sequential.blocked] == [share_arn(8)]
     change, = sequential.permission_changes
-    assert (change["share"], change["status"]) == (share_arn(9), "APPROVAL_REQUIRED")
+    assert (change["share"], change["from_version"], change["to_version"]) == (share_arn(9), "1", "2")
 
 
 def test_share_level_concurrency_is_bounded_by_share_workers():
@@ -356,7 +358,7 @@ def test_throttled_or_expired_share_reads_are_named_blockers_for_that_share_only
     assert f"(request request-{code})" in reason
     assert cli.blocker_category(reason) == category
     rules = next(g for g in plan.groups if RESOLVER in g.permissions)
-    assert set(rules.resources) == {rule(1), rule(2), rule(4)}  # other shares still planned
+    assert set(rules.resources) == {rule(1), rule(2), rule(4), rule(9)}  # other shares still planned
 
 
 # ---------------------------------------------------------------------------
@@ -377,9 +379,9 @@ def receive_many(h, receiver: str, owner: str, suffix: str, resources: list[tupl
 
 
 def large_estate_example(h) -> list[str]:
-    """Two permission-change shares from the stationary owner, a proposed owner seen
-    66 times, one seen 12 times through IPAM pools, and 26 receipts of the
-    stationary owner itself, which are not migration dependencies."""
+    """Two shares from the stationary owner whose permission versions differ from the
+    default, a proposed owner seen 66 times, one seen 12 times through IPAM pools, and 26
+    receipts of the stationary owner itself, which are not migration dependencies."""
     groups, changes = [], []
     for index in (1, 2):
         share = f"arn:aws:ram:{REGION}:{OWNER}:resource-share/tgw-{index}"
@@ -416,24 +418,22 @@ def test_blocker_summary_for_the_large_estate_example(harness, capsys, migration
     argv = args(consumers=f"{CONSUMER},{OTHER_CONSUMER}")
     assert main(with_record(argv, migration_record) if recorded else argv) == 1
     output = capsys.readouterr().out
-    header, permissions, owners = lines = summary_lines(output)
-    assert output.splitlines()[-3:] == lines  # the last thing a blocked run prints
-    assert header == "phase=blocker-summary status=BLOCKED blockers=4 categories=2"
-    assert permissions.startswith("phase=blocker-summary category=permission-approval-required "
-                                  "blockers=2 shares=2 approvals=1 next_action=")
+    header, owners = lines = summary_lines(output)
+    assert output.splitlines()[-2:] == lines  # the last thing a blocked run prints
+    assert header == "phase=blocker-summary status=BLOCKED blockers=2 categories=1"
     assert owners.startswith("phase=blocker-summary category=owner-outside-approved-scope "
                              "blockers=2 owners=2 shares=4 resources=45 observations=78 "
                              "next_action=")
+    # The two shares' permission differences are information, never blockers.
+    info, = [line for line in output.splitlines() if line.startswith("phase=permission-change ")]
+    assert info.startswith("phase=permission-change status=INFO ") and info.endswith(" shares=2")
     assert "APPROVE-OWNERS" in owners and "--profile-map or --role-map" in owners
     assert ("phase=plan record=" in output) == recorded
     if recorded:
-        assert "next_action=review each managed-permission comparison, run approve with the " \
-               "same --record" in permissions
         assert "next_action=run approve with the same --record and type the APPROVE-OWNERS" in owners
     else:  # no record holds the requests yet: record the plan first
-        for line in (permissions, owners):
-            assert "next_action=re-run plan with --record <path> to record the" in line
-            assert "the same --record" not in line
+        assert "next_action=re-run plan with --record <path> to record the" in owners
+        assert "the same --record" not in owners
     assert "provides 33 unique received resources" in output and "(66 observations)" in output
     assert "provides 12 unique received resources (ec2:IpamPool x12)" in output
     # The stationary owner's own receipts are not dependencies at all.
@@ -447,25 +447,23 @@ CAPABILITY = (f"{SUMMARY_SHARE}-8: owner={OWNER} region={REGION} {UNLISTED}: uns
               "unverified external-sharing capability")
 PRINCIPAL_MAP = (f"{SUMMARY_SHARE}: owner={OWNER} region={REGION} Original account-facing "
                  "consumers are unresolved; provide a principal-map override")
-REVALIDATION_DENIED = (f"{OWNER}/{REGION}: post-confirmation permission revalidation "
-                       "operation=ListResourceSharePermissions AccessDeniedException: denied "
-                       "(request r5)")
-REVALIDATION_THROTTLED = (f"{OWNER}/{REGION}: post-confirmation permission revalidation "
-                          "operation=GetPermission ThrottlingException: Rate exceeded (request r6)")
-REVALIDATION_DRIFT = (f"{OWNER}/{REGION}: post-confirmation permission revalidation "
-                      f"{RULE_PERMISSION}: permission changed since approval a-1; re-run plan "
-                      "and approve again")
+RECHECK_DENIED = (f"{OWNER}/{REGION}: post-confirmation preflight operation=GetPermission "
+                  "AccessDeniedException: denied (request r5)")
+RECHECK_THROTTLED = (f"{OWNER}/{REGION}: post-confirmation preflight operation=GetPermission "
+                     "ThrottlingException: Rate exceeded (request r6)")
+DEFAULT_DRIFT = (f"{OWNER}/{REGION}: post-confirmation preflight {RULE_PERMISSION}: the default "
+                 "managed permission changed since discovery read it")
 BASELINE_LOSS = (f"phase=baseline status=BLOCKED original missing: resolver_association|"
                  f"{CONSUMER}|{REGION}|a-1; {cli.RECORDED_LOSS}")
 BASELINE_MOVED = (f"phase=baseline status=BLOCKED original state changed during confirmation "
                   f"(missing): resolver_association|{CONSUMER}|{REGION}|a-1")
 
 
-def test_categories_put_api_failures_before_approval_and_configuration_needs():
+def test_categories_put_api_failures_before_configuration_needs():
     assert cli.blocker_category(CAPABILITY) == cli.blocker_category(PRINCIPAL_MAP) == "configuration"
-    assert cli.blocker_category(REVALIDATION_DENIED) == "discovery-api-error"
-    assert cli.blocker_category(REVALIDATION_THROTTLED) == "discovery-api-error"
-    assert cli.blocker_category(REVALIDATION_DRIFT) == "permission-approval-required"
+    assert cli.blocker_category(RECHECK_DENIED) == "discovery-api-error"
+    assert cli.blocker_category(RECHECK_THROTTLED) == "discovery-api-error"
+    assert cli.blocker_category(DEFAULT_DRIFT) == "other"  # a re-run reads the new default
     assert cli.blocker_category(BASELINE_LOSS) == "baseline-loss"
     assert cli.blocker_category(BASELINE_MOVED) == "baseline-capture"  # nothing recorded yet
     restricted = (f"{SUMMARY_SHARE}: owner={OWNER} region={REGION} Unsupported account-level "
@@ -492,19 +490,18 @@ def test_blocker_summary_groups_every_category_with_counts_and_next_actions(caps
         PRINCIPAL_MAP, CAPABILITY,
         f"{share}-3: owner={OWNER} region={REGION} operation=ListResources ThrottlingException: "
         "Rate exceeded (request r4)",
-        REVALIDATION_DENIED, REVALIDATION_DRIFT, BASELINE_LOSS,
+        RECHECK_DENIED, DEFAULT_DRIFT, BASELINE_LOSS,
         f"phase=baseline status=BLOCKED kind=resolver_association consumer={CONSUMER}: not COMPLETE",
         "phase=reviewed-record tool sources changed since the reviewed plan",
         f"{OWNER}/{REGION}: migration template exceeds inline CFN limit",
     ])
     cli.report_blockers(plan, cli.Reporter(), "BLOCKED", mode="plan", recorded=True)
     lines = summary_lines(capsys.readouterr().out)
-    assert lines[0] == "phase=blocker-summary status=BLOCKED blockers=15 categories=10"
+    assert lines[0] == "phase=blocker-summary status=BLOCKED blockers=15 categories=9"
     found = {re.search(r"category=(\S+)", line)[1]: line for line in lines[1:]}
-    assert list(found) == ["permission-approval-required", "received-dependency-not-covered",
-                           "configuration", "authentication", "region-scope",
-                           "discovery-api-error", "baseline-loss", "baseline-capture",
-                           "reviewed-record-mismatch", "other"]
+    assert list(found) == ["received-dependency-not-covered", "configuration", "authentication",
+                           "region-scope", "discovery-api-error", "baseline-loss",
+                           "baseline-capture", "reviewed-record-mismatch", "other"]
     # One migrating account at risk, from three owners: consumers and owners are separate.
     assert "blockers=3 shares=3 resources=3 consumers=1 owners=3 next_action=" in \
         found["received-dependency-not-covered"]
@@ -513,7 +510,7 @@ def test_blocker_summary_groups_every_category_with_counts_and_next_actions(caps
     assert "blockers=2 shares=2 owners=1 next_action=" in found["configuration"]
     assert "--principal-map" in found["configuration"] and "--capabilities" in found["configuration"]
     assert "blockers=2 shares=1 owners=1 next_action=" in found["discovery-api-error"]
-    assert "blockers=1 next_action=" in found["permission-approval-required"]
+    assert "blockers=2 next_action=" in found["other"]
     assert "permanent failure drop" in found["baseline-loss"]
     assert "new migration record" in found["baseline-loss"] and \
         "re-run apply" not in found["baseline-loss"]
@@ -542,7 +539,7 @@ def test_every_next_action_follows_the_run_mode_and_the_record(category):
     assert "approve with the same --record" not in unrecorded
     if category in RERUNS_APPLY:
         assert "re-run apply with the same --record" in apply
-    if category in ("permission-approval-required", "owner-outside-approved-scope"):
+    if category == "owner-outside-approved-scope":
         assert "with --record <path>" in unrecorded and "the same --record" in plan
     if category == "baseline-loss":
         assert all("new migration record" in text for text in (plan, apply, verify))
