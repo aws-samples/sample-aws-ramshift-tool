@@ -751,6 +751,7 @@ def test_retired_consumers_need_every_serving_share_retired():
         "retirements": [{"share_arn": "arn:a", "consumer": "111111111111"},
                         {"share_arn": "arn:a", "consumer": "222222222222"}]}
     assert rec.retired_consumers(record) == {"222222222222"}
+    assert rec.retired_pairs(record) == {("arn:a", "111111111111"), ("arn:a", "222222222222")}
     record["retirements"].append({"share_arn": "arn:b", "consumer": "111111111111"})
     assert rec.retired_consumers(record) == {"111111111111", "222222222222"}
     assert rec.retired_consumers({}) == set()

@@ -603,6 +603,24 @@ class Stacks:
         return result.shares
 
 
+def _current_share(ram, arn: str) -> dict | None:
+    """The owner's share ``arn`` as RAM returns it now, or None when RAM returns none."""
+    rows = pages(ram, "get_resource_shares", "resourceShares", resourceOwner="SELF",
+                 resourceShareArns=[arn])
+    if len(rows) > 1 or any(row.get("resourceShareArn") != arn for row in rows):
+        raise MigrationError(f"{arn}: ambiguous share readback")
+    return rows[0] if rows else None
+
+
+def _temporary_share(share: dict, owner: str, migration: str) -> bool:
+    """Owned by ``owner``, tagged with this migration, that owner and an entitlement hash,
+    and named by this tool: the only shares complete deletes or removes principals from."""
+    values = tags(share.get("tags", []))
+    return share.get("owningAccountId") == owner and managed(share.get("tags", []), migration) \
+        and values.get("owneraccount") == owner and bool(values.get("entitlementhash")) \
+        and str(share.get("name", "")).startswith(PURPOSE + "-")
+
+
 def delete_share(router: Router, owner: str, region: str, arn: str, migration: str,
                  timeout: float = 600, interval: float = 3) -> None:
     """Delete one verified temporary migration share; never an original share."""
@@ -611,26 +629,16 @@ def delete_share(router: Router, owner: str, region: str, arn: str, migration: s
     if arn.split(":")[2:4] != ["ram", region]:
         raise MigrationError(f"{arn}: temporary share ARN belongs to another service/Region")
     ram = router.client(owner, "ram", region, write=True)
-
-    def current() -> dict | None:
-        rows = pages(ram, "get_resource_shares", "resourceShares", resourceOwner="SELF",
-                     resourceShareArns=[arn])
-        if len(rows) > 1 or any(row.get("resourceShareArn") != arn for row in rows):
-            raise MigrationError(f"{arn}: ambiguous share readback")
-        return rows[0] if rows else None
-    share = current()
+    share = _current_share(ram, arn)
     if share is None or share.get("status") == "DELETED":
         return
-    values = tags(share.get("tags", []))
-    if share.get("owningAccountId") != owner or not managed(share.get("tags", []), migration) or \
-            values.get("owneraccount") != owner or not values.get("entitlementhash") or \
-            not str(share.get("name", "")).startswith(PURPOSE + "-"):
+    if not _temporary_share(share, owner, migration):
         raise MigrationError(f"{arn}: refusing to delete a share that is not this migration's "
                              "temporary share")
     ram.delete_resource_share(resourceShareArn=arn)
     deadline = time.monotonic() + timeout
     while True:
-        share = current()
+        share = _current_share(ram, arn)
         if share is None or share.get("status") == "DELETED":
             return
         if share.get("status") not in ("ACTIVE", "DELETING"):
@@ -638,6 +646,82 @@ def delete_share(router: Router, owner: str, region: str, arn: str, migration: s
         if time.monotonic() >= deadline:
             raise MigrationError(f"{arn}: deletion did not finish before the timeout")
         time.sleep(interval)
+
+
+def remove_principals(router: Router, owner: str, region: str, arn: str, migration: str,
+                      consumers: list[str] | tuple[str, ...], timeout: float = 600,
+                      interval: float = 3) -> None:
+    """Disassociate these consumer principals from one ACTIVE temporary share of this
+    migration, which keeps every resource and every other principal; never an original
+    share. A principal already DISASSOCIATED, or never associated, needs nothing; one
+    DISASSOCIATING is waited for, not disassociated again."""
+    account_id(owner)
+    targets = sorted({account_id(consumer) for consumer in consumers})
+    _owner_arn(arn, owner)
+    if arn.split(":")[2:4] != ["ram", region]:
+        raise MigrationError(f"{arn}: temporary share ARN belongs to another service/Region")
+    if not targets or owner in targets:
+        raise MigrationError(f"{arn}: principal removal names consumer accounts, never the owner")
+    ram = router.client(owner, "ram", region, write=True)
+    share = _current_share(ram, arn)
+    if share is None or not _temporary_share(share, owner, migration):
+        raise MigrationError(f"{arn}: refusing to remove principals from a share that is not "
+                             "this migration's temporary share")
+    if share.get("status") != "ACTIVE":
+        raise MigrationError(f"{arn}: temporary share is {share.get('status')}; principals are "
+                             "removed only from an ACTIVE share")
+
+    def associated() -> dict[str, str]:
+        """Each target's principal association status, unless DISASSOCIATED or absent."""
+        found: dict[str, str] = {}
+        for row in pages(ram, "get_resource_share_associations", "resourceShareAssociations",
+                         associationType="PRINCIPAL", resourceShareArns=[arn]):
+            if row.get("resourceShareArn") != arn or row.get("associationType") != "PRINCIPAL":
+                raise MigrationError(f"{arn}: association belongs to a different share/type")
+            entity = row.get("associatedEntity")
+            if entity not in targets or row.get("status") == "DISASSOCIATED":
+                continue
+            if entity in found:
+                raise MigrationError(f"{arn}: ambiguous duplicate principal associations")
+            found[entity] = row.get("status")
+        return found
+    pending = associated()
+    if not pending:
+        return
+    request = sorted(entity for entity, status in pending.items() if status != "DISASSOCIATING")
+    if request:
+        ram.disassociate_resource_share(resourceShareArn=arn, principals=request)
+    deadline = time.monotonic() + timeout
+    while True:
+        pending = associated()
+        if not pending:
+            return
+        if "FAILED" in pending.values():
+            raise MigrationError(f"{arn}: principal disassociation failed: {pending}")
+        if time.monotonic() >= deadline:
+            raise MigrationError(f"{arn}: principal removal did not finish before the timeout: "
+                                 f"{pending}")
+        time.sleep(interval)
+
+
+def unserved_consumers(router: Router, owner: str, region: str, arn: str,
+                       consumers: list[str] | tuple[str, ...]) -> set[str]:
+    """Of ``consumers``, those temporary share ``arn`` no longer serves, through a read-only
+    client: all of them once RAM returns the share DELETED or not at all, else each whose
+    principal association is DISASSOCIATED or absent. After a failed or interrupted action,
+    complete records exactly these as retired, so its record matches what AWS holds."""
+    ram = router.client(owner, "ram", region)
+    share = _current_share(ram, arn)
+    if share is None or share.get("status") == "DELETED":
+        return set(consumers)
+    active = set()
+    for row in pages(ram, "get_resource_share_associations", "resourceShareAssociations",
+                     associationType="PRINCIPAL", resourceShareArns=[arn]):
+        if row.get("resourceShareArn") != arn or row.get("associationType") != "PRINCIPAL":
+            raise MigrationError(f"{arn}: association belongs to a different share/type")
+        if row.get("status") != "DISASSOCIATED":
+            active.add(row.get("associatedEntity"))
+    return set(consumers) - active
 
 
 def accept(router: Router, consumer: str, region: str, allowed: dict[str, str]) -> None:
@@ -705,7 +789,11 @@ def _exact_associations(rows: list[dict], expected: set[str], arn: str, kind: st
         raise MigrationError(f"{arn}: {kind.lower()} associations incomplete: {active}")
 
 
-def verify_group(router: Router, group: Group, share: dict, migration: str) -> None:
+def verify_group(router: Router, group: Group, share: dict, migration: str,
+                 retired: set[str] | frozenset[str] = frozenset()) -> None:
+    """The temporary share holds exactly the group's approved entitlements. ``retired``
+    names consumers complete removed from this share: they must no longer be its
+    principals, and only the others' visibility is checked."""
     arn = share["resourceShareArn"]
     _owner_arn(arn, group.owner)
     if arn.split(":")[2:4] != ["ram", group.region]:
@@ -752,8 +840,10 @@ def verify_group(router: Router, group: Group, share: dict, migration: str) -> N
         raise MigrationError(f"{arn}: actual resource types differ from approved entitlements")
     principals = pages(ram, "get_resource_share_associations", "resourceShareAssociations",
                        associationType="PRINCIPAL", resourceShareArns=[arn])
-    _exact_associations(principals, set(group.consumers), arn, "PRINCIPAL")
+    _exact_associations(principals, set(group.consumers) - set(retired), arn, "PRINCIPAL")
     for consumer in group.consumers:
+        if consumer in retired:
+            continue
         target = router.client(consumer, "ram", group.region)
         visible = pages(target, "list_resources", "resources", resourceOwner="OTHER-ACCOUNTS",
                         resourceShareArns=[arn])

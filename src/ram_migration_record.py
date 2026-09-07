@@ -158,12 +158,18 @@ def _drop_identity(drop: dict) -> tuple:
     return (drop.get("kind"), drop.get("consumer"), drop.get("region"), drop.get("subject"))
 
 
+def retired_pairs(record: dict) -> set[tuple[str, str]]:
+    """(share ARN, consumer) of every retirement entry: each temporary share complete has
+    retired each consumer from."""
+    return {(row.get("share_arn"), row.get("consumer")) for row in record.get("retirements") or []}
+
+
 def retired_consumers(record: dict) -> set[str]:
     """Migrating consumers whose temporary access complete has retired from every recorded
     temporary share that served them. ``retirements`` holds one entry per (share,
     consumer): {consumer, owner, region, logical_id, share_arn, action, at, forced}, where
     action is PRINCIPAL_REMOVED (the share still serves other consumers) or SHARE_DELETED."""
-    done = {(row.get("share_arn"), row.get("consumer")) for row in record.get("retirements") or []}
+    done = retired_pairs(record)
     serving: dict[str, set[str]] = {}
     for share in record.get("shares", []):
         if share.get("share_arn"):

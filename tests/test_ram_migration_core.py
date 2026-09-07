@@ -911,7 +911,7 @@ def test_existing_template_without_policy_approval_is_an_explicit_blocker(client
         Stacks(OfflineRouter(cs), MIGRATION).persisted_groups(OWNER, REGION)
 
 
-def stub_verification(stub, g, extra=None):
+def stub_verification(stub, g, extra=None, principals=None):
     permission_rows = [{"arn": PERMISSION, "version": "2", "resourceType": KIND}]
     if extra == "permission":
         permission_rows.append({"arn": PERMISSION + "Extra", "version": "2",
@@ -931,7 +931,7 @@ def stub_verification(stub, g, extra=None):
         return
     stub.add_response("list_resources", {"resources": [resource()]},
                       {"resourceOwner": "SELF", "resourceShareArns": [TEMP]})
-    rows = [association(CONSUMER, "PRINCIPAL")]
+    rows = list(principals) if principals is not None else [association(CONSUMER, "PRINCIPAL")]
     if extra == "principal":
         rows.append(association(OTHER, "PRINCIPAL"))
     stub.add_response("get_resource_share_associations", {"resourceShareAssociations": rows},
@@ -994,6 +994,164 @@ def test_permission_versions_are_validated_before_sdk_reads(clients, version):
     cs, _ = clients
     with pytest.raises(MigrationError, match="invalid managed permission version"):
         permission_snapshot(Api(cs["ram"]), PERMISSION, version)
+
+
+# ---------------------------------------------------------------------------
+# Per-account completion: principal removal, retired principals, share deletion
+# ---------------------------------------------------------------------------
+from ram_migration_stacks import delete_share, remove_principals, unserved_consumers  # noqa: E402
+
+SHARE_QUERY = {"resourceOwner": "SELF", "resourceShareArns": [TEMP]}
+PRINCIPAL_QUERY = {"associationType": "PRINCIPAL", "resourceShareArns": [TEMP]}
+
+
+def principal_rows(*rows):
+    return {"resourceShareAssociations": [association(entity, "PRINCIPAL", status)
+                                          for entity, status in rows]}
+
+
+def shared_share(**changes):
+    """This migration's temporary share for CONSUMER and OTHER, as RAM returns it."""
+    return dict(migration_share(group(consumers=(CONSUMER, OTHER))), **changes)
+
+
+def test_verification_of_a_partly_retired_share_expects_only_the_other_principals(clients):
+    cs, stubs = clients
+    g = group(consumers=(CONSUMER, OTHER), approved=True)
+    stub_verification(stubs["ram"], g, principals=[
+        association(CONSUMER, "PRINCIPAL", "DISASSOCIATED"), association(OTHER, "PRINCIPAL")])
+    consumer = botocore.session.get_session().create_client(
+        "ram", region_name=REGION, config=Config(signature_version=UNSIGNED))
+    with Stubber(consumer) as stub:  # visibility is read for OTHER only
+        stub.add_response("list_resources", {"resources": [resource()]},
+                          {"resourceOwner": "OTHER-ACCOUNTS", "resourceShareArns": [TEMP]})
+        verify_group(OfflineRouter(cs, consumer=consumer), g, migration_share(g), MIGRATION,
+                     retired={CONSUMER})
+        stub.assert_no_pending_responses()
+
+
+def test_verification_fails_while_a_retired_consumer_is_still_a_principal(clients):
+    cs, stubs = clients
+    g = group(consumers=(CONSUMER, OTHER), approved=True)
+    stub_verification(stubs["ram"], g, principals=[
+        association(CONSUMER, "PRINCIPAL"), association(OTHER, "PRINCIPAL")])
+    with pytest.raises(MigrationError, match="unexpected or missing principal entitlements"):
+        verify_group(OfflineRouter(cs), g, migration_share(g), MIGRATION, retired={CONSUMER})
+
+
+@pytest.mark.parametrize("change", ["another-migration", "another-owner", "not-tool-named", "absent"])
+def test_principal_removal_refuses_a_share_that_is_not_this_migrations(clients, change):
+    cs, stubs = clients
+    share = shared_share()
+    if change == "another-migration":
+        share["tags"] = [dict(tag, value="another-migration") if tag["key"] == "MigrationId"
+                         else tag for tag in share["tags"]]
+    elif change == "another-owner":
+        share["owningAccountId"] = DEPARTED
+    elif change == "not-tool-named":
+        share["name"] = "original-dns-share"
+    stubs["ram"].add_response("get_resource_shares",
+                              {"resourceShares": [] if change == "absent" else [share]}, SHARE_QUERY)
+    with pytest.raises(MigrationError, match="refusing to remove principals from a share that is "
+                                             "not this migration's temporary share"):
+        remove_principals(OfflineRouter(cs), OWNER, REGION, TEMP, MIGRATION, [CONSUMER])
+
+
+def test_principal_removal_needs_an_active_share_and_never_names_the_owner(clients):
+    cs, stubs = clients
+    with pytest.raises(MigrationError, match="never the owner"):
+        remove_principals(OfflineRouter(cs), OWNER, REGION, TEMP, MIGRATION, [OWNER])
+    stubs["ram"].add_response("get_resource_shares",
+                              {"resourceShares": [shared_share(status="DELETING")]}, SHARE_QUERY)
+    with pytest.raises(MigrationError, match="principals are removed only from an ACTIVE share"):
+        remove_principals(OfflineRouter(cs), OWNER, REGION, TEMP, MIGRATION, [CONSUMER])
+
+
+@pytest.mark.parametrize("rows", [
+    [(CONSUMER, "DISASSOCIATED"), (OTHER, "ASSOCIATED")],
+    [(OTHER, "ASSOCIATED")],
+], ids=["disassociated", "never-associated"])
+def test_principal_removal_is_a_no_op_for_a_principal_already_gone(clients, rows):
+    cs, stubs = clients
+    stubs["ram"].add_response("get_resource_shares", {"resourceShares": [shared_share()]}, SHARE_QUERY)
+    stubs["ram"].add_response("get_resource_share_associations", principal_rows(*rows),
+                              PRINCIPAL_QUERY)
+    remove_principals(OfflineRouter(cs), OWNER, REGION, TEMP, MIGRATION, [CONSUMER])
+
+
+def test_principal_removal_disassociates_only_the_named_principal_and_waits(clients, monkeypatch):
+    cs, stubs = clients
+    monkeypatch.setattr("ram_migration_stacks.time.sleep", lambda _seconds: None)
+    ram = stubs["ram"]
+    ram.add_response("get_resource_shares", {"resourceShares": [shared_share()]}, SHARE_QUERY)
+    ram.add_response("get_resource_share_associations",
+                     principal_rows((CONSUMER, "ASSOCIATED"), (OTHER, "ASSOCIATED")), PRINCIPAL_QUERY)
+    # Exactly the named principal: never the other one, never a resource.
+    ram.add_response("disassociate_resource_share", principal_rows((CONSUMER, "DISASSOCIATING")),
+                     {"resourceShareArn": TEMP, "principals": [CONSUMER]})
+    ram.add_response("get_resource_share_associations",
+                     principal_rows((CONSUMER, "DISASSOCIATING"), (OTHER, "ASSOCIATED")),
+                     PRINCIPAL_QUERY)
+    ram.add_response("get_resource_share_associations",
+                     principal_rows((CONSUMER, "DISASSOCIATED"), (OTHER, "ASSOCIATED")),
+                     PRINCIPAL_QUERY)
+    remove_principals(OfflineRouter(cs), OWNER, REGION, TEMP, MIGRATION, [CONSUMER])
+
+
+def test_principal_removal_waits_for_a_disassociation_already_under_way(clients, monkeypatch):
+    cs, stubs = clients
+    monkeypatch.setattr("ram_migration_stacks.time.sleep", lambda _seconds: None)
+    ram = stubs["ram"]
+    ram.add_response("get_resource_shares", {"resourceShares": [shared_share()]}, SHARE_QUERY)
+    ram.add_response("get_resource_share_associations",
+                     principal_rows((CONSUMER, "DISASSOCIATING"), (OTHER, "ASSOCIATED")),
+                     PRINCIPAL_QUERY)
+    ram.add_response("get_resource_share_associations", principal_rows((OTHER, "ASSOCIATED")),
+                     PRINCIPAL_QUERY)
+    remove_principals(OfflineRouter(cs), OWNER, REGION, TEMP, MIGRATION, [CONSUMER])
+
+
+def test_principal_removal_that_does_not_finish_times_out(clients):
+    cs, stubs = clients
+    ram = stubs["ram"]
+    ram.add_response("get_resource_shares", {"resourceShares": [shared_share()]}, SHARE_QUERY)
+    ram.add_response("get_resource_share_associations", principal_rows((CONSUMER, "ASSOCIATED")),
+                     PRINCIPAL_QUERY)
+    ram.add_response("disassociate_resource_share", principal_rows((CONSUMER, "DISASSOCIATING")),
+                     {"resourceShareArn": TEMP, "principals": [CONSUMER]})
+    ram.add_response("get_resource_share_associations",
+                     principal_rows((CONSUMER, "DISASSOCIATING")), PRINCIPAL_QUERY)
+    with pytest.raises(MigrationError, match="principal removal did not finish before the timeout"):
+        remove_principals(OfflineRouter(cs), OWNER, REGION, TEMP, MIGRATION, [CONSUMER], timeout=0)
+
+
+def test_unserved_consumers_reads_what_the_share_now_holds(clients):
+    cs, stubs = clients
+    ram, router = stubs["ram"], OfflineRouter(cs, readonly=True)
+    ram.add_response("get_resource_shares", {"resourceShares": [shared_share()]}, SHARE_QUERY)
+    ram.add_response("get_resource_share_associations",
+                     principal_rows((CONSUMER, "DISASSOCIATED"), (OTHER, "DISASSOCIATING")),
+                     PRINCIPAL_QUERY)
+    assert unserved_consumers(router, OWNER, REGION, TEMP, [CONSUMER, OTHER]) == {CONSUMER}
+    for rows in ([shared_share(status="DELETED")], []):  # a deleted share serves no one
+        ram.add_response("get_resource_shares", {"resourceShares": rows}, SHARE_QUERY)
+        assert unserved_consumers(router, OWNER, REGION, TEMP, [CONSUMER, OTHER]) == {CONSUMER, OTHER}
+
+
+def test_share_deletion_refuses_a_share_that_is_not_this_migrations(clients, monkeypatch):
+    cs, stubs = clients
+    monkeypatch.setattr("ram_migration_stacks.time.sleep", lambda _seconds: None)
+    ram = stubs["ram"]
+    ram.add_response("get_resource_shares",
+                     {"resourceShares": [shared_share(name="original-dns-share")]}, SHARE_QUERY)
+    with pytest.raises(MigrationError, match="refusing to delete a share that is not this "
+                                             "migration's temporary share"):
+        delete_share(OfflineRouter(cs), OWNER, REGION, TEMP, MIGRATION)
+    ram.add_response("get_resource_shares", {"resourceShares": [shared_share()]}, SHARE_QUERY)
+    ram.add_response("delete_resource_share", {"returnValue": True}, {"resourceShareArn": TEMP})
+    ram.add_response("get_resource_shares", {"resourceShares": [shared_share(status="DELETED")]},
+                     SHARE_QUERY)
+    delete_share(OfflineRouter(cs), OWNER, REGION, TEMP, MIGRATION)
 
 
 def invitation(share=TEMP, sender=OWNER, status="PENDING"):

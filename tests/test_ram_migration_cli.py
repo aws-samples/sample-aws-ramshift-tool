@@ -233,8 +233,7 @@ class FakeVerification:
                     other = [] if site in h.original_lost else sorted(set(granted.source_shares))
                     if site in h.replacement:
                         other = sorted(set(other) | {f"arn:aws:ram:{g.region}:{g.owner}:resource-share/permanent"})
-                    temp = Harness.share(granted)["resourceShareArn"]
-                    via_temp = [temp] if temp in temporary and temp not in h.deleted_shares else []
+                    via_temp = self.temporary_paths(g, consumer, arn, temporary)
                     items.append({"kind": "entitlement", "key": f"entitlement|{consumer}|{g.region}|{arn}",
                                   "consumer": consumer, "owner": g.owner, "region": g.region,
                                   "resource_arn": arn, "type": kind, "via_shares": other + via_temp,
@@ -248,6 +247,17 @@ class FakeVerification:
                                           "vpc_id": row["VPCId"], "association_id": row["Id"],
                                           "status": row["Status"]})
         return items
+
+    def temporary_paths(self, g, consumer, arn, temporary):
+        """The recorded temporary shares through which the consumer still sees ``arn``: g's
+        own, or that of a stored group listing both (g may be narrowed to some consumers),
+        unless complete deleted the share or removed the consumer from it."""
+        h = self.harness
+        shares = {Harness.share(candidate)["resourceShareArn"]
+                  for candidate in [g, *getattr(h, "stored", {}).get((g.owner, g.region), [])]
+                  if consumer in candidate.consumers and arn in candidate.resources}
+        return sorted(share for share in shares if share in temporary and share not in h.deleted_shares
+                      and (share, consumer) not in getattr(h, "removed_principals", set()))
 
     def collect(self, router, groups, *, temporary_shares=frozenset(), workers=4):
         self.harness.calls.append(("collect", len(groups), tuple(sorted(temporary_shares))))
@@ -338,7 +348,9 @@ class Harness:
         self.replacement_gaps = []
         self.deleted_shares = []
         self.deleted_stacks = []
+        self.removed_principals = set()   # (share ARN, consumer) complete disassociated
         self.after_delete = None          # callback(harness, share_arn) run after a deletion
+        self.after_remove = None          # callback(harness, share_arn, consumers) after a removal
         self.org_manager = MANAGER
         self.org_feature_set = "ALL"
         self.org_parents = {}             # child -> (parent ID, type); default: the root
@@ -431,8 +443,14 @@ class Harness:
                 return "local-migration-stack"
 
             def delete(self, owner, region):
+                """Like Stacks.delete: refused while any of the stack's shares exists."""
                 harness.calls.append(("delete-stack", owner, region))
+                if any(harness.share(g)["resourceShareArn"] not in harness.deleted_shares
+                       for g in harness.stored.get((owner, region), [])):
+                    raise MigrationError("temporary share still exists; complete deletes and "
+                                         "verifies every share before deleting its stack")
                 harness.deleted_stacks.append((owner, region))
+                harness.stored.pop((owner, region), None)
                 return f"local-stack-{owner}-{region}"
 
             def shares(self, owner, region):
@@ -442,7 +460,9 @@ class Harness:
                     raise MigrationError("Migration stack does not exist")
                 states = harness.share_states.get((owner, region), ["ACTIVE"])
                 state = states.pop(0) if len(states) > 1 else states[0]
-                return {g.logical_id: dict(harness.share(g), status=state)
+                deleted = set(harness.deleted_shares)
+                return {g.logical_id: dict(harness.share(g), status="DELETED" if
+                                           harness.share(g)["resourceShareArn"] in deleted else state)
                         for g in harness.stored[owner, region] if g.key not in harness.missing_shares}
 
             def readback(self, owner, region):
@@ -453,8 +473,10 @@ class Harness:
                 return Readback({logical: share for logical, share in found.items()
                                  if logical not in failures}, failures)
 
-        def local_verify(router, g, share, migration):
+        def local_verify(router, g, share, migration, retired=frozenset()):
             harness.calls.append(("verify", g.key, share["resourceShareArn"], migration))
+            if retired:
+                harness.calls.append(("verify-retired", g.key, tuple(sorted(retired))))
             if harness.verify_hook:
                 harness.verify_hook(router, g, share)
             if g.key in harness.verify_errors:
@@ -472,9 +494,24 @@ class Harness:
             if harness.after_delete:
                 harness.after_delete(harness, arn)
 
+        def local_remove_principals(router, owner, region, arn, migration, consumers, timeout=600):
+            harness.calls.append(("remove-principals", owner, region, arn, tuple(consumers)))
+            router.client(owner, "ram", region, write=True)  # the write gate must be open
+            harness.removed_principals.update((arn, consumer) for consumer in consumers)
+            if harness.after_remove:
+                harness.after_remove(harness, arn, consumers)
+
+        def local_unserved(router, owner, region, arn, consumers):
+            """Like unserved_consumers, read back after a failed or interrupted action."""
+            harness.calls.append(("readback", arn))
+            return {consumer for consumer in consumers if arn in harness.deleted_shares
+                    or (arn, consumer) in harness.removed_principals}
+
         monkeypatch.setattr(cli, "Router", LocalRouter)
         monkeypatch.setattr(cli, "verification", FakeVerification(self))
         monkeypatch.setattr(cli, "delete_share", local_delete_share)
+        monkeypatch.setattr(cli, "remove_principals", local_remove_principals)
+        monkeypatch.setattr(cli, "unserved_consumers", local_unserved)
         monkeypatch.setattr(cli, "Discovery", LocalDiscovery)
         monkeypatch.setattr(cli, "Stacks", LocalStacks)
         monkeypatch.setattr(cli, "verify_group", local_verify)
@@ -1851,7 +1888,7 @@ def write_clients(harness):
 
 def completion_events(harness):
     return [f"collect-{call[1]}" if call[0] == "collect" else call[0] for call in harness.calls
-            if call[0] in ("collect", "delete-share", "delete-stack")]
+            if call[0] in ("collect", "delete-share", "remove-principals", "delete-stack")]
 
 
 # verify ---------------------------------------------------------------------
@@ -2327,23 +2364,26 @@ def test_lost_baseline_association_is_reported_missing_never_as_unassociated(
 
 
 # complete -------------------------------------------------------------------
-def refused(harness, path, capsys, *expected):
+def refused(harness, path, capsys, *expected, extra=()):
     """complete must stop before its confirmation, delete nothing and record why."""
     before = read_record(path)
-    deleted = list(harness.deleted_shares)
+    deleted, stacks = list(harness.deleted_shares), list(harness.deleted_stacks)
+    removed = set(harness.removed_principals)
     harness.calls.clear()
-    assert main(complete_args(path),
+    assert main(complete_args(path, *extra),
                 input_fn=lambda _: pytest.fail("A refused completion must not confirm")) == 1
     output = capsys.readouterr().out
     for text in expected:
         assert text in output
     assert f"status=BLOCKED migration={MIGRATION} phase=complete" in output
     assert "temporary shares retained" in output
-    assert harness.deleted_shares == deleted and not harness.deleted_stacks
+    assert harness.deleted_shares == deleted and harness.deleted_stacks == stacks
+    assert harness.removed_principals == removed
     assert not write_clients(harness)
     record = read_record(path)
     assert record["completion"] is None and record["shares"] == before["shares"]
     assert record["baseline"] == before["baseline"]
+    assert record["retirements"] == before["retirements"]
     last = record["history"][-1]
     assert (last["mode"], last["status"]) == ("complete", "BLOCKED")
     return record
@@ -3639,3 +3679,436 @@ def test_monitor_that_cannot_record_still_reports_and_never_exits_0(harness, mig
     assert "phase=record status=NOT_RECORDED record changed concurrently" in output
     assert "status=UNCHANGED" in output and "recorded=false exit_code=1" in output
     assert read_record(migration_record)["revision"] == revision
+# Per-account completion: chosen accounts, retirements, --force
+# ---------------------------------------------------------------------------
+BOTH = f"{CONSUMER},{OTHER_CONSUMER}"
+FORCED = ("phase=complete status=NOT_OVERRIDDEN --force never overrides identity, "
+          "record-versus-stack or ownership checks")
+
+
+def shared_group(harness):
+    """One temporary share serving both migrating accounts."""
+    shared = pool_group("test", consumers=(CONSUMER, OTHER_CONSUMER))
+    harness.source[OWNER, REGION] = [shared]
+    return shared
+
+
+def complete_for(path, *consumers, extra=()):
+    return complete_args(path, "--consumers", *consumers, *extra)
+
+
+def answering(token, prompts):
+    def answer(prompt):
+        prompts.append(prompt)
+        return token
+    return answer
+
+
+def complete_history(path):
+    return [entry for entry in read_record(path)["history"] if entry["mode"] == "complete"]
+
+
+def lose_access_on_deletion(h, arn):
+    """The consumer had no permanent path: deleting the share ends its access."""
+    deleted = next(g for groups in h.stored.values() for g in groups if share_arn(g) == arn)
+    h.original_lost.update((c, deleted.region, r) for c in deleted.consumers for r in deleted.resources)
+
+
+def test_completing_one_account_of_a_shared_share_removes_only_its_principal(
+        harness, capsys, migration_record):
+    shared = shared_group(harness)
+    applied(harness, migration_record, args(consumers=BOTH))
+    arn = share_arn(shared)
+    prompts = []
+    capsys.readouterr()
+    assert main(complete_for(migration_record, CONSUMER),
+                input_fn=answering(f"COMPLETE {MIGRATION}", prompts)) == 0
+    output = capsys.readouterr().out
+    assert (f"owner={OWNER} region={REGION} phase=complete action=REMOVE_PRINCIPALS share={arn} "
+            f"consumers={CONSUMER} resources=1 retained_consumers={OTHER_CONSUMER}") in output
+    assert "action=DELETE_SHARE" not in output and "action=DELETE_STACK" not in output
+    assert prompts == [f"Type COMPLETE {MIGRATION} to retire the temporary access of {CONSUMER} "
+                       "with the actions above, re-verifying after each: "]
+    assert completion_events(harness) == ["collect-1", "remove-principals", "collect-1", "collect-1"]
+    assert harness.removed_principals == {(arn, CONSUMER)}
+    assert not harness.deleted_shares and not harness.deleted_stacks
+    # Only the chosen account and the share's owner are read; the other is not touched.
+    assert {call[1] for call in harness.calls if call[0] == "authentication"} == {OWNER, CONSUMER}
+    assert {call[1] for call in harness.calls if call[0] == "organization"} == {CONSUMER}
+    assert summary_line(output) == (
+        f"status=PARTIALLY_COMPLETED migration={MIGRATION} deleted_shares=0 deleted_stacks=0 "
+        f"removed_principals=1 retired_accounts={CONSUMER} remaining_accounts={OTHER_CONSUMER} "
+        "original baseline intact")
+    record = read_record(migration_record)
+    assert record["completion"] is None
+    retirement, = record["retirements"]
+    assert {key: entry for key, entry in retirement.items() if key != "at"} == {
+        "consumer": CONSUMER, "owner": OWNER, "region": REGION, "logical_id": shared.logical_id,
+        "share_arn": arn, "action": "PRINCIPAL_REMOVED", "forced": False}
+    assert record_module.retired_consumers(record) == {CONSUMER}
+    assert [(h["status"], h["retired"], h["consumers"]) for h in complete_history(migration_record)] \
+        == [("PRINCIPALS_REMOVED", [CONSUMER], [CONSUMER]),
+            ("PARTIALLY_COMPLETED", [CONSUMER], [CONSUMER])]
+
+
+def test_completing_one_account_deletes_a_share_only_it_uses_and_keeps_the_stack(
+        harness, capsys, migration_record):
+    first, second, argv = two_consumer_groups(harness)
+    applied(harness, migration_record, argv)
+    capsys.readouterr()
+    assert main(complete_for(migration_record, CONSUMER), input_fn=confirm_complete(harness)) == 0
+    output = capsys.readouterr().out
+    assert (f"owner={OWNER} region={REGION} phase=complete action=DELETE_SHARE "
+            f"share={share_arn(first)} consumers={CONSUMER} resources=1") in output
+    assert "REMOVE_PRINCIPALS" not in output and "action=DELETE_STACK" not in output
+    assert harness.deleted_shares == [share_arn(first)] and not harness.deleted_stacks
+    assert "status=PARTIALLY_COMPLETED" in summary_line(output)
+    retirement, = read_record(migration_record)["retirements"]
+    assert (retirement["consumer"], retirement["action"]) == (CONSUMER, "SHARE_DELETED")
+    # RAM may no longer return the deleted share at all: the stack is still the recorded one.
+    harness.readback_failures[OWNER, REGION] = {
+        first.logical_id: MigrationError("Migration resource ownership verification failed")}
+    assert main(complete_for(migration_record, OTHER_CONSUMER), input_fn=confirm_complete(harness)) == 0
+    output = capsys.readouterr().out
+    assert f"action=DELETE_SHARE share={share_arn(second)} consumers={OTHER_CONSUMER}" in output
+    assert harness.deleted_stacks == [(OWNER, REGION)]
+    assert "status=COMPLETED" in summary_line(output)
+
+
+def test_a_stack_is_deleted_only_once_its_last_share_is(harness, capsys, migration_record):
+    shared = pool_group("test", consumers=(CONSUMER, OTHER_CONSUMER))
+    own = pool_group("c1", owner=OTHER_OWNER)
+    harness.source = {(OWNER, REGION): [shared], (OTHER_OWNER, REGION): [own]}
+    applied(harness, migration_record, args(owners=f"{OWNER},{OTHER_OWNER}", consumers=BOTH))
+    capsys.readouterr()
+    assert main(complete_for(migration_record, CONSUMER), input_fn=confirm_complete(harness)) == 0
+    output = capsys.readouterr().out
+    # CONSUMER's own share empties OTHER_OWNER's stack; the shared one keeps OWNER's.
+    assert f"owner={OTHER_OWNER} region={REGION} phase=complete action=DELETE_STACK" in output
+    assert f"owner={OWNER} region={REGION} phase=complete action=DELETE_STACK" not in output
+    assert harness.removed_principals == {(share_arn(shared), CONSUMER)}
+    assert harness.deleted_shares == [share_arn(own)]
+    assert harness.deleted_stacks == [(OTHER_OWNER, REGION)]
+    assert summary_line(output).startswith(
+        f"status=PARTIALLY_COMPLETED migration={MIGRATION} deleted_shares=1 deleted_stacks=1 "
+        f"removed_principals=1 retired_accounts={CONSUMER} remaining_accounts={OTHER_CONSUMER}")
+    harness.calls.clear()
+    assert main(complete_for(migration_record, OTHER_CONSUMER), input_fn=confirm_complete(harness)) == 0
+    output = capsys.readouterr().out
+    assert (f"owner={OWNER} region={REGION} phase=complete action=DELETE_SHARE "
+            f"share={share_arn(shared)} consumers={OTHER_CONSUMER} resources=1") in output
+    assert ("existing", OTHER_OWNER, REGION) in harness.calls  # emptied earlier, already gone
+    assert harness.deleted_stacks == [(OTHER_OWNER, REGION), (OWNER, REGION)]
+    assert summary_line(output) == (
+        f"status=COMPLETED migration={MIGRATION} deleted_shares=1 deleted_stacks=1 "
+        f"removed_principals=0 retired_accounts={BOTH} remaining_accounts=none "
+        "original baseline intact")
+    record = read_record(migration_record)
+    assert record["completion"]["deleted_shares"] == [share_arn(shared)]
+    assert record["completion"]["deleted_stacks"] == [f"local-stack-{OWNER}-{REGION}"]
+    assert sorted((row["consumer"], row["share_arn"], row["action"]) for row in record["retirements"]) \
+        == sorted([(CONSUMER, share_arn(shared), "PRINCIPAL_REMOVED"),
+                   (CONSUMER, share_arn(own), "SHARE_DELETED"),
+                   (OTHER_CONSUMER, share_arn(shared), "SHARE_DELETED")])
+
+
+def test_all_accounts_deletes_a_shared_share_and_its_stack_as_before(harness, capsys, migration_record):
+    shared = shared_group(harness)
+    applied(harness, migration_record, args(consumers=BOTH))
+    capsys.readouterr()
+    assert main(complete_args(migration_record), input_fn=confirm_complete(harness)) == 0
+    output = capsys.readouterr().out
+    assert (f"action=DELETE_SHARE share={share_arn(shared)} consumers={BOTH} resources=1") in output
+    assert "REMOVE_PRINCIPALS" not in output and not harness.removed_principals
+    assert completion_events(harness) == ["collect-1", "delete-share", "collect-1", "collect-1",
+                                          "delete-stack"]
+    assert summary_line(output) == (
+        f"status=COMPLETED migration={MIGRATION} deleted_shares=1 deleted_stacks=1 "
+        f"removed_principals=0 retired_accounts={BOTH} remaining_accounts=none "
+        "original baseline intact")
+    record = read_record(migration_record)
+    assert sorted((row["consumer"], row["action"]) for row in record["retirements"]) == [
+        (CONSUMER, "SHARE_DELETED"), (OTHER_CONSUMER, "SHARE_DELETED")]
+    assert (record["completion"]["forced"], record["completion"]["overridden"]) == (False, [])
+
+
+def test_an_already_retired_account_is_skipped(harness, capsys, migration_record):
+    shared = shared_group(harness)
+    applied(harness, migration_record, args(consumers=BOTH))
+    assert quietly(complete_for(migration_record, CONSUMER), confirm_complete(harness)) == 0
+    record = read_record(migration_record)
+    harness.calls.clear()
+    capsys.readouterr()
+    assert main(complete_for(migration_record, CONSUMER),
+                input_fn=lambda _: pytest.fail("nothing to confirm")) == 0
+    output = capsys.readouterr().out
+    assert (f"consumer={CONSUMER} phase=complete status=ALREADY_RETIRED "
+            f"at={record['retirements'][0]['at']}") in output
+    assert summary_line(output) == (f"status=NOTHING_TO_RETIRE migration={MIGRATION} "
+                                    f"retired_accounts={CONSUMER} remaining_accounts={OTHER_CONSUMER}")
+    assert [call[0] for call in harness.calls] == ["router"]
+    assert read_record(migration_record) == record
+    # Named beside an account still to retire, it is skipped again and the other retired.
+    assert main(complete_for(migration_record, CONSUMER, OTHER_CONSUMER),
+                input_fn=confirm_complete(harness)) == 0
+    output = capsys.readouterr().out
+    assert f"consumer={CONSUMER} phase=complete status=ALREADY_RETIRED" in output
+    assert (f"action=DELETE_SHARE share={share_arn(shared)} consumers={OTHER_CONSUMER} "
+            "resources=1") in output
+    assert "status=COMPLETED" in summary_line(output)
+
+
+def test_force_overrides_missing_replacement_access_with_its_own_token_and_records_it(
+        harness, capsys, migration_record):
+    applied(harness, migration_record)
+    arn = share_arn(harness.stored[OWNER, REGION][0])
+    harness.original_lost.add((CONSUMER, REGION, POOL))  # only the temporary share provides access
+    prompts = []
+    capsys.readouterr()
+    assert main(complete_args(migration_record, "--force"),
+                input_fn=answering(f"FORCE-COMPLETE {MIGRATION}", prompts)) == 0
+    output = capsys.readouterr().out
+    missing = (f"phase=replacement consumer={CONSUMER} region={REGION} resource={POOL}: only the "
+               "temporary share provides access; establish permanent replacement sharing first")
+    assert f"phase=complete status=OVERRIDDEN {missing}" in output and "BLOCKED" not in output
+    assert prompts == [f"Type FORCE-COMPLETE {MIGRATION} to retire the temporary access of "
+                       f"{CONSUMER} with the actions above despite the failed safety checks "
+                       "overridden above (1); these accounts may lose access to the resources "
+                       "above: "]
+    # Forced, a loss after the deletion is reported and recorded, and the run continues.
+    lost = f"original not visible to the consumer: {entitlement_key(POOL)}"
+    assert f"phase=complete status=OVERRIDDEN {lost}" in output
+    assert harness.deleted_shares == [arn] and harness.deleted_stacks == [(OWNER, REGION)]
+    assert summary_line(output) == (
+        f"status=COMPLETED migration={MIGRATION} deleted_shares=1 deleted_stacks=1 "
+        f"removed_principals=0 retired_accounts={CONSUMER} remaining_accounts=none "
+        "forced=true overridden=5")
+    record = read_record(migration_record)
+    assert record["completion"]["forced"] is True
+    assert record["completion"]["overridden"][0] == missing and lost in record["completion"]["overridden"]
+    retirement, = record["retirements"]
+    assert (retirement["action"], retirement["forced"]) == ("SHARE_DELETED", True)
+    drop, = record["drops"]  # still lost at the final check: the same loss, recorded once
+    assert (drop["kind"], drop["subject"], drop["detected_by"], drop["evidence"]) == (
+        "entitlement", entitlement_key(POOL), "complete", "complete-settle-1")
+    history = complete_history(migration_record)
+    assert [h["status"] for h in history] == ["FORCED", "SHARE_DELETED", "OVERRIDDEN",
+                                              "OVERRIDDEN", "COMPLETED"]
+    assert history[0]["overridden"] == [missing] and all(h["forced"] for h in history)
+
+
+def test_a_forced_completion_needs_the_force_token(harness, capsys, migration_record):
+    applied(harness, migration_record)
+    harness.original_lost.add((CONSUMER, REGION, POOL))
+    capsys.readouterr()
+    assert main(complete_args(migration_record, "--force"),
+                input_fn=lambda _prompt: f"COMPLETE {MIGRATION}") == 2
+    assert "status=CANCELLED Confirmation did not match; no AWS writes requested" in \
+        capsys.readouterr().out
+    assert not harness.deleted_shares and not harness.deleted_stacks and not write_clients(harness)
+    record = read_record(migration_record)
+    assert not complete_history(migration_record)
+    assert (record["retirements"], record["drops"]) == ([], [])
+
+
+def test_force_changes_nothing_when_every_check_passes(harness, capsys, migration_record):
+    small, large = pool_group("test"), pool_group("l1", "l2", permission=OTHER_PERMISSION)
+    harness.source[OWNER, REGION] = [large, small]
+    applied(harness, migration_record)
+    harness.after_delete = lose_access_on_deletion
+    prompts = []
+    capsys.readouterr()
+    assert main(complete_args(migration_record, "--force"),
+                input_fn=answering(f"COMPLETE {MIGRATION}", prompts)) == 1
+    output = capsys.readouterr().out
+    assert prompts[0].startswith(f"Type COMPLETE {MIGRATION} to retire")
+    assert "OVERRIDDEN" not in output
+    # Nothing to override, so a loss after the canary deletion still stops the run.
+    assert harness.deleted_shares == [share_arn(small)] and not harness.deleted_stacks
+    assert "Completion stopped; the remaining temporary shares are retained." in output
+    history = complete_history(migration_record)
+    assert [h["status"] for h in history] == ["SHARE_DELETED", "FAILED"]
+    assert all(h["force"] == "unused" and "forced" not in h for h in history)
+    assert read_record(migration_record)["retirements"][0]["forced"] is False
+
+
+def test_forced_a_loss_after_an_action_is_recorded_and_the_run_continues(
+        harness, capsys, migration_record):
+    small, large = pool_group("test"), pool_group("l1", "l2", permission=OTHER_PERMISSION)
+    harness.source[OWNER, REGION] = [large, small]
+    applied(harness, migration_record)
+    recorded_drop(migration_record)  # a recorded failure drop: refused without --force
+    harness.after_delete = lose_access_on_deletion
+    capsys.readouterr()
+    assert main(complete_args(migration_record, "--force"),
+                input_fn=lambda _prompt: f"FORCE-COMPLETE {MIGRATION}") == 0
+    output = capsys.readouterr().out
+    assert f"phase=complete status=OVERRIDDEN failure drop recorded: association {ASSOCIATION_KEY}" \
+        in output
+    for arn in (POOL, f"arn:aws:ec2:{REGION}:{OWNER}:ipam-pool/l1"):
+        assert f"phase=complete status=OVERRIDDEN original not visible to the consumer: " \
+               f"{entitlement_key(arn)}" in output
+    # Forced, every action observes once and the run goes on past each loss.
+    assert completion_events(harness) == ["collect-2", "delete-share", "collect-1", "delete-share",
+                                          "collect-1", "collect-2", "delete-stack"]
+    assert harness.deleted_shares == [share_arn(small), share_arn(large)]
+    record = read_record(migration_record)
+    assert sorted(drop["subject"] for drop in record["drops"] if drop["detected_by"] == "complete") \
+        == sorted(entitlement_key(arn) for g in (small, large) for arn in g.resources)
+    assert [h["status"] for h in complete_history(migration_record)] == [
+        "FORCED", "SHARE_DELETED", "OVERRIDDEN", "SHARE_DELETED", "OVERRIDDEN", "OVERRIDDEN",
+        "COMPLETED"]
+    assert "status=COMPLETED" in summary_line(output) and "forced=true" in summary_line(output)
+
+
+@pytest.mark.parametrize("mismatch", ["stack-only", "share-arn", "authentication"])
+def test_force_never_overrides_identity_or_a_record_stack_mismatch(
+        harness, capsys, migration_record, mismatch):
+    first, second = pool_group("test"), pool_group("second", permission=OTHER_PERMISSION)
+    harness.source[OWNER, REGION] = [first, second]
+    record = applied(harness, migration_record)
+    harness.original_lost.add((CONSUMER, REGION, POOL))  # an overridable check fails as well
+    if mismatch == "stack-only":
+        extra = pool_group("unrecorded", permission="arn:aws:ram::aws:permission/ThirdPermission")
+        harness.stored[OWNER, REGION].append(extra)
+        expected = f"stack entitlement {OWNER}/{REGION}/{extra.logical_id} is not in the migration record"
+    elif mismatch == "share-arn":
+        rewrite(migration_record, shares=[
+            dict(entry, share_arn=entry["share_arn"] + "-replaced")
+            if entry["logical_id"] == second.logical_id else entry for entry in record["shares"]])
+        expected = f"{OWNER}/{REGION}/{second.logical_id}: stack share {share_arn(second)} differs"
+    else:
+        harness.auth_errors[CONSUMER] = denied("GetCallerIdentity")
+        expected = f"account={CONSUMER} phase=authentication status=BLOCKED"
+    capsys.readouterr()
+    refused(harness, migration_record, capsys, expected, FORCED, extra=("--force",))
+    assert not any(call[0] == "collect" for call in harness.calls)
+
+
+@pytest.mark.parametrize("error,code,status", [
+    (MigrationError("principal removal did not finish before the timeout"), 1, "FAILED"),
+    (KeyboardInterrupt(), 130, "INTERRUPTED"),
+])
+def test_an_action_that_fails_after_aws_acted_records_what_aws_holds(
+        harness, capsys, migration_record, monkeypatch, error, code, status):
+    shared = shared_group(harness)
+    applied(harness, migration_record, args(consumers=BOTH))
+    arn = share_arn(shared)
+
+    def removed_then_failed(router, owner, region, share, migration, consumers, timeout=600):
+        router.client(owner, "ram", region, write=True)
+        harness.removed_principals.update((share, consumer) for consumer in consumers)
+        raise error
+    monkeypatch.setattr(cli, "remove_principals", removed_then_failed)
+    capsys.readouterr()
+    assert main(complete_for(migration_record, CONSUMER), input_fn=confirm_complete(harness)) == code
+    output = capsys.readouterr().out
+    assert f"status={status} share={arn} phase=complete " in output
+    assert f" retired={CONSUMER}" in output and ("readback", arn) in harness.calls
+    record = read_record(migration_record)
+    retirement, = record["retirements"]
+    assert (retirement["consumer"], retirement["action"]) == (CONSUMER, "PRINCIPAL_REMOVED")
+    last = record["history"][-1]
+    assert (last["status"], last["retired"], last["principals_removed"]) == (status, [CONSUMER], 1)
+    # The record holds what AWS holds: nothing is left to retire for that account.
+    assert main(complete_for(migration_record, CONSUMER),
+                input_fn=lambda _: pytest.fail("nothing to confirm")) == 0
+    assert f"consumer={CONSUMER} phase=complete status=ALREADY_RETIRED" in capsys.readouterr().out
+
+
+def test_a_stack_left_by_a_failed_deletion_is_deleted_by_the_next_run(
+        harness, capsys, migration_record, monkeypatch):
+    applied(harness, migration_record)
+    delete, attempts = cli.Stacks.delete, []
+
+    def failing_once(self, owner, region):
+        attempts.append((owner, region))
+        if len(attempts) == 1:
+            raise MigrationError("stack deletion did not finish before the timeout")
+        return delete(self, owner, region)
+    monkeypatch.setattr(cli.Stacks, "delete", failing_once)
+    assert quietly(complete_args(migration_record), confirm_complete(harness)) == 1
+    record = read_record(migration_record)
+    assert record["completion"] is None and record_module.retired_consumers(record) == {CONSUMER}
+    harness.calls.clear()
+    prompts = []
+    capsys.readouterr()
+    assert main(complete_args(migration_record),
+                input_fn=answering(f"COMPLETE {MIGRATION}", prompts)) == 0
+    output = capsys.readouterr().out
+    assert f"consumer={CONSUMER} phase=complete status=ALREADY_RETIRED" in output
+    assert f"owner={OWNER} region={REGION} phase=complete action=DELETE_STACK" in output
+    assert prompts == [f"Type COMPLETE {MIGRATION} to delete the emptied migration stacks above: "]
+    assert not any(call[0] in ("collect", "delete-share") for call in harness.calls)
+    assert summary_line(output) == (
+        f"status=COMPLETED migration={MIGRATION} deleted_shares=0 deleted_stacks=1 "
+        f"removed_principals=0 retired_accounts={CONSUMER} remaining_accounts=none")
+    assert read_record(migration_record)["completion"]["deleted_stacks"] == [
+        f"local-stack-{OWNER}-{REGION}"]
+
+
+def test_apply_refuses_once_an_account_is_retired_and_plan_still_runs(
+        harness, capsys, migration_record):
+    shared_group(harness)
+    argv = args(consumers=BOTH)
+    applied(harness, migration_record, argv)
+    assert quietly(complete_for(migration_record, CONSUMER), confirm_complete(harness)) == 0
+    assert quietly(with_record(argv, migration_record)) == 0
+    before = read_record(migration_record)
+    harness.calls.clear()
+    capsys.readouterr()
+    assert main(with_record(["apply", *argv], migration_record),
+                input_fn=lambda _: pytest.fail("refused before confirmation")) == 1
+    assert (f"status=BLOCKED this migration is being completed: complete has retired the "
+            f"temporary access of {CONSUMER} under migration ID {MIGRATION}, so apply creates no "
+            "further temporary shares for it; plan and apply them under a new --migration-id and "
+            "--record") in capsys.readouterr().out
+    assert [call[0] for call in harness.calls] == ["router"] and not harness.writes()
+    assert read_record(migration_record) == before
+
+
+def test_verify_leaves_a_retired_account_out_of_its_scope(harness, capsys, migration_record):
+    shared = shared_group(harness)
+    applied(harness, migration_record, args(consumers=BOTH))
+    assert quietly(complete_for(migration_record, CONSUMER), confirm_complete(harness)) == 0
+    at = read_record(migration_record)["retirements"][0]["at"]
+    arn = share_arn(shared)
+    # Neither the retired account's original path nor its organization counts any more.
+    harness.original_lost.add((CONSUMER, REGION, POOL))
+    harness.organizations[OTHER_CONSUMER] = "o-destination1"
+    harness.calls.clear()
+    capsys.readouterr()
+    assert main(mode_args("verify", migration_record)) == 0
+    output = capsys.readouterr().out
+    assert output.count(f"consumer={CONSUMER} phase=verification status=RETIRED at={at}") == 1
+    assert f"share={arn} consumer={OTHER_CONSUMER} phase=verification status=VERIFIED" in output
+    assert f"consumer={CONSUMER} phase=verification status=VERIFIED" not in output
+    assert ("verify-retired", shared.key, (CONSUMER,)) in harness.calls
+    assert [call[1] for call in harness.calls if call[0] == "collect"] == [1]
+    assert not any(call[0] in ("authentication", "organization") and call[1] == CONSUMER
+                   for call in harness.calls)
+    line = summary_line(output)
+    assert line.startswith("status=MIGRATION_VALIDATED") and "baseline_missing=0" in line
+    assert "expected_entitlements=1 planned_shares=1 " in line  # the share serves one account now
+    entry = read_record(migration_record)["verifications"][-1]
+    assert (entry["migration_status"], entry["consumer_organizations"]) == (
+        "MIGRATION_VALIDATED", {OTHER_CONSUMER: "o-destination1"})
+
+
+def test_verify_no_longer_expects_a_share_retired_from_every_consumer(
+        harness, capsys, migration_record):
+    first, second, argv = two_consumer_groups(harness)
+    applied(harness, migration_record, argv)
+    assert quietly(complete_for(migration_record, CONSUMER), confirm_complete(harness)) == 0
+    harness.readback_failures[OWNER, REGION] = {  # RAM may no longer return the deleted share
+        first.logical_id: MigrationError("Migration resource ownership verification failed")}
+    harness.calls.clear()
+    capsys.readouterr()
+    assert main(mode_args("verify", migration_record)) == 0
+    output = capsys.readouterr().out
+    assert "is missing from its migration stack" not in output and "could not be proven" not in output
+    assert [call[1] for call in harness.calls if call[0] == "verify"] == [second.key]
+    assert "sharing_status=SHARING_READY migration_status=PENDING_MIGRATION" in output
+    assert "expected_entitlements=1 planned_shares=1 " in summary_line(output)
+    assert f"{OTHER_CONSUMER} is still in its baseline organization" in output
+    assert f"{CONSUMER} is still in its baseline organization" not in output

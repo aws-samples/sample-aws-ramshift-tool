@@ -27,7 +27,7 @@ import threading
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -51,8 +51,12 @@ from ram_migration_preflight import (
     destination_target, organization_preflight, policy_changes, recorded_destination,
 )
 from ram_migration_record import load as load_record
+from ram_migration_record import retired_consumers, retired_pairs
 from ram_migration_record import update as update_record
-from ram_migration_stacks import Readback, Stacks, accept, delete_share, stack_name, verify_group
+from ram_migration_stacks import (
+    Readback, Stacks, accept, delete_share, remove_principals, stack_name, unserved_consumers,
+    verify_group,
+)
 
 try:
     import ram_migration_verification as verification
@@ -1282,14 +1286,17 @@ def original_share_drops(dropped: list[dict], observation: Any, organizations: d
 
 
 def migration_status(record: dict, comparison: Any | None, organizations: dict,
-                     groups: list | None = None) -> tuple[str, list[str]]:
+                     groups: list | None = None,
+                     retired: set[str] | frozenset[str] = frozenset()) -> tuple[str, list[str]]:
     """FAILED > INCONCLUSIVE > PENDING_MIGRATION > MIGRATION_VALIDATED.
 
     With ``groups``, an entitlement of a baseline consumer that the baseline does not
-    cover is INCONCLUSIVE too: its original state was never recorded."""
+    cover is INCONCLUSIVE too: its original state was never recorded. ``retired``
+    consumers, whose temporary access complete retired, have left the scope: their failure
+    drops and baseline organizations are not judged (the drops stay recorded)."""
     baseline = record.get("baseline")
     reasons = [f"failure drop {d['kind']} {d['subject']} first absent {d['first_absent_at']}"
-               for d in failure_drops(record)]
+               for d in failure_drops(record) if d.get("consumer") not in retired]
     if comparison is not None and value(comparison, "status") == "LOSS":
         reasons += [f"{loss['reason']}: {loss['key']}" for loss in losses(comparison)]
     if reasons:
@@ -1304,7 +1311,8 @@ def migration_status(record: dict, comparison: Any | None, organizations: dict,
         return "INCONCLUSIVE", [f"observation gap: {gap.get('collector')} {gap.get('account')} "
                                 f"{gap.get('region')} {gap.get('reason')}" for gap in gaps] or [
                                     "the current observation is incomplete"]
-    before = baseline.get("consumer_organizations", {})
+    before = {consumer: organization for consumer, organization
+              in baseline.get("consumer_organizations", {}).items() if consumer not in retired}
     unknown = [f"current organization of {consumer} is unknown"
                for consumer in sorted(before) if consumer not in organizations]
     unknown += [f"{consumer} has no baseline organization; the original baseline does not cover it"
@@ -1370,6 +1378,12 @@ def selected_consumers(opts: Options, record: dict) -> list[str]:
         raise MigrationError(f"--consumers {','.join(unknown)}: not a migrating account of this "
                              f"migration record; its migrating accounts are {','.join(population)}")
     return sorted(set(opts.selected))
+
+
+def retired_at(record: dict, consumer: str) -> str:
+    """When complete recorded this consumer's latest retirement."""
+    return max((row.get("at") or "" for row in record.get("retirements") or []
+                if row.get("consumer") == consumer), default="")
 
 
 def transient(exc: Exception, verification: bool = False) -> bool:
@@ -1707,13 +1721,16 @@ def summary(plan: Plan, report: Reporter, status: str, *, mode: str, recorded: b
             created: int = 0, reused: int = 0, accepted: int = 0,
             reused_invitations: int = 0, failures: int = 0, comparison: Any = None,
             unassociated: int = 0, sharing: str | None = None,
-            migration: str | None = None, excluded: dict | None = None) -> None:
-    resources = {arn for group in plan.groups for arn in group.resources}
+            migration: str | None = None, excluded: dict | None = None,
+            groups: list | None = None) -> None:
+    """``groups``, when given, are what the totals count instead of the plan's groups."""
+    groups = plan.groups if groups is None else groups
+    resources = {arn for group in groups for arn in group.resources}
     entitlements = {(group.owner, group.region, arn, consumer, group.permissions[kind])
-                    for group in plan.groups for arn, kind in group.resources.items()
+                    for group in groups for arn, kind in group.resources.items()
                     for consumer in group.consumers}
     line = (f"status={status} migration={plan.migration} resources_in_plan={len(resources)} "
-            f"expected_entitlements={len(entitlements)} planned_shares={len(plan.groups)} "
+            f"expected_entitlements={len(entitlements)} planned_shares={len(groups)} "
             f"created_shares={created} reused_shares={reused} accepted_invitations={accepted} "
             f"reused_invitations={reused_invitations} exclusions={len(plan.excluded)} "
             f"blockers={len(plan.blocked)} verification_failures={failures}")
@@ -2004,9 +2021,31 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
             record = new_record(args.migration_id)
         else:
             record = load_record(args.record, args.migration_id)
+    if args.mode == "apply" and record is not None and record.get("retirements"):
+        raise MigrationError(
+            "this migration is being completed: complete has retired the temporary access of "
+            f"{','.join(sorted({row['consumer'] for row in record['retirements']}))} under "
+            f"migration ID {plan.migration}, so apply creates no further temporary shares for it; "
+            "plan and apply them under a new --migration-id and --record")
     recorded_regions: dict[str, set[str]] = {}
+    # verify: consumers complete retired have left the scope, and so has every temporary
+    # share retired from all its consumers (deleted); per share, the consumers retired from it.
+    retired: set[str] = set()
+    retired_from: dict[tuple[str, str, str], frozenset[str]] = {}
+    closed: set[tuple[str, str, str]] = set()
     if args.mode == "verify":
         recorded_regions = fill_scope_from_record(opts, record)
+        retired, pairs = retired_consumers(record), retired_pairs(record)
+        for entry in record.get("shares", []):
+            if entry.get("share_arn"):
+                key = (entry["owner"], entry["region"], entry["logical_id"])
+                retired_from[key] = frozenset(consumer for consumer in entry.get("consumers", [])
+                                              if (entry["share_arn"], consumer) in pairs)
+                if retired_from[key] >= set(entry.get("consumers", [])):
+                    closed.add(key)
+        for consumer in sorted(retired):
+            report.emit(f"consumer={consumer} phase=verification status=RETIRED "
+                        f"at={retired_at(record, consumer)}")
     approved_owner_scope = approved_owners(record) if record else set()
     added_owners = sorted(approved_owner_scope - set(opts.owners))
     if added_owners:
@@ -2030,7 +2069,8 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         if record is not None and args.mode in ("apply", "verify"):
             record = update_record(args.record, plan.migration, mutate, mode=args.mode,
                                    status=status, **{**opts.applied_plan, **details})
-    plan.blocked.extend(authenticate(router, set(opts.owners + opts.consumers), opts, report))
+    plan.blocked.extend(authenticate(router, set(opts.owners) | (set(opts.consumers) - retired),
+                                     opts, report))
     if plan.blocked:
         if not args.sso_role and not args.role_name:
             report.emit("For unmapped accounts, supply explicit --sso-role or an "
@@ -2084,6 +2124,10 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                 deployed[row.account, row.region] = copy.deepcopy(row.value)
             persisted.update(group.key for group in row.value)
             merge_plan(plan, Plan(plan.migration, groups=row.value))
+    stack_groups = list(plan.groups)
+    if args.mode == "verify":
+        # A share retired from every consumer is deleted and no longer expected in its stack.
+        plan.groups = [g for g in plan.groups if (g.owner, g.region, g.logical_id) not in closed]
     # What each existing temporary share attaches, by entitlement key: it keeps the
     # version it was created with, whatever the current default is.
     kept = {g.key: g.permission_snapshots for groups in deployed.values() for g in groups
@@ -2159,16 +2203,22 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
             plan.blocked.extend(baseline_scope_problems(
                 record["baseline"], plan.groups, [g for groups in deployed.values() for g in groups]))
     if args.mode == "verify" and record is not None:
-        # An unreadable stored plan is already a blocker; its shares are not missing.
+        # An unreadable stored plan is already a blocker; its shares are not missing. A
+        # closed share may be gone with its stack, or still in it.
         recorded = {(s["owner"], s["region"], s["logical_id"]) for s in record.get("shares", [])
-                    if (s["owner"], s["region"]) not in unread}
+                    if (s["owner"], s["region"]) not in unread} - closed
         stored = {(g.owner, g.region, g.logical_id) for g in plan.groups}
         plan.blocked += [f"phase=reviewed-record recorded temporary share {owner}/{region}/{logical} "
                          "is missing from its migration stack" for owner, region, logical
                          in sorted(recorded - stored)]
         plan.blocked += [f"phase=reviewed-record stack entitlement {owner}/{region}/{logical} is not "
                          "in the migration record" for owner, region, logical in sorted(stored - recorded)]
-    consumers_in_scope = sorted({c for g in plan.groups for c in g.consumers})
+    # What is observed and judged: verify's retired consumers have left the scope, and an
+    # unretired consumer's entitlements stay observed even through a closed share's group.
+    observed = plan.groups if args.mode != "verify" else [
+        replace(g, consumers=tuple(c for c in g.consumers if c not in retired))
+        if set(g.consumers) & retired else g for g in stack_groups if set(g.consumers) - retired]
+    consumers_in_scope = sorted({c for g in observed for c in g.consumers})
     preflight, organizations, pending_drops = None, {}, []
     if args.mode == "apply" and not plan.blocked and plan.groups:
         organizations, errors = consumer_organizations(gate, consumers_in_scope, opts)
@@ -2420,7 +2470,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
     for (owner, region), readback in sorted(readbacks.items()):
         failures += [f"owner={owner} region={region} logical_id={logical} phase=share-readback "
                      f"{readback.reason(logical)}" for logical in sorted(readback.failures)
-                     if (owner, region, logical) not in planned]
+                     if (owner, region, logical) not in planned | closed]
     for group in plan.groups:
         share = shares.get((group.owner, group.region), {}).get(group.logical_id)
         readback = readbacks.get((group.owner, group.region))
@@ -2469,6 +2519,8 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
             share = shares.get((owner, region), {}).get(group.logical_id)
             if share is None:
                 continue  # Missing shares already contribute a failure above.
+            # Consumers complete removed from this share are no longer its principals.
+            gone = retired_from.get((owner, region, group.logical_id), frozenset())
             try:
                 def check_current_share():
                     readback = verification_stacks.readback(owner, region)
@@ -2477,9 +2529,9 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                     current = readback.shares.get(group.logical_id)
                     if current is None:
                         raise MigrationError(f"{group.key}: migration share MISSING during verification")
-                    verify_group(readonly, group, current, plan.migration)
+                    verify_group(readonly, group, current, plan.migration, retired=gone)
                 poll(check_current_share, opts, verification=True)
-                for consumer in group.consumers:
+                for consumer in (c for c in group.consumers if c not in gone):
                     report.emit(f"owner={owner} region={region} share={share['resourceShareArn']} "
                                 f"consumer={consumer} phase=verification status=VERIFIED "
                                 f"resources={len(group.resources)}")
@@ -2497,10 +2549,10 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
     # Every current observation is compared with the one recorded original baseline.
     phase = "post-apply" if args.mode == "apply" else "verification"
     temporary = temporary_share_arns(record, shares)
-    final = observe(readonly, plan.groups, temporary, opts, report, phase)
+    final = observe(readonly, observed, temporary, opts, report, phase)
     organizations_now, errors = consumer_organizations(readonly, consumers_in_scope, opts)
     baseline = record.get("baseline")
-    comparison = verifier().compare(scoped_items(baseline["items"], plan.groups), final) \
+    comparison = verifier().compare(scoped_items(baseline["items"], observed), final) \
         if baseline else None
     new_drops = drops_from(comparison, final, organizations_now, args.mode,
                            baseline["captured_at"] if baseline else "",
@@ -2508,7 +2560,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
     if baseline:
         # Original shares that stopped reaching a consumer are expected while it moves;
         # they are recorded as informational drops and never change the status.
-        dropped, _ = share_changes(scoped_items(baseline["items"], plan.groups), final, temporary)
+        dropped, _ = share_changes(scoped_items(baseline["items"], observed), final, temporary)
         for row in dropped:
             report.emit(f"consumer={row['item']['consumer']} region={row['item']['region']} "
                         f"resource={row['item']['resource_arn']} phase={phase} "
@@ -2517,11 +2569,12 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                                           baseline["captured_at"],
                                           f"record revision {record['revision']}")
     projected = dict(record, drops=list(record.get("drops", [])) + new_drops)
-    status_now, reasons = migration_status(projected, comparison, organizations_now, plan.groups)
+    status_now, reasons = migration_status(projected, comparison, organizations_now, observed,
+                                           retired)
     reasons += errors
     if errors and status_now in ("MIGRATION_VALIDATED", "PENDING_MIGRATION"):
         status_now = "INCONCLUSIVE"
-    unassociated = unassociated_rules(plan.groups, final, baseline)
+    unassociated = unassociated_rules(observed, final, baseline)
     for consumer, region, arn in unassociated:
         report.emit(f"consumer={consumer} region={region} resource={arn} phase={phase} "
                     "status=NOT_ASSOCIATED this rule had no association before migration; "
@@ -2545,10 +2598,14 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         status = status_now if sharing_status == "SHARING_READY" else sharing_status
         code = 0 if status in ("MIGRATION_VALIDATED", "PENDING_MIGRATION") else \
             3 if status == "INCONCLUSIVE" else 1
+    # The totals count only the principals each temporary share is still expected to serve.
+    serving = [replace(g, consumers=tuple(c for c in g.consumers if c not in gone))
+               if (gone := retired_from.get((g.owner, g.region, g.logical_id))) else g
+               for g in plan.groups]
     summary(plan, report, status, **run, created=created, reused=reused,
             accepted=accepted_count, reused_invitations=reused_invitations, failures=len(failures),
             comparison=comparison, unassociated=len(unassociated),
-            sharing=sharing_status, migration=status_now)
+            sharing=sharing_status, migration=status_now, groups=serving)
     entry = {"at": value(final, "observed_at"), "mode": args.mode, "sharing_status": sharing_status,
              "migration_status": status_now, "reasons": reasons,
              "baseline_status": value(comparison, "status") if comparison is not None else None,
@@ -2578,14 +2635,17 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
     return code
 
 
-def settle(router: Any, groups: list, baseline: dict, temporary: frozenset[str],
-           organizations: dict, opts: Options, report: Reporter,
-           phase: str) -> tuple[list[str], list[dict]]:
-    """Keep re-verifying for the settle window; the first loss or gap stops completion."""
-    deadline = time.monotonic() + opts.args.settle_seconds
+def settle(router: Any, groups: list, baseline: dict | None, temporary: frozenset[str],
+           organizations: dict, opts: Options, report: Reporter, phase: str,
+           seconds: float | None = None) -> tuple[list[str], list[dict]]:
+    """Keep re-verifying for the settle window, --settle-seconds unless ``seconds`` is given
+    (0 observes once); the first loss or gap ends it. Without a baseline, which only --force
+    accepts, nothing original is compared, but gaps and replacement access still count."""
+    deadline = time.monotonic() + (opts.args.settle_seconds if seconds is None else seconds)
+    items = (baseline or {}).get("items", [])
     while True:
         observation = observe(router, groups, temporary, opts, report, phase)
-        comparison = verifier().compare(scoped_items(baseline["items"], groups), observation)
+        comparison = verifier().compare(scoped_items(items, groups), observation)
         replacement = verifier().replacement_access(router, groups, temporary,
                                                     workers=opts.args.region_workers)
         problems = [f"original {loss['reason']}: {loss['key']}" for loss in losses(comparison)]
@@ -2599,7 +2659,7 @@ def settle(router: Any, groups: list, baseline: dict, temporary: frozenset[str],
                      for gap in replacement["gaps"]]
         if problems:
             return problems, drops_from(comparison, observation, organizations, "complete",
-                                        baseline["captured_at"], phase)
+                                        (baseline or {}).get("captured_at", ""), phase)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return [], []
@@ -2607,7 +2667,15 @@ def settle(router: Any, groups: list, baseline: dict, temporary: frozenset[str],
 
 
 def run_complete(router: Router, opts: Options, ask: Callable[[str], str], report: Reporter) -> int:
-    """Retire the temporary path only after proving nothing original is missing or dropped."""
+    """Retire the temporary access of the chosen migrating accounts (--consumers, or every one
+    with --all-accounts), only after proving nothing original of theirs is missing or dropped.
+
+    A recorded temporary share serving a chosen account is deleted when it serves no other
+    unretired account, and otherwise loses only the chosen accounts' principals; a migration
+    stack is deleted once every recorded share in it is. The checks before any write are
+    scoped to the chosen accounts. --force overrides the baseline, original-state, failure-drop
+    and replacement-access checks only, never identity, record-versus-stack or ownership
+    checks. Every retirement is recorded as soon as AWS holds it."""
     args = opts.args
     record = load_record(args.record, args.migration_id)
     migration = record["migration_id"]
@@ -2616,7 +2684,7 @@ def run_complete(router: Router, opts: Options, ask: Callable[[str], str], repor
                     f"at={record['completion'].get('completed_at')}")
         return 0
     fill_scope_from_record(opts, record)
-    chosen = selected_consumers(opts, record)  # noqa: F841 - per-account completion follows
+    selection = selected_consumers(opts, record)
 
     def note(status: str, mutate: Callable[[dict], Any] = lambda _record: None,
              **details: Any) -> None:
@@ -2629,154 +2697,345 @@ def run_complete(router: Router, opts: Options, ask: Callable[[str], str], repor
     def refuse(problems: list[str], drops: list[dict] | None = None) -> int:
         for problem in problems:
             report.emit(f"phase=complete status=BLOCKED {problem}")
+        if args.force:  # every check --force overrides has been overridden by now
+            report.emit("phase=complete status=NOT_OVERRIDDEN --force never overrides identity, "
+                        "record-versus-stack or ownership checks")
         report.emit(f"status=BLOCKED migration={migration} phase=complete blockers={len(problems)} "
                     f"temporary shares retained{excluded}")
         note("BLOCKED", lambda current: add_drops(current, drops or []), blockers=problems)
         return 1
 
-    blocked = authenticate(router, set(opts.owners + opts.consumers), opts, report)
+    def listed(accounts: Any) -> str:
+        return ",".join(sorted(accounts)) or "none"
+
+    recorded = {(entry["owner"], entry["region"], entry["logical_id"]): entry
+                for entry in record.get("shares", []) if entry.get("share_arn")}
+    if not recorded:
+        return refuse(["the migration record has no temporary shares to retire"])
+    pairs = retired_pairs(record)
+    retired = retired_consumers(record)
+    served = {consumer for entry in recorded.values() for consumer in entry["consumers"]}
+    for consumer in selection:
+        if consumer in retired:
+            report.emit(f"consumer={consumer} phase=complete status=ALREADY_RETIRED "
+                        f"at={retired_at(record, consumer)}")
+        elif consumer not in served:
+            report.emit(f"consumer={consumer} phase=complete status=NO_TEMPORARY_SHARES no "
+                        "recorded temporary share serves this account")
+    chosen = [consumer for consumer in selection if consumer in served and consumer not in retired]
+    # Per recorded share: the chosen accounts this run retires from it, and the unretired
+    # others it keeps serving. Retirement is per share: a chosen account a stopped run
+    # already retired from a share is not acted on there again.
+    acting = {key: [c for c in entry["consumers"]
+                    if c in chosen and (entry["share_arn"], c) not in pairs]
+              for key, entry in recorded.items()}
+    keeping = {key: [c for c in entry["consumers"]
+                     if c not in chosen and (entry["share_arn"], c) not in pairs]
+               for key, entry in recorded.items()}
+    closed = {key for key, entry in recorded.items()
+              if all((entry["share_arn"], c) in pairs for c in entry["consumers"])}
+    affected = [key for key in sorted(recorded) if acting[key]]
+    touched = sorted({key[:2] for key in affected})
+    # A touched stack is emptied when none of its shares keeps serving anyone. Once no
+    # account remains, the stacks earlier runs emptied are deleted too, unless already gone.
+    emptied = [stack for stack in touched
+               if not any(keeping[key] for key in recorded if key[:2] == stack)]
+    final = not served - retired - set(chosen)
+    leftover = sorted({key[:2] for key in recorded} - set(touched)) if final else []
+    if not affected and not leftover:
+        report.emit(f"status=NOTHING_TO_RETIRE migration={migration} "
+                    f"retired_accounts={listed(retired)} "
+                    f"remaining_accounts={listed(served - retired)}{excluded}")
+        return 0
+
+    blocked = authenticate(router, {owner for owner, _ in touched + leftover} | set(chosen),
+                           opts, report)
     if blocked:
         return refuse(blocked)
-    entries = [entry for entry in record.get("shares", []) if entry.get("share_arn")]
-    if not entries:
-        return refuse(["the migration record has no temporary shares to retire"])
     gate = WriteGate(router)
     stacks = Stacks(gate, migration, timeout=args.timeout)
     scopes: dict[str, list[str]] = defaultdict(list)
-    for entry in entries:
-        if entry["region"] not in scopes[entry["owner"]]:
-            scopes[entry["owner"]].append(entry["region"])
-    groups: list[Group] = []
-    shares: dict[tuple[str, str], dict] = {}
+    for owner, region in touched:
+        scopes[owner].append(region)
+    stored: dict[tuple[str, str, str], Group] = {}
+    readbacks: dict[tuple[str, str], Readback] = {}
     problems: list[str] = []
     for row in scoped_fanout(scopes, lambda owner, region: (stacks.persisted_groups(owner, region),
-                                                            stacks.shares(owner, region)), opts):
+                                                            stacks.readback(owner, region)), opts):
         if row.error:
             problems.append(f"owner={row.account} region={row.region} phase=stored-plan {row.error}")
         else:
-            groups.extend(row.value[0])
-            shares[row.account, row.region] = row.value[1]
-    recorded = {(e["owner"], e["region"], e["logical_id"]): e for e in entries}
-    stored = {(g.owner, g.region, g.logical_id): g for g in groups}
+            stored.update({(g.owner, g.region, g.logical_id): g for g in row.value[0]})
+            readbacks[row.account, row.region] = row.value[1]
+    shares = {stack: readback.shares for stack, readback in readbacks.items()}
+    # Every share of a stack this run writes to is the recorded one, and one retired from
+    # every consumer is deleted: RAM returns it DELETED, or no longer at all.
+    here = {key: entry for key, entry in recorded.items() if key[:2] in touched}
     problems += [f"recorded temporary share {'/'.join(key)} is missing from its migration stack"
-                 for key in sorted(set(recorded) - set(stored))]
+                 for key in sorted(set(here) - set(stored))]
     problems += [f"stack entitlement {'/'.join(key)} is not in the migration record"
-                 for key in sorted(set(stored) - set(recorded))]
-    for key, entry in sorted(recorded.items()):
+                 for key in sorted(set(stored) - set(here))]
+    for (owner, region), readback in sorted(readbacks.items()):
+        problems += [f"owner={owner} region={region} logical_id={logical} phase=stored-plan "
+                     f"{readback.reason(logical)}" for logical in sorted(readback.failures)
+                     if (owner, region, logical) not in closed]
+    for key, entry in sorted(here.items()):
         live = shares.get(key[:2], {}).get(key[2])
         if live and live["resourceShareArn"] != entry["share_arn"]:
             problems.append(f"{'/'.join(key)}: stack share {live['resourceShareArn']} differs from "
                             f"recorded {entry['share_arn']}")
+        elif live and key in closed and live.get("status") != "DELETED":
+            problems.append(f"{'/'.join(key)}: temporary share {entry['share_arn']} is "
+                            f"{live.get('status')}, but this record retired it from every consumer")
+    leftover_scopes: dict[str, list[str]] = defaultdict(list)
+    for owner, region in leftover:
+        leftover_scopes[owner].append(region)
+    for row in scoped_fanout(leftover_scopes,
+                             lambda owner, region: stacks.existing(owner, region) is not None, opts):
+        if row.error:
+            problems.append(f"owner={row.account} region={row.region} phase=stored-plan {row.error}")
+        elif row.value:
+            emptied.append((row.account, row.region))
     if problems:
         return refuse(problems)
 
     temporary = temporary_share_arns(record, shares)
-    consumers = sorted({consumer for group in groups for consumer in group.consumers})
-    organizations, errors = consumer_organizations(gate, consumers, opts)
-    problems += errors
+    # The chosen accounts' temporary entitlements this run retires: the scope of every check.
+    retiring = {key: replace(stored[key], consumers=tuple(acting[key])) for key in affected}
+    checks: list[str] = []
+    organizations: dict[str, str] = {}
     baseline = record.get("baseline")
-    observation = observe(gate, groups, temporary, opts, report, "complete-preflight")
-    comparison = None
-    if baseline is None or not baseline.get("complete"):
-        problems.append("a complete original baseline is required before the temporary path is retired")
-    else:
-        before = baseline.get("consumer_organizations", {})
-        problems += [f"consumer {consumer} is not covered by the original baseline; its original "
-                     "state was never recorded, so its temporary shares cannot be retired safely"
-                     for consumer in consumers if consumer not in before]
-        problems += [f"entitlement owner={owner} region={region} consumer={consumer} resource={arn} "
-                     "is not covered by the original baseline; its original state was never "
-                     "recorded, so its temporary share cannot be retired safely"
-                     for owner, region, consumer, arn in uncovered_entitlements(baseline, groups)
-                     if consumer in before]
-        comparison = verifier().compare(scoped_items(baseline["items"], groups), observation)
-        if value(comparison, "status") != "INTACT":
-            problems += [f"original {loss['reason']}: {loss['key']}" for loss in losses(comparison)] or [
-                f"observation gap {gap.get('collector')} {gap.get('account')} {gap.get('region')} "
-                f"{gap.get('reason')}" for gap in value(comparison, "gaps")]
-    problems += [f"failure drop recorded: {drop['kind']} {drop['subject']} first absent "
-                 f"{drop['first_absent_at']}" for drop in failure_drops(record)]
-    replacement = verifier().replacement_access(gate, groups, temporary, workers=args.region_workers)
-    for row in replacement["covered"]:
-        report.emit(f"phase=replacement status=COVERED consumer={row.get('consumer')} "
-                    f"region={row.get('region')} resource={row.get('resource_arn')}")
-    problems += [f"phase=replacement consumer={row.get('consumer')} region={row.get('region')} "
-                 f"resource={row.get('resource_arn')}: only the temporary share provides access; "
-                 "establish permanent replacement sharing first" for row in replacement["uncovered"]]
-    problems += [f"phase=replacement gap {gap.get('account')} {gap.get('region')} {gap.get('reason')}"
-                 for gap in replacement["gaps"]]
-    if problems:
-        return refuse(problems, drops_from(comparison, observation, organizations, "complete",
-                                           baseline["captured_at"] if baseline else "",
-                                           f"record revision {record['revision']}"))
+    observation = comparison = None
+    if retiring:
+        organizations, checks = consumer_organizations(gate, chosen, opts)
+        observation = observe(gate, list(retiring.values()), temporary, opts, report,
+                              "complete-preflight")
+        if baseline is None or not baseline.get("complete"):
+            checks.append("a complete original baseline is required before the temporary path "
+                          "is retired")
+        else:
+            before = baseline.get("consumer_organizations", {})
+            checks += [f"consumer {consumer} is not covered by the original baseline; its "
+                       "original state was never recorded, so its temporary shares cannot be "
+                       "retired safely" for consumer in chosen if consumer not in before]
+            checks += [f"entitlement owner={owner} region={region} consumer={consumer} "
+                       f"resource={arn} is not covered by the original baseline; its original "
+                       "state was never recorded, so its temporary share cannot be retired safely"
+                       for owner, region, consumer, arn
+                       in uncovered_entitlements(baseline, list(retiring.values()))
+                       if consumer in before]
+            comparison = verifier().compare(
+                scoped_items(baseline["items"], list(retiring.values())), observation)
+            if value(comparison, "status") != "INTACT":
+                checks += [f"original {loss['reason']}: {loss['key']}"
+                           for loss in losses(comparison)] or [
+                    f"observation gap {gap.get('collector')} {gap.get('account')} "
+                    f"{gap.get('region')} {gap.get('reason')}" for gap in value(comparison, "gaps")]
+        # A drop naming no consumer is an owner-side loss that every consumer of that owner
+        # and Region relies on.
+        checks += [f"failure drop recorded: {drop['kind']} {drop['subject']} first absent "
+                   f"{drop['first_absent_at']}" for drop in failure_drops(record)
+                   if drop.get("consumer") in chosen or drop.get("consumer") is None and
+                   (drop.get("owner"), drop.get("region")) in touched]
+        replacement = verifier().replacement_access(gate, list(retiring.values()), temporary,
+                                                    workers=args.region_workers)
+        for row in replacement["covered"]:
+            report.emit(f"phase=replacement status=COVERED consumer={row.get('consumer')} "
+                        f"region={row.get('region')} resource={row.get('resource_arn')}")
+        checks += [f"phase=replacement consumer={row.get('consumer')} region={row.get('region')} "
+                   f"resource={row.get('resource_arn')}: only the temporary share provides access; "
+                   "establish permanent replacement sharing first" for row in replacement["uncovered"]]
+        checks += [f"phase=replacement gap {gap.get('account')} {gap.get('region')} {gap.get('reason')}"
+                   for gap in replacement["gaps"]]
+    drops = drops_from(comparison, observation, organizations, "complete",
+                       baseline["captured_at"] if baseline else "",
+                       f"record revision {record['revision']}")
+    if checks and not args.force:
+        return refuse(checks, drops)
+    forced = bool(checks)
+    for problem in checks:
+        report.emit(f"phase=complete status=OVERRIDDEN {problem}")
 
-    # Smallest share first: the first deletion is the canary step.
-    order = sorted(entries, key=lambda e: (len(stored[e["owner"], e["region"], e["logical_id"]].resources),
-                                           e["owner"], e["region"], e["logical_id"]))
-    for entry in order:
-        group = stored[entry["owner"], entry["region"], entry["logical_id"]]
-        report.emit(f"owner={entry['owner']} region={entry['region']} phase=complete action=DELETE_SHARE "
-                    f"share={entry['share_arn']} consumers={','.join(group.consumers)} "
-                    f"resources={len(group.resources)}")
-    owner_regions = sorted({(entry["owner"], entry["region"]) for entry in entries})
-    for owner, region in owner_regions:
+    # Smallest share first: the first action is the canary step.
+    order = sorted(affected, key=lambda key: (len(stored[key].resources), *key))
+    for key in order:
+        owner, region, _logical = key
+        detail = (f"share={recorded[key]['share_arn']} consumers={','.join(acting[key])} "
+                  f"resources={len(stored[key].resources)}")
+        if keeping[key]:
+            report.emit(f"owner={owner} region={region} phase=complete action=REMOVE_PRINCIPALS "
+                        f"{detail} retained_consumers={','.join(keeping[key])}")
+        else:
+            report.emit(f"owner={owner} region={region} phase=complete action=DELETE_SHARE {detail}")
+    for owner, region in sorted(emptied):
         report.emit(f"owner={owner} region={region} phase=complete action=DELETE_STACK "
                     f"stack={stack_name(migration, owner, region)}")
-    token = f"COMPLETE {migration}"
-    try:
-        reply = ask(f"Type {token} to delete these temporary shares and stacks, re-verifying after each: ")
-    except EOFError:
-        reply = ""
-    if reply != token:
-        report.emit("status=CANCELLED Confirmation did not match; no AWS writes requested")
-        return 2
-    gate.open = True
+    run: dict[str, Any] = {"consumers": chosen}
+    if forced:
+        run["forced"] = True
+    elif args.force:
+        run["force"] = "unused"  # nothing failed, so --force changed nothing
     deleted: list[str] = []
-    for entry in order:
-        group = stored[entry["owner"], entry["region"], entry["logical_id"]]
+    removed = 0  # principals removed
+    removed_stacks: list[str] = []
+    overridden = list(checks)
+    if affected or emptied:
+        if forced:
+            token = f"FORCE-COMPLETE {migration}"
+            prompt = (f"Type {token} to retire the temporary access of {listed(chosen)} with the "
+                      f"actions above despite the failed safety checks overridden above "
+                      f"({len(checks)}); these accounts may lose access to the resources above: ")
+        elif chosen:
+            token = f"COMPLETE {migration}"
+            prompt = (f"Type {token} to retire the temporary access of {listed(chosen)} with the "
+                      "actions above, re-verifying after each: ")
+        else:
+            token = f"COMPLETE {migration}"
+            prompt = f"Type {token} to delete the emptied migration stacks above: "
         try:
-            delete_share(gate, entry["owner"], entry["region"], entry["share_arn"], migration,
-                         timeout=args.timeout)
-        except Exception as exc:
-            report.emit(f"status=FAILED share={entry['share_arn']} phase=complete {failure_text(exc)}")
-            note("FAILED", failures=[failure_text(exc)], deleted=list(deleted))
-            return 1
-        deleted.append(entry["share_arn"])
-        report.emit(f"owner={entry['owner']} region={entry['region']} share={entry['share_arn']} "
-                    "phase=complete status=SHARE_DELETED")
-        note("SHARE_DELETED", deleted=list(deleted), share=entry["share_arn"])
-        losses_now, drops = settle(gate, [group], baseline, temporary, organizations, opts, report,
-                                   f"complete-settle-{len(deleted)}")
-        if losses_now:
-            for problem in losses_now:
-                report.emit(f"status=FAILED phase=complete {problem}")
-            report.emit("Completion stopped; the remaining temporary shares are retained.")
-            note("FAILED", lambda current: add_drops(current, drops), failures=losses_now,
-                 deleted=list(deleted))
-            return 1
-    losses_now, drops = settle(gate, groups, baseline, temporary, organizations, opts, report,
-                               "complete-final")
-    if losses_now:
-        for problem in losses_now:
+            reply = ask(prompt)
+        except EOFError:
+            reply = ""
+        if reply != token:
+            report.emit("status=CANCELLED Confirmation did not match; no AWS writes requested")
+            return 2
+        if forced:
+            note("FORCED", lambda current: add_drops(current, drops), overridden=checks,
+                 drops=len(drops), **run)
+        gate.open = True
+
+    def retire(key: tuple[str, str, str], consumers: list[str],
+               action: str) -> Callable[[dict], Any]:
+        """One retirement entry per (share, consumer), each recorded once."""
+        entry = recorded[key]
+        rows = [{"consumer": consumer, "owner": entry["owner"], "region": entry["region"],
+                 "logical_id": entry["logical_id"], "share_arn": entry["share_arn"],
+                 "action": action, "at": timestamp(), "forced": forced} for consumer in consumers]
+
+        def mutate(current: dict) -> None:
+            known = retired_pairs(current)
+            current.setdefault("retirements", []).extend(
+                row for row in rows if (row["share_arn"], row["consumer"]) not in known)
+        return mutate
+
+    def check(groups: list, phase: str) -> tuple[list[str], list[dict]]:
+        """After a write: re-verify for the settle window, or when forced observe once."""
+        try:
+            return settle(gate, groups, baseline, temporary, organizations, opts, report, phase,
+                          seconds=0 if forced else None)
+        except Exception as exc:  # an observation that fails never passes
+            return [f"{phase} observation failed: {failure_text(exc)}"], []
+
+    def stopped(problems: list[str], found: list[dict], retained: str) -> int:
+        for problem in problems:
             report.emit(f"status=FAILED phase=complete {problem}")
-        note("FAILED", lambda current: add_drops(current, drops), failures=losses_now,
-             deleted=list(deleted))
+        report.emit(f"Completion stopped; {retained} retained.")
+        note("FAILED", lambda current: add_drops(current, found), failures=problems,
+             deleted=list(deleted), principals_removed=removed, **run)
         return 1
-    removed = []
-    for owner, region in owner_regions:
+
+    # The losses this run recorded: one still absent at a later observation is the same
+    # loss, first absent when first recorded, never a new drop.
+    lost = {(drop["kind"], drop["consumer"], drop["region"], drop["subject"]) for drop in drops}
+
+    def overrode(problems: list[str], found: list[dict], **details: Any) -> None:
+        """When forced, a loss or gap after a write is reported and recorded, not stopped at."""
+        for problem in problems:
+            report.emit(f"phase=complete status=OVERRIDDEN {problem}")
+        overridden.extend(problems)
+        found = [drop for drop in found
+                 if (drop["kind"], drop["consumer"], drop["region"], drop["subject"]) not in lost]
+        lost.update((drop["kind"], drop["consumer"], drop["region"], drop["subject"])
+                    for drop in found)
+        note("OVERRIDDEN", lambda current: add_drops(current, found), problems=problems,
+             drops=len(found), **details, **run)
+
+    for index, key in enumerate(order, 1):
+        owner, region, _logical = key
+        arn, consumers = recorded[key]["share_arn"], acting[key]
+        status, action = ("PRINCIPALS_REMOVED", "PRINCIPAL_REMOVED") if keeping[key] else \
+            ("SHARE_DELETED", "SHARE_DELETED")
         try:
-            removed.append(stacks.delete(owner, region))
+            if keeping[key]:
+                remove_principals(gate, owner, region, arn, migration, consumers,
+                                  timeout=args.timeout)
+            else:
+                delete_share(gate, owner, region, arn, migration, timeout=args.timeout)
+        except (Exception, KeyboardInterrupt) as exc:
+            # A call can fail, or be interrupted, after AWS acted: what the share now holds,
+            # read back through a closed gate, is what the record keeps.
+            interrupted = isinstance(exc, KeyboardInterrupt)
+            failure = "interrupted" if interrupted else failure_text(exc)
+            try:
+                gone = sorted(unserved_consumers(WriteGate(router), owner, region, arn, consumers))
+            except Exception as unread:
+                gone = []
+                report.emit(f"owner={owner} region={region} share={arn} phase=record "
+                            f"status=UNKNOWN the share could not be read back "
+                            f"({failure_text(unread)}); run complete with this record again "
+                            "to reconcile it")
+            if gone and keeping[key]:
+                removed += len(gone)
+            elif gone:
+                deleted.append(arn)
+            report.emit(f"status={'INTERRUPTED' if interrupted else 'FAILED'} share={arn} "
+                        f"phase=complete {failure}" + (f" retired={','.join(gone)}" if gone else ""))
+            note("INTERRUPTED" if interrupted else "FAILED", retire(key, gone, action),
+                 failures=[failure], share=arn, retired=gone, deleted=list(deleted),
+                 principals_removed=removed, **run)
+            if interrupted:
+                raise
+            return 1
+        if keeping[key]:
+            removed += len(consumers)
+        else:
+            deleted.append(arn)
+        report.emit(f"owner={owner} region={region} share={arn} phase=complete status={status} "
+                    f"consumers={','.join(consumers)}")
+        note(status, retire(key, consumers, action), share=arn, retired=consumers,
+             deleted=list(deleted), principals_removed=removed, **run)
+        problems, found = check([retiring[key]], f"complete-settle-{index}")
+        if problems and not forced:
+            return stopped(problems, found, "the remaining temporary shares are")
+        if problems:
+            overrode(problems, found, share=arn)
+    if retiring:
+        problems, found = check(list(retiring.values()), "complete-final")
+        if problems and not forced:
+            return stopped(problems, found, "the migration stacks are")
+        if problems:
+            overrode(problems, found)
+    for owner, region in sorted(emptied):
+        try:
+            removed_stacks.append(stacks.delete(owner, region))
         except Exception as exc:
-            report.emit(f"status=FAILED owner={owner} region={region} phase=complete {failure_text(exc)}")
-            note("FAILED", failures=[failure_text(exc)], deleted=list(deleted), stacks=list(removed))
+            report.emit(f"status=FAILED owner={owner} region={region} phase=complete "
+                        f"{failure_text(exc)}")
+            note("FAILED", failures=[failure_text(exc)], deleted=list(deleted),
+                 stacks=list(removed_stacks), principals_removed=removed, **run)
             return 1
         report.emit(f"owner={owner} region={region} phase=complete status=STACK_DELETED")
-    completion = {"completed_at": timestamp(), "deleted_shares": deleted, "deleted_stacks": removed,
-                  "consumer_organizations": organizations}
-    note("COMPLETED", lambda current: current.__setitem__("completion", completion),
-         deleted=len(deleted), stacks=len(removed))
-    report.emit(f"status=COMPLETED migration={migration} deleted_shares={len(deleted)} "
-                f"deleted_stacks={len(removed)} original baseline intact{excluded}")
+
+    # COMPLETED once no account remains: every recorded share is then deleted, and so is
+    # every migration stack, by this run or an earlier one.
+    retired = retired_consumers(record)
+    remaining = sorted(served - retired)
+    status = "PARTIALLY_COMPLETED" if remaining else "COMPLETED"
+    completion = {"completed_at": timestamp(), "deleted_shares": deleted,
+                  "deleted_stacks": removed_stacks, "consumer_organizations": organizations,
+                  "forced": forced, "overridden": overridden}
+    note(status, (lambda _current: None) if remaining else
+         (lambda current: current.__setitem__("completion", completion)),
+         deleted=len(deleted), principals_removed=removed, stacks=len(removed_stacks),
+         retired=sorted(retired), remaining=remaining, **run)
+    line = (f"status={status} migration={migration} deleted_shares={len(deleted)} "
+            f"deleted_stacks={len(removed_stacks)} removed_principals={removed} "
+            f"retired_accounts={listed(retired)} remaining_accounts={listed(remaining)}")
+    if forced:
+        line += f" forced=true overridden={len(overridden)}"
+    elif retiring:
+        line += " original baseline intact"
+    report.emit(line + excluded)
     return 0
 
 
