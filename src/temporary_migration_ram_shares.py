@@ -2027,6 +2027,12 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
             f"{','.join(sorted({row['consumer'] for row in record['retirements']}))} under "
             f"migration ID {plan.migration}, so apply creates no further temporary shares for it; "
             "plan and apply them under a new --migration-id and --record")
+    if args.mode == "verify" and record is not None and record.get("completion"):
+        # Every temporary share is retired; the baseline comparison is the monitor's.
+        report.emit(f"status=ALREADY_COMPLETE migration={plan.migration} phase=verification "
+                    f"completed_at={record['completion'].get('completed_at')} no temporary shares "
+                    "remain to verify; run monitor to compare with the pre-migration baseline")
+        return 0
     recorded_regions: dict[str, set[str]] = {}
     # verify: consumers complete retired have left the scope, and so has every temporary
     # share retired from all its consumers (deleted); per share, the consumers retired from it.

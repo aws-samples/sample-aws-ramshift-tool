@@ -4112,3 +4112,16 @@ def test_verify_no_longer_expects_a_share_retired_from_every_consumer(
     assert "expected_entitlements=1 planned_shares=1 " in summary_line(output)
     assert f"{OTHER_CONSUMER} is still in its baseline organization" in output
     assert f"{CONSUMER} is still in its baseline organization" not in output
+
+
+def test_verify_of_a_completed_migration_reports_it_without_aws_reads(harness, migration_record):
+    applied(harness, migration_record)
+    harness.replacement.add((CONSUMER, REGION, POOL))
+    assert quietly(complete_args(migration_record), confirm_complete(harness)) == 0
+    assert read_record(migration_record)["completion"]
+    harness.calls.clear()
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert main(mode_args("verify", migration_record)) == 0
+    assert f"status=ALREADY_COMPLETE migration={MIGRATION} phase=verification" in out.getvalue()
+    assert [call[0] for call in harness.calls] == ["router"]
