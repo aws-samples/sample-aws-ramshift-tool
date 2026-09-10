@@ -1161,13 +1161,20 @@ def losses(comparison: Any) -> list[dict]:
     return rows
 
 
-def scoped_items(items: list[dict], groups: list) -> list[dict]:
-    """Baseline items belonging to these groups' consumers and resources."""
+def scoped_items(items: list[dict], groups: list, observation: Any = None) -> list[dict]:
+    """Baseline items belonging to these groups' consumers and resources.
+
+    An item of no consumer, such as a Resolver endpoint, belongs to any group using one of
+    its resources: its rule_arns, or for a baseline captured before rule_arns its
+    resource_arn, or else the observation of these groups produced it again."""
     pairs = {(consumer, arn) for group in groups for consumer in group.consumers
              for arn in group.resources}
     resources = {arn for _, arn in pairs}
-    return [item for item in items if item.get("resource_arn") in resources and (
-        item.get("consumer") is None or (item.get("consumer"), item.get("resource_arn")) in pairs)]
+    observed = {item["key"] for item in value(observation, "items")} if observation is not None else set()
+    return [item for item in items if (
+        (item.get("consumer"), item.get("resource_arn")) in pairs if item.get("consumer") is not None
+        else item.get("resource_arn") in resources or resources & set(item.get("rule_arns") or ())
+        or item["key"] in observed)]
 
 
 RECORDED_LOSS = ("the recorded baseline is never replaced - restore it or start a new "
@@ -1179,7 +1186,7 @@ def baseline_check(record: dict | None, observation: Any, groups: list) -> tuple
     baseline = (record or {}).get("baseline")
     if baseline is None:
         return capture_problems(observation), None
-    comparison = verifier().compare(scoped_items(baseline["items"], groups), observation)
+    comparison = verifier().compare(scoped_items(baseline["items"], groups, observation), observation)
     status = value(comparison, "status")
     if status == "LOSS":
         return [f"phase=baseline status=BLOCKED original {loss['reason']}: {loss['key']}; "
@@ -1370,7 +1377,11 @@ def selected_consumers(opts: Options, record: dict) -> list[str]:
     """The migrating accounts monitor/complete act on, after fill_scope_from_record: the
     accounts named with --consumers, each a migrating account of the record, or with
     --all-accounts every one of them."""
-    population = sorted(set(opts.consumers))
+    # A re-plan may narrow the scope; an account a recorded temporary share serves, or the
+    # baseline records, stays selectable so its temporary access can still be retired.
+    population = sorted(set(opts.consumers)
+                        | {c for entry in record.get("shares", []) for c in entry.get("consumers", [])}
+                        | set(((record.get("baseline") or {}).get("consumer_organizations") or {})))
     if opts.selected is None:
         return population
     unknown = sorted(set(opts.selected) - set(population))
@@ -2353,6 +2364,9 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                            "apply")
             if problem is None and captured is not None and current.get("baseline") is not None:
                 problem = "another apply recorded the original baseline; re-run apply"
+            if problem is None and (current.get("retirements") or current.get("completion")):
+                problem = ("complete retired temporary access meanwhile; this migration creates no "
+                           "further temporary shares")
             if problem:
                 raise ReviewedRecordChanged("the migration record changed while this apply waited "
                                             f"for confirmation, and nothing was written: {problem}")
@@ -2558,7 +2572,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
     final = observe(readonly, observed, temporary, opts, report, phase)
     organizations_now, errors = consumer_organizations(readonly, consumers_in_scope, opts)
     baseline = record.get("baseline")
-    comparison = verifier().compare(scoped_items(baseline["items"], observed), final) \
+    comparison = verifier().compare(scoped_items(baseline["items"], observed, final), final) \
         if baseline else None
     new_drops = drops_from(comparison, final, organizations_now, args.mode,
                            baseline["captured_at"] if baseline else "",
@@ -2566,7 +2580,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
     if baseline:
         # Original shares that stopped reaching a consumer are expected while it moves;
         # they are recorded as informational drops and never change the status.
-        dropped, _ = share_changes(scoped_items(baseline["items"], observed), final, temporary)
+        dropped, _ = share_changes(scoped_items(baseline["items"], observed, final), final, temporary)
         for row in dropped:
             report.emit(f"consumer={row['item']['consumer']} region={row['item']['region']} "
                         f"resource={row['item']['resource_arn']} phase={phase} "
@@ -2651,7 +2665,7 @@ def settle(router: Any, groups: list, baseline: dict | None, temporary: frozense
     items = (baseline or {}).get("items", [])
     while True:
         observation = observe(router, groups, temporary, opts, report, phase)
-        comparison = verifier().compare(scoped_items(items, groups), observation)
+        comparison = verifier().compare(scoped_items(items, groups, observation), observation)
         replacement = verifier().replacement_access(router, groups, temporary,
                                                     workers=opts.args.region_workers)
         problems = [f"original {loss['reason']}: {loss['key']}" for loss in losses(comparison)]
@@ -2831,7 +2845,7 @@ def run_complete(router: Router, opts: Options, ask: Callable[[str], str], repor
                        in uncovered_entitlements(baseline, list(retiring.values()))
                        if consumer in before]
             comparison = verifier().compare(
-                scoped_items(baseline["items"], list(retiring.values())), observation)
+                scoped_items(baseline["items"], list(retiring.values()), observation), observation)
             if value(comparison, "status") != "INTACT":
                 checks += [f"original {loss['reason']}: {loss['key']}"
                            for loss in losses(comparison)] or [
@@ -3176,9 +3190,9 @@ def run_monitor(router: Router, opts: Options, report: Reporter) -> int:
         return finish("INCONCLUSIVE", {})
     gate = WriteGate(router)  # never opened: the monitor only reads AWS
     temporary = temporary_share_arns(record, {})
-    items = scoped_items(baseline["items"], groups)
     observation = observe(gate, groups, temporary, opts, report, "monitor") if groups else \
         {"observed_at": timestamp(), "items": [], "gaps": []}
+    items = scoped_items(baseline["items"], groups, observation)
     comparison = verifier().compare(items, observation)
     organizations, errors = consumer_organizations(gate, chosen, opts)
     reasons += errors

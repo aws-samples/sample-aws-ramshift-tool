@@ -260,9 +260,9 @@ def association(association_id=ASSOCIATION_ID, rule_id=RULE_ID, arn=RULE, vpc=VP
                 rule_id=rule_id, vpc_id=vpc, association_id=association_id, status=status)
 
 
-def endpoint(status="OPERATIONAL", ips=(("10.0.1.10", "ATTACHED"),), arn=RULE):
+def endpoint(status="OPERATIONAL", ips=(("10.0.1.10", "ATTACHED"),), arn=RULE, rules=None):
     return item("resolver_endpoint", [OWNER, REGION, ENDPOINT_ID], None, arn,
-                endpoint_id=ENDPOINT_ID, status=status,
+                endpoint_id=ENDPOINT_ID, rule_arns=list(rules or [arn]), status=status,
                 ip_addresses=None if ips is None else [{"ip": ip, "status": s} for ip, s in ips])
 
 
@@ -495,9 +495,10 @@ def test_resolver_forward_and_system_rules_endpoints_and_associations(world):
     assert keyed(observation.items) == keyed([
         entitlement(RULE, RESOLVER), entitlement(SECOND_RULE, RESOLVER),
         entitlement(SYSTEM_RULE, RESOLVER),
-        # One item per endpoint, attributed to the first in-scope rule that uses it.
+        # One item per endpoint, attributed to the first in-scope rule that uses it and
+        # naming every in-scope rule that does.
         endpoint(ips=(("10.0.1.10", "ATTACHED"), ("10.0.2.10", "UPDATING"),
-                      ("fd00:ec2::10", "ATTACHED"))),
+                      ("fd00:ec2::10", "ATTACHED")), rules=sorted([RULE, SECOND_RULE])),
         association(),
         association(SECOND_ASSOCIATION_ID, SYSTEM_RULE_ID, SYSTEM_RULE, vpc=OTHER_VPC)])
     assert "do-not-copy" not in json.dumps(observation.to_dict())

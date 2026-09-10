@@ -4125,3 +4125,25 @@ def test_verify_of_a_completed_migration_reports_it_without_aws_reads(harness, m
         assert main(mode_args("verify", migration_record)) == 0
     assert f"status=ALREADY_COMPLETE migration={MIGRATION} phase=verification" in out.getvalue()
     assert [call[0] for call in harness.calls] == ["router"]
+
+
+def test_endpoint_items_scope_by_any_rule_using_them_or_by_their_observation():
+    rule_a, rule_b = (f"arn:aws:route53resolver:{REGION}:{OWNER}:resolver-rule/rslvr-rr-{n}" for n in "ab")
+    only_a = [Group(OWNER, REGION, (CONSUMER,), {RESOLVER: "p"}, {rule_a: RESOLVER})]
+    endpoint = {"kind": "resolver_endpoint", "key": f"resolver_endpoint|{OWNER}|{REGION}|rslvr-out-1",
+                "consumer": None, "owner": OWNER, "region": REGION, "resource_arn": rule_b}
+    assert cli.scoped_items([endpoint], only_a) == []  # recorded against the other account's rule
+    assert cli.scoped_items([dict(endpoint, rule_arns=[rule_a, rule_b])], only_a) == [
+        dict(endpoint, rule_arns=[rule_a, rule_b])]
+    observed = {"items": [dict(endpoint, resource_arn=rule_a)]}  # an older baseline: no rule_arns
+    assert cli.scoped_items([endpoint], only_a, observed) == [endpoint]
+
+
+def test_a_replan_that_drops_an_account_keeps_its_temporary_access_retirable(harness, migration_record):
+    harness.source[OWNER, REGION].append(group(consumer=OTHER_CONSUMER))
+    applied(harness, migration_record, args(consumers=f"{CONSUMER},{OTHER_CONSUMER}"))
+    rewrite(migration_record, scope=dict(read_record(migration_record)["scope"],
+                                         migrating_consumers=[CONSUMER]))
+    args_ = cli.build_parser().parse_args(["complete", "--consumers", OTHER_CONSUMER])
+    opts = cli.Options(args_, [], [CONSUMER], [], [], {}, {}, None, selected=[OTHER_CONSUMER])
+    assert cli.selected_consumers(opts, read_record(migration_record)) == [OTHER_CONSUMER]

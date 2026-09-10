@@ -299,7 +299,7 @@ def _rules(task: _Task, arns: list[str], rule_ids: dict[str, str]) -> None:
     listed: dict[Any, list[dict]] = defaultdict(list)
     for row in rows:
         listed[row.get("Arn")].append(row)
-    endpoints: dict[str, str] = {}
+    endpoints: dict[str, list[str]] = defaultdict(list)
     for arn in arns:
         matches = listed.get(arn, [])
         rule = matches[0] if len(matches) == 1 else {}
@@ -313,16 +313,17 @@ def _rules(task: _Task, arns: list[str], rule_ids: dict[str, str]) -> None:
         # FORWARD and SYSTEM rules alike are bridged; only FORWARD rules need an endpoint.
         rule_ids[arn] = rule_id
         if endpoint:
-            endpoints.setdefault(endpoint, arn)
+            endpoints[endpoint].append(arn)
         elif rule.get("RuleType") == "FORWARD":
             task.gap("resolver_endpoints", arn, _reason("UnexpectedResponse", "ListResolverRules"))
-    for endpoint, arn in sorted(endpoints.items()):
-        _endpoint(task, endpoint, arn)
+    for endpoint, users in sorted(endpoints.items()):
+        _endpoint(task, endpoint, sorted(users))
 
 
-def _endpoint(task: _Task, endpoint_id: str, rule_arn: str) -> None:
-    """One item per endpoint. Its resource_arn is the first in-scope rule using it,
-    so the item stays in the scope of the groups that rely on it."""
+def _endpoint(task: _Task, endpoint_id: str, rule_arns: list[str]) -> None:
+    """One item per endpoint. Its resource_arn is the first in-scope rule using it and
+    rule_arns every one, so the item stays in the scope of any group relying on it."""
+    rule_arn = rule_arns[0]
     def read():
         value = task.client("route53resolver").get_resolver_endpoint(
             ResolverEndpointId=endpoint_id).get("ResolverEndpoint") or {}
@@ -346,7 +347,7 @@ def _endpoint(task: _Task, endpoint_id: str, rule_arn: str) -> None:
     ips = task.attempt("resolver_endpoints", rule_arn, "list_resolver_endpoint_ip_addresses", addresses)
     task.items.append(_item(
         "resolver_endpoint", [task.account, task.region, endpoint_id], None, task.account,
-        task.region, rule_arn, endpoint_id=endpoint_id, status=status,
+        task.region, rule_arn, endpoint_id=endpoint_id, rule_arns=rule_arns, status=status,
         ip_addresses=None if ips is _FAILED else ips))
 
 
