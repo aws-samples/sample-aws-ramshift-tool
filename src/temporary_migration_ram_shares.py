@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
-"""Interactive orchestration for additive RAM migration shares (Python 3.11+).
+"""RAMShift: keep migrating accounts' access to shared AWS resources while they move
+between AWS Organizations (Python 3.11+).
 
-Plan is the default and cannot request writable clients. With ``--record`` it
-writes a versioned migration record that ``approve``, ``apply`` and ``verify``
-consume. Approve binds an explicit approval to a proposed owner scope; a
-managed-permission version difference is reported and needs none. Apply
-requires a PLANNED record revision whose entitlements still match live
-discovery, then opens its write gate only after complete preflight, the
-exact ``APPLY <migration-id>`` reply, and a check under the record lock that the
-record still holds that reviewed revision. It records each stack's shares as
-the stack completes, and its outcome even when it fails or is interrupted.
-Plan and apply, before and after the confirmation, also evaluate the
-organization's SCPs and RCPs read-only (ram_migration_preflight).
-This tool neither moves accounts nor cleans up shares or Resolver associations.
+plan (read-only) discovers what the migrating accounts receive through organization or
+OU shares and writes a reviewed migration record. approve approves a proposed owner scope.
+apply creates temporary account-targeted RAM shares that survive leaving an organization,
+accepts their invitations and captures the pre-migration baseline. verify (read-only)
+checks the temporary shares and the baseline. monitor (read-only, on demand) reports what
+changed since the baseline. complete retires the temporary access of chosen accounts once
+permanent sharing exists and nothing original is lost. RAMShift never moves accounts and
+never changes original shares, IAM roles, trusts or policies.
 """
 from __future__ import annotations
 
@@ -37,7 +34,7 @@ from botocore.exceptions import (
 )
 
 from ram_migration_common import (
-    Api, Group, MigrationError, Plan, Router, account_id, check_sdk, digest,
+    PRODUCT, TOOL_VERSION, Api, Group, MigrationError, Plan, Router, account_id, check_sdk, digest,
     error_text, pages, timestamp,
 )
 from ram_migration_discovery import (
@@ -105,18 +102,19 @@ def nonnegative_number(value: str) -> float:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__,
-        epilog=(
-            "Complete the AWS CLI login and explicit account/role selection "
-            "first. Profiles are never selected automatically."
-        ),
+        prog="ramshift",
+        epilog="Documentation: README.md and docs/USER_GUIDE.md shipped with RAMShift.",
     )
+    parser.add_argument("--version", action="version",
+                        version=f"{PRODUCT} {TOOL_VERSION}")
     parser.add_argument("mode", nargs="?",
                         choices=("plan", "approve", "apply", "verify", "complete", "monitor"),
                         default="plan")
     parser.add_argument("--migration-id", help="stable identifier for this migration")
     parser.add_argument("--record", type=Path,
-                        help="versioned migration record: written by plan and approve, "
-                             "required by apply, verify, monitor and complete")
+                        help="versioned migration record: written by every mode except a "
+                             "plan without it; required by approve, apply, verify, monitor and "
+                             "complete")
     parser.add_argument("--owners", "--accounts", dest="owners", nargs="+", action="append",
                         default=[], help="explicit owner/inspection account IDs; spaces or commas")
     parser.add_argument("--consumers", nargs="+", action="append", default=[],
