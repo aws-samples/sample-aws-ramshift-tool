@@ -1,6 +1,6 @@
 """Read-only organization-policy preflight for temporary migration shares.
 
-large-estate cases case 051, case 053 and case 054. ``plan`` runs it before recording a
+It checks the organization-policy and RAM-organization requirements. ``plan`` runs it before recording a
 reviewed plan, and ``apply`` runs it again before its confirmation and after it,
 immediately before the write gate. Through each organization's management
 account it reads the service control policies (SCPs) and resource control
@@ -799,7 +799,7 @@ def _unreadable(governance: Governance, roles: list[str], destination: str | Non
 
 
 # ---------------------------------------------------------------------------
-# RAM organization prerequisites (case 054)
+# RAM organization prerequisites
 # ---------------------------------------------------------------------------
 
 def _organization_principal(principal: str) -> tuple[str, str] | None:
