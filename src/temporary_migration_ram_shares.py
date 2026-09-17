@@ -26,7 +26,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from botocore.exceptions import (
     BotoCoreError, ClientError, ConnectionClosedError, ConnectTimeoutError,
@@ -119,10 +119,17 @@ def build_parser() -> argparse.ArgumentParser:
                         default=[], help="explicit owner/inspection account IDs; spaces or commas")
     parser.add_argument("--consumers", nargs="+", action="append", default=[],
                         help="plan/apply: explicit migrating consumer account IDs; monitor/"
-                             "complete: the migrating accounts of the record to act on; spaces "
+                             "complete: the tracked accounts of the record to act on; spaces "
                              "or commas")
+    parser.add_argument("--exclude-consumers", nargs="+", action="append", default=[],
+                        help="account IDs explicitly excluded from recipient discovery, "
+                             "verification and invitation handling, including stationary "
+                             "recipients; requires --exclude-consumers-reason")
+    parser.add_argument("--exclude-consumers-reason",
+                        help="mandatory reason for --exclude-consumers; recorded with the "
+                             "reviewed scope and inherited by verify/monitor/complete")
     parser.add_argument("--all-accounts", action="store_true",
-                        help="monitor/complete: act on every migrating account in the migration "
+                        help="monitor/complete: act on every tracked account in the migration "
                              "record instead of the accounts named with --consumers")
     parser.add_argument("--force", action="store_true",
                         help="complete: retire the temporary access even when its safety checks "
@@ -142,6 +149,13 @@ def build_parser() -> argparse.ArgumentParser:
                              "be excluded")
     parser.add_argument("--exclude-reason",
                         help="mandatory reason for --exclude-regions, recorded with them")
+    parser.add_argument("--exclude-tgw-routes", action="store_true",
+                        help="exclude TGW-targeted VPC route collection and verification only; "
+                             "RAM visibility and attachment checks still run. Requires "
+                             "--exclude-tgw-routes-reason and a fresh reviewed plan")
+    parser.add_argument("--exclude-tgw-routes-reason",
+                        help="mandatory reason for --exclude-tgw-routes; bound to the reviewed "
+                             "plan and captured baseline, and inherited by verify/monitor/complete")
     parser.add_argument("--destination-ou",
                         help="plan/apply: destination OU (or root) ARN, "
                              "arn:aws:organizations::<management-account>:ou/<o-id>/<ou-id>; the "
@@ -231,6 +245,13 @@ class Options:
     # monitor/complete: the migrating accounts named with --consumers; None with
     # --all-accounts. selected_consumers() checks them against the record.
     selected: list[str] | None = None
+    # Explicit route verification exclusion; immutable after baseline capture.
+    tgw_route_exclusion_reason: str | None = None
+    # Derived from original-share evidence, never added to the migrating population.
+    stationary_consumers: list[str] = field(default_factory=list)
+    # Explicit recipient exclusions; cannot change after baseline capture.
+    excluded_consumers: list[str] = field(default_factory=list)
+    consumer_exclusion_reason: str | None = None
 
 
 MIGRATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
@@ -252,6 +273,155 @@ def exclusion_text(excluded: dict | None) -> str:
         return ""
     return (f" excluded_regions={','.join(excluded['regions'])} "
             f"exclusion_reason={json.dumps(excluded['reason'])}")
+
+
+def _consumer_exclusion_reason(text: Any) -> str:
+    if not isinstance(text, str) or not text.strip():
+        raise MigrationError("--exclude-consumers requires --exclude-consumers-reason: "
+                             "a nonempty reason recorded with the recipient scope")
+    if len(text) > MAX_REASON or any(ord(char) < 32 or ord(char) == 127 for char in text):
+        raise MigrationError("--exclude-consumers-reason must be one line of at most "
+                             f"{MAX_REASON} characters without control characters")
+    return text.strip()
+
+
+def excluded_consumer_options(args: argparse.Namespace) -> tuple[list[str], str | None]:
+    accounts = [checked_account(account)
+                for account in split_values(getattr(args, "exclude_consumers", []))]
+    reason = getattr(args, "exclude_consumers_reason", None)
+    if not accounts and reason is None:
+        return [], None
+    if args.mode == "approve":
+        raise MigrationError("--exclude-consumers is not supported by approve")
+    if not accounts:
+        raise MigrationError("--exclude-consumers-reason requires --exclude-consumers")
+    return accounts, _consumer_exclusion_reason(reason)
+
+
+def consumer_exclusion_scope(opts: Options) -> dict | None:
+    if not opts.excluded_consumers:
+        return None
+    return {"accounts": sorted(set(opts.excluded_consumers)),
+            "reason": _consumer_exclusion_reason(opts.consumer_exclusion_reason)}
+
+
+def recorded_consumer_exclusions(scope: dict) -> dict | None:
+    excluded = scope.get("excluded_consumers")
+    if excluded is None:
+        return None
+    if not isinstance(excluded, dict) or set(excluded) != {"accounts", "reason"} or \
+            not isinstance(excluded["accounts"], list) or not excluded["accounts"]:
+        raise MigrationError("Invalid recorded recipient exclusions")
+    accounts = sorted({checked_account(account) for account in excluded["accounts"]})
+    reason = _consumer_exclusion_reason(excluded["reason"])
+    if accounts != excluded["accounts"] or reason != excluded["reason"]:
+        raise MigrationError("Recorded recipient exclusions are not canonical")
+    return {"accounts": accounts, "reason": reason}
+
+
+def consumer_scope_problem(record: dict, excluded: dict | None) -> str | None:
+    baseline = record.get("baseline")
+    if baseline is None:
+        return None
+    if recorded_consumer_exclusions(baseline) != excluded:
+        return ("phase=baseline-scope status=BLOCKED recipient exclusions differ from the "
+                "captured baseline; retire existing access and create a fresh plan")
+    accounts = set((excluded or {}).get("accounts", []))
+    tracked = set(baseline.get("consumer_organizations", {})) | {
+        item.get("consumer") for item in baseline.get("items", [])}
+    if accounts & tracked:
+        return ("phase=baseline-scope status=BLOCKED excluded recipients remain in the "
+                "captured baseline; an exclusion cannot hide recorded access")
+    return None
+
+
+def excluded_group_problems(groups: list[Group], excluded: set[str]) -> list[str]:
+    return [
+        f"owner={group.owner} region={group.region} phase=stored-plan status=BLOCKED "
+        f"excluded_consumers={','.join(sorted(set(group.consumers) & excluded))} "
+        f"remain in temporary share {group.logical_id}; retire that access before resetting "
+        "the recipient scope"
+        for group in groups if set(group.consumers) & excluded]
+
+
+def report_consumer_exclusions(opts: Options, report: "Reporter") -> None:
+    excluded = consumer_exclusion_scope(opts)
+    if excluded:
+        report.emit("phase=recipient-scope status=EXCLUDED "
+                    f"accounts={','.join(excluded['accounts'])} "
+                    f"reason={json.dumps(excluded['reason'])}")
+
+
+def _route_exclusion_reason(text: Any) -> str:
+    if not isinstance(text, str) or not text.strip():
+        raise MigrationError("--exclude-tgw-routes requires --exclude-tgw-routes-reason: "
+                             "a nonempty reason recorded with the verification scope")
+    if len(text) > MAX_REASON or any(ord(char) < 32 or ord(char) == 127 for char in text):
+        raise MigrationError("--exclude-tgw-routes-reason must be one line of at most "
+                             f"{MAX_REASON} characters without control characters")
+    return text.strip()
+
+
+def excluded_tgw_route_reason(args: argparse.Namespace) -> str | None:
+    enabled = getattr(args, "exclude_tgw_routes", False)
+    reason = getattr(args, "exclude_tgw_routes_reason", None)
+    if not enabled and reason is None:
+        return None
+    if args.mode == "approve":
+        raise MigrationError("--exclude-tgw-routes is not supported by approve")
+    if not enabled:
+        raise MigrationError("--exclude-tgw-routes-reason requires --exclude-tgw-routes")
+    return _route_exclusion_reason(reason)
+
+
+def verification_exclusions(opts: Options) -> dict | None:
+    if opts.tgw_route_exclusion_reason is None:
+        return None
+    return {"collectors": ["tgw_routes"], "item_kinds": ["tgw_route"],
+            "reason": _route_exclusion_reason(opts.tgw_route_exclusion_reason)}
+
+
+def recorded_verification_exclusions(scope: dict) -> dict | None:
+    excluded = scope.get("verification_exclusions")
+    if excluded is None:
+        return None
+    if not isinstance(excluded, dict) or set(excluded) != {"collectors", "item_kinds", "reason"} or \
+            excluded["collectors"] != ["tgw_routes"] or excluded["item_kinds"] != ["tgw_route"]:
+        raise MigrationError("Invalid recorded verification exclusions; only explicit TGW "
+                             "route exclusion is supported")
+    reason = _route_exclusion_reason(excluded["reason"])
+    if reason != excluded["reason"]:
+        raise MigrationError("Recorded TGW route exclusion reason is not canonical")
+    return {"collectors": ["tgw_routes"], "item_kinds": ["tgw_route"], "reason": reason}
+
+
+def verification_scope_problem(record: dict, excluded: dict | None) -> str | None:
+    baseline = record.get("baseline")
+    if baseline is None:
+        return None
+    captured = recorded_verification_exclusions(baseline)
+    if captured != excluded:
+        return ("phase=baseline-scope status=BLOCKED verification exclusions differ from the "
+                "captured baseline; they cannot change after capture")
+    if excluded and any(item.get("kind") == "tgw_route" for item in baseline.get("items", [])):
+        return ("phase=baseline-scope status=BLOCKED captured baseline contains TGW routes; "
+                "a verification exclusion cannot hide recorded items")
+    return None
+
+
+def verification_exclusion_text(excluded: dict | None) -> str:
+    if excluded is None:
+        return ""
+    return (" excluded_verification_collectors=tgw_routes verification_exclusion_reason="
+            + json.dumps(excluded["reason"]))
+
+
+def report_verification_exclusions(opts: Options, report: "Reporter") -> None:
+    excluded = verification_exclusions(opts)
+    if excluded:
+        report.emit("phase=verification-scope status=EXCLUDED collector=tgw_routes kind=tgw_route "
+                    f"reason={json.dumps(excluded['reason'])}")
+        report.emit("TGW route health and network reachability are outside this verification scope.")
 
 
 def aliases_record(export: Path, record: Path) -> bool:
@@ -299,6 +469,8 @@ def excluded_regions(args: argparse.Namespace, regions: list[str]) -> tuple[list
 
 
 def options(args: argparse.Namespace, ask: Callable[[str], str]) -> Options:
+    route_reason = excluded_tgw_route_reason(args)
+    omitted_consumers, consumer_reason = excluded_consumer_options(args)
     if args.destination_ou is not None:
         if args.mode not in ("plan", "apply"):
             raise MigrationError("--destination-ou is supported only for plan and apply")
@@ -331,6 +503,10 @@ def options(args: argparse.Namespace, ask: Callable[[str], str]) -> Options:
 
     owners = [checked_account(value) for value in split_values(args.owners)]
     consumers = [checked_account(value) for value in split_values(args.consumers)]
+    overlap = sorted(set(omitted_consumers) & set(owners + consumers))
+    if overlap:
+        raise MigrationError(f"Accounts {','.join(overlap)} are both requested and "
+                             "excluded with --exclude-consumers")
     regions = split_values(args.regions)
     if any(not REGION.fullmatch(region) for region in regions):
         raise MigrationError("Regions must be AWS Region names")
@@ -414,7 +590,10 @@ def options(args: argparse.Namespace, ask: Callable[[str], str]) -> Options:
         capabilities = {key.lower(): value for key, value in capabilities.items()}
     return Options(args, owners, consumers, sorted(set(regions) | {RAM_HOME_REGION}),
                    profiles, mappings, principals, capabilities,
-                   excluded_regions=excluded, exclusion_reason=reason, selected=selected)
+                   excluded_regions=excluded, exclusion_reason=reason, selected=selected,
+                   tgw_route_exclusion_reason=route_reason,
+                   excluded_consumers=omitted_consumers,
+                   consumer_exclusion_reason=consumer_reason)
 
 
 class WriteGate:
@@ -977,6 +1156,7 @@ def merge_plan(plan: Plan, addition: Plan) -> None:
     plan.permission_changes.extend(addition.permission_changes)
     plan.notes.extend(addition.notes)
     plan.external_access.extend(addition.external_access)
+    plan.owner_continuity.extend(addition.owner_continuity)
 
 
 def entitlement_sites(groups: list) -> set[tuple[str, str, str, str]]:
@@ -995,14 +1175,15 @@ def uncovered_entitlements(baseline: dict, groups: list,
                   if (consumer, region, arn) not in covered)
 
 
-def baseline_scope_problems(baseline: dict, groups: list, deployed: list) -> list[str]:
+def baseline_scope_problems(baseline: dict, groups: list, deployed: list,
+                            migrating_owners: Iterable[str] = ()) -> list[str]:
     """An apply never writes an entitlement the recorded original baseline does not cover.
 
     The baseline is captured once, at the first write gate, and never extended or
     replaced, so an entitlement added by a later plan has no recorded original state:
     verify could not validate it and complete could not retire it safely."""
     organizations = baseline.get("consumer_organizations", {})
-    return [f"phase=baseline-scope status=BLOCKED owner={owner} region={region} "
+    problems = [f"phase=baseline-scope status=BLOCKED owner={owner} region={region} "
             f"consumer={consumer} resource={arn}: this entitlement is not in the recorded "
             f"original baseline (captured in revision {baseline.get('captured_in_revision')})"
             + ("" if consumer in organizations else
@@ -1011,6 +1192,12 @@ def baseline_scope_problems(baseline: dict, groups: list, deployed: list) -> lis
               "add it"
             for owner, region, consumer, arn in uncovered_entitlements(
                 baseline, groups, entitlement_sites(deployed))]
+    problems += [
+        f"phase=baseline-scope status=BLOCKED owner={owner}: the migrating owner's "
+        "original organization is not in the captured baseline; use a separate "
+        "owner-phase record because the original baseline is never extended or replaced"
+        for owner in sorted(set(migrating_owners) - set(organizations))]
+    return problems
 
 
 def capabilities_for(opts: Options) -> tuple[dict[str, bool], dict]:
@@ -1053,6 +1240,19 @@ def validate_groups(groups: list[Group], scopes: dict[str, list[str]]) -> None:
             checked_account(consumer)
         if group.owner in group.consumers:
             raise MigrationError("Owner must not be a consumer of its own migration share")
+
+
+def validate_discovered_consumers(groups: list[Group], moving: set[str],
+                                  migrating_owners: set[str]) -> None:
+    """Extra recipients require discovery's original-share continuity evidence."""
+    for group in groups:
+        stationary = set(getattr(group, "stationary_consumers", ()))
+        outside = set(group.consumers) - moving
+        if stationary - set(group.consumers) or stationary & moving or \
+                outside != stationary or stationary and group.owner not in migrating_owners:
+            raise MigrationError(
+                "Discovery returned consumers outside the moving population without "
+                "stationary-consumer evidence from a migrating owner's original share")
 
 
 HEALTH = {
@@ -1109,7 +1309,8 @@ def observe(router: Any, groups: list, temporary: frozenset[str], opts: Options,
             report: Reporter, phase: str) -> Any:
     progress = Progress(report, f"observation:{phase}", group_accounts(groups))
     observation = verifier().collect(router, groups, temporary_shares=temporary,
-                                     workers=opts.args.region_workers)
+                                     workers=opts.args.region_workers, allowed_regions=opts.regions,
+                                     include_tgw_routes=opts.tgw_route_exclusion_reason is None)
     progress.observed(observation)
     for item in sorted(value(observation, "items"), key=lambda row: row["key"]):
         report.emit(f"phase={phase} {describe_item(item)}")
@@ -1219,11 +1420,15 @@ def consumer_organizations(router: Any, consumers: list[str],
     return found, errors
 
 
-def new_baseline(observation: Any, organizations: dict, revision: int) -> dict:
+def new_baseline(observation: Any, organizations: dict, revision: int,
+                 excluded_verification: dict | None = None,
+                 excluded_consumers: dict | None = None) -> dict:
     gaps = list(value(observation, "gaps"))
     return {"schema": 1, "captured_at": value(observation, "observed_at"),
             "captured_in_revision": revision, "complete": not gaps, "gaps": gaps,
             "consumer_organizations": dict(sorted(organizations.items())),
+            "verification_exclusions": excluded_verification,
+            "excluded_consumers": excluded_consumers,
             "items": sorted(value(observation, "items"), key=lambda row: row["key"])}
 
 
@@ -1328,7 +1533,17 @@ def migration_status(record: dict, comparison: Any | None, organizations: dict,
                 if consumer in before]
     if unknown:
         return "INCONCLUSIVE", unknown
-    staying = sorted(consumer for consumer, org in before.items() if organizations[consumer] == org)
+    scope = record.get("scope") or {}
+    moving = set(scope.get("migrating_consumers", [])) | set(scope.get("migrating_owners", []))
+    if not moving:
+        moving = set(before) - set(scope.get("stationary_consumers", []))
+    unrecorded_owners = set(scope.get("migrating_owners", [])) - set(before) - set(retired)
+    if unrecorded_owners:
+        return "INCONCLUSIVE", [
+            f"migrating owner {owner} has no original baseline organization"
+            for owner in sorted(unrecorded_owners)]
+    staying = sorted(consumer for consumer, org in before.items()
+                     if consumer in moving and organizations[consumer] == org)
     if staying:
         return "PENDING_MIGRATION", [f"{consumer} is still in its baseline organization {before[consumer]}"
                                      for consumer in staying]
@@ -1347,6 +1562,21 @@ def fill_scope_from_record(opts: Options, record: dict) -> dict[str, set[str]]:
     regions = sorted(set(scope.get("regions", [])) | {RAM_HOME_REGION})
     detected = sorted(scope.get("detected_owners") or [])
     excluded = scope.get("excluded_regions") or None
+    verification_excluded = recorded_verification_exclusions(scope)
+    consumer_excluded = recorded_consumer_exclusions(scope)
+    if opts.excluded_consumers and consumer_exclusion_scope(opts) != consumer_excluded:
+        raise MigrationError("--exclude-consumers/--exclude-consumers-reason differ from "
+                             "the migration record recipient scope")
+    if opts.tgw_route_exclusion_reason is not None and \
+            verification_exclusions(opts) != verification_excluded:
+        raise MigrationError("--exclude-tgw-routes/--exclude-tgw-routes-reason differ from "
+                             "the migration record verification scope")
+    problem = verification_scope_problem(record, verification_excluded)
+    if problem:
+        raise MigrationError(problem)
+    problem = consumer_scope_problem(record, consumer_excluded)
+    if problem:
+        raise MigrationError(problem)
     if not owners or not consumers:
         raise MigrationError("The migration record has no reviewed account scope; run plan --record")
     # Migrating owners found by their owned shares need not be repeated in --owners.
@@ -1362,9 +1592,26 @@ def fill_scope_from_record(opts: Options, record: dict) -> dict[str, set[str]]:
         raise MigrationError("--exclude-regions/--exclude-reason differ from the migration record "
                              f"scope {json.dumps(excluded)}")
     opts.owners, opts.consumers, opts.regions = owners, consumers, regions
+    stationary = scope.get("stationary_consumers") or []
+    if not isinstance(stationary, list):
+        raise MigrationError("The migration record has invalid stationary-consumer scope")
+    opts.stationary_consumers = sorted({checked_account(account) for account in stationary})
+    if set(opts.stationary_consumers) & set(consumers):
+        raise MigrationError("Stationary and migrating consumer scopes overlap")
+    omitted = set((consumer_excluded or {}).get("accounts", []))
+    tracked = set(owners + consumers + opts.stationary_consumers) | {
+        account for entry in [*record.get("shares", []),
+                              *(record.get("plan") or {}).get("groups", [])]
+        for account in entry.get("consumers", [])}
+    if omitted & tracked:
+        raise MigrationError("Excluded recipients remain in the migration record scope or "
+                             "temporary shares; retire existing access and create a fresh plan")
     opts.detected_owners = detected
     opts.excluded_regions = list(excluded["regions"]) if excluded else []
     opts.exclusion_reason = excluded["reason"] if excluded else None
+    opts.tgw_route_exclusion_reason = verification_excluded["reason"] if verification_excluded else None
+    opts.excluded_consumers = sorted(omitted)
+    opts.consumer_exclusion_reason = consumer_excluded["reason"] if consumer_excluded else None
     located: dict[str, set[str]] = defaultdict(set)
     for row in [*record.get("shares", []), *(record.get("plan") or {}).get("groups", [])]:
         located[row["owner"]].add(row["region"])
@@ -1372,20 +1619,18 @@ def fill_scope_from_record(opts: Options, record: dict) -> dict[str, set[str]]:
 
 
 def selected_consumers(opts: Options, record: dict) -> list[str]:
-    """The migrating accounts monitor/complete act on, after fill_scope_from_record: the
-    accounts named with --consumers, each a migrating account of the record, or with
-    --all-accounts every one of them."""
+    """The moving and stationary accounts monitor/complete track from the record."""
     # A re-plan may narrow the scope; an account a recorded temporary share serves, or the
     # baseline records, stays selectable so its temporary access can still be retired.
-    population = sorted(set(opts.consumers)
+    population = sorted(set(opts.consumers) | set(opts.stationary_consumers)
                         | {c for entry in record.get("shares", []) for c in entry.get("consumers", [])}
                         | set(((record.get("baseline") or {}).get("consumer_organizations") or {})))
     if opts.selected is None:
         return population
     unknown = sorted(set(opts.selected) - set(population))
     if unknown:
-        raise MigrationError(f"--consumers {','.join(unknown)}: not a migrating account of this "
-                             f"migration record; its migrating accounts are {','.join(population)}")
+        raise MigrationError(f"--consumers {','.join(unknown)}: not a tracked account of this "
+                             f"migration record; its tracked accounts are {','.join(population)}")
     return sorted(set(opts.selected))
 
 
@@ -1520,7 +1765,10 @@ def account_scope(opts: Options) -> dict:
     does not name it (``detected_owners``). Regions the operator excluded, with the
     reason, are part of the reviewed scope."""
     owners, consumers = set(opts.owners), set(opts.consumers)
-    return {
+    if set(opts.excluded_consumers) & (owners | consumers | set(opts.stationary_consumers)):
+        raise MigrationError("Excluded recipients overlap the requested or stationary "
+                             "account scope")
+    scope = {
         "migrating_consumers": sorted(consumers - owners),
         "migrating_owners": sorted(owners & consumers),
         "stationary_owners": sorted(owners - consumers),
@@ -1528,11 +1776,17 @@ def account_scope(opts: Options) -> dict:
         "regions": sorted(opts.regions),
         "scan_enabled_regions": bool(opts.args.scan_enabled_regions),
         "excluded_regions": exclusion_scope(opts),
+        "verification_exclusions": verification_exclusions(opts),
     }
+    if opts.excluded_consumers:
+        scope["excluded_consumers"] = consumer_exclusion_scope(opts)
+    if opts.stationary_consumers:
+        scope["stationary_consumers"] = sorted(set(opts.stationary_consumers) - consumers)
+    return scope
 
 
 def group_record(group: Group, migration: str) -> dict:
-    return {
+    result = {
         "key": group.key, "logical_id": group.logical_id,
         "stack": stack_name(migration, group.owner, group.region),
         "owner": group.owner, "region": group.region,
@@ -1542,6 +1796,10 @@ def group_record(group: Group, migration: str) -> dict:
         "source_shares": sorted(set(group.source_shares)),
         "source_stacks": sorted(set(getattr(group, "source_stacks", []))),
     }
+    stationary = getattr(group, "stationary_consumers", ())
+    if stationary:
+        result["stationary_consumers"] = list(stationary)
+    return result
 
 
 # One comparison: its source shares are listed under it.
@@ -1607,6 +1865,7 @@ def organization_policies(router: Any, plan: Plan, opts: Options, report: Report
         router, plan.groups, opts.consumers, destination=opts.args.destination_ou,
         organization_shares={arn: principals for arn, principals in organization_shares.items()
                              if arn in sources},
+        include_tgw_routes=opts.tgw_route_exclusion_reason is None,
         emit=report.emit)
 
 
@@ -1623,6 +1882,8 @@ def record_plan(record: dict, plan: Plan, scope: dict, prepared: dict, received:
         "blocked": list(plan.blocked),
         "excluded": list(plan.excluded),
         "notes": list(plan.notes),
+        "owner_continuity": sorted(copy.deepcopy(plan.owner_continuity),
+                                   key=lambda row: (row["owner"], row["region"], row["share"])),
         # Information for reviewers, as print_permission_changes shows it; never approved.
         "permission_changes": copy.deepcopy(plan.permission_changes),
         "existing_shares": sorted({s.get("resourceShareArn", "unknown") for s in plan.existing}),
@@ -1731,7 +1992,7 @@ def summary(plan: Plan, report: Reporter, status: str, *, mode: str, recorded: b
             reused_invitations: int = 0, failures: int = 0, comparison: Any = None,
             unassociated: int = 0, sharing: str | None = None,
             migration: str | None = None, excluded: dict | None = None,
-            groups: list | None = None) -> None:
+            groups: list | None = None, verification_exclusions: dict | None = None) -> None:
     """``groups``, when given, are what the totals count instead of the plan's groups."""
     groups = plan.groups if groups is None else groups
     resources = {arn for group in groups for arn in group.resources}
@@ -1754,7 +2015,7 @@ def summary(plan: Plan, report: Reporter, status: str, *, mode: str, recorded: b
                  f"observation_gaps={len(value(comparison, 'gaps'))}")
     if unassociated:
         line += f" unassociated_resolver_rules={unassociated}"
-    report.emit(line + exclusion_text(excluded))
+    report.emit(line + exclusion_text(excluded) + verification_exclusion_text(verification_exclusions))
     report.emit("Sharing status is not live migration acceptance evidence. "
                 "Resource totals cover planned entitlements; excluded inventory is reported separately.")
     if excluded:
@@ -2073,8 +2334,18 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         scope["approved_owner_scope"] = sorted(approved_owner_scope)
         return scope
     scope = reviewed_scope()
+    if record is not None:
+        problem = verification_scope_problem(record, verification_exclusions(opts))
+        if problem:
+            raise MigrationError(problem)
+        problem = consumer_scope_problem(record, consumer_exclusion_scope(opts))
+        if problem:
+            raise MigrationError(problem)
+    report_verification_exclusions(opts, report)
+    report_consumer_exclusions(opts, report)
     # Selects each next action, and puts any Region exclusion on every summary line.
-    run = {"mode": args.mode, "recorded": record is not None, "excluded": exclusion_scope(opts)}
+    run = {"mode": args.mode, "recorded": record is not None, "excluded": exclusion_scope(opts),
+           "verification_exclusions": verification_exclusions(opts)}
 
     def note(status: str, mutate: Callable[[dict], Any] = lambda _record: None,
              **details: Any) -> None:
@@ -2128,6 +2399,9 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
             return []
         groups = stacks.persisted_groups(owner, region)
         validate_groups(groups, {owner: [region]})
+        problems = excluded_group_problems(groups, set(opts.excluded_consumers))
+        if problems:
+            raise MigrationError("; ".join(problems))
         return groups
     for row in scoped_fanout(scopes, load_persisted, opts):
         if row.error:
@@ -2156,13 +2430,15 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         report.emit(f"phase=plan capability_provenance={json.dumps(capability_provenance, sort_keys=True)}")
         discovery = Discovery(gate, set(opts.consumers), plan.migration, opts.principals, capabilities,
                               migrating_owners=set(scope["migrating_owners"]),
-                              share_workers=args.share_workers, cache=cache, deployed=kept)
+                              share_workers=args.share_workers, cache=cache, deployed=kept,
+                              excluded_consumers=set(opts.excluded_consumers),
+                              consumer_exclusion_reason=opts.consumer_exclusion_reason)
         def inspect(owner, region):
             report.emit(f"owner={owner} region={region} phase=discovery status=STARTED")
             result = discovery.inspect(owner, region)
             validate_groups(result.groups, {owner: [region]})
-            if any(set(group.consumers) - set(opts.consumers) for group in result.groups):
-                raise MigrationError("Discovery returned consumers outside the approved population")
+            validate_discovered_consumers(
+                result.groups, set(opts.consumers), set(scope["migrating_owners"]))
             return result
         for row in scoped_fanout(scopes, inspect, opts, Progress(report, "discovery", scopes)):
             if row.error:
@@ -2177,8 +2453,18 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         print_received(received, report)
         plan.blocked.extend(received.blocked)
         plan.excluded.extend(received.excluded)
+        opts.stationary_consumers = sorted(
+            {consumer for group in plan.groups for consumer in group.consumers}
+            - set(opts.consumers))
+        scope = reviewed_scope()
+        scope["proposed_owners"] = sorted(proposed)
+        if opts.stationary_consumers:
+            report.emit(
+                f"phase=owner-continuity status=SCOPED "
+                f"stationary_consumers={','.join(opts.stationary_consumers)} "
+                "source=original-share-evidence accounts_are_migrating=false")
     additional_consumers = {consumer for group in plan.groups for consumer in group.consumers} \
-        - set(opts.owners + opts.consumers)
+        - set(opts.owners + opts.consumers + opts.excluded_consumers)
     plan.blocked.extend(authenticate(router, additional_consumers, opts, report))
     grouped, group_scopes = grouped_scopes(plan.groups)
     prepared: dict = {}
@@ -2216,7 +2502,8 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                     "and review it")
         if record.get("baseline") is not None:
             plan.blocked.extend(baseline_scope_problems(
-                record["baseline"], plan.groups, [g for groups in deployed.values() for g in groups]))
+                record["baseline"], plan.groups, [g for groups in deployed.values() for g in groups],
+                scope["migrating_owners"]))
     if args.mode == "verify" and record is not None:
         # An unreadable stored plan is already a blocker; its shares are not missing. A
         # closed share may be gone with its stack, or still in it.
@@ -2233,7 +2520,8 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
     observed = plan.groups if args.mode != "verify" else [
         replace(g, consumers=tuple(c for c in g.consumers if c not in retired))
         if set(g.consumers) & retired else g for g in stack_groups if set(g.consumers) - retired]
-    consumers_in_scope = sorted({c for g in observed for c in g.consumers})
+    consumers_in_scope = sorted(
+        ({c for g in observed for c in g.consumers} | set(scope["migrating_owners"])) - retired)
     preflight, organizations, pending_drops = None, {}, []
     if args.mode == "apply" and not plan.blocked and plan.groups:
         organizations, errors = consumer_organizations(gate, consumers_in_scope, opts)
@@ -2328,6 +2616,13 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         # The original baseline is observed again immediately before the first write.
         captured = None
         if not plan.blocked:
+            organizations_at_gate, errors = consumer_organizations(gate, consumers_in_scope, opts)
+            plan.blocked.extend(errors)
+            if not errors and organizations_at_gate != organizations:
+                plan.blocked.append(
+                    "phase=baseline status=BLOCKED account organization changed during "
+                    "confirmation; re-run plan before any sharing writes")
+        if not plan.blocked:
             at_gate = observe(gate, plan.groups, temporary_share_arns(record, {}), opts, report,
                               "baseline")
             problems, comparison = baseline_check(record, at_gate, plan.groups)
@@ -2337,7 +2632,9 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                              f"confirmation ({loss['reason']}): {loss['key']}"
                              for loss in losses(moved)]
                 if not problems:
-                    captured = new_baseline(at_gate, organizations, record["revision"] + 1)
+                    captured = new_baseline(at_gate, organizations, record["revision"] + 1,
+                                            verification_exclusions(opts),
+                                            consumer_exclusion_scope(opts))
             plan.blocked.extend(problems)
             pending_drops = drops_from(comparison, at_gate, organizations, "apply",
                                        record["baseline"]["captured_at"] if record.get("baseline")
@@ -2703,6 +3000,8 @@ def run_complete(router: Router, opts: Options, ask: Callable[[str], str], repor
         return 0
     fill_scope_from_record(opts, record)
     selection = selected_consumers(opts, record)
+    report_verification_exclusions(opts, report)
+    report_consumer_exclusions(opts, report)
 
     def note(status: str, mutate: Callable[[dict], Any] = lambda _record: None,
              **details: Any) -> None:
@@ -2710,7 +3009,8 @@ def run_complete(router: Router, opts: Options, ask: Callable[[str], str], repor
         record = update_record(args.record, migration, mutate, mode="complete", status=status,
                                **details)
 
-    excluded = exclusion_text(exclusion_scope(opts))
+    excluded = (exclusion_text(exclusion_scope(opts))
+                + verification_exclusion_text(verification_exclusions(opts)))
 
     def refuse(problems: list[str], drops: list[dict] | None = None) -> int:
         for problem in problems:
@@ -3136,7 +3436,10 @@ def run_monitor(router: Router, opts: Options, report: Reporter) -> int:
     migration = record["migration_id"]
     fill_scope_from_record(opts, record)
     chosen = selected_consumers(opts, record)
-    excluded = exclusion_text(exclusion_scope(opts))
+    report_verification_exclusions(opts, report)
+    report_consumer_exclusions(opts, report)
+    excluded = (exclusion_text(exclusion_scope(opts))
+                + verification_exclusion_text(verification_exclusions(opts)))
     baseline = record.get("baseline")
     retired = retired_consumers(record)
     reasons: list[str] = []

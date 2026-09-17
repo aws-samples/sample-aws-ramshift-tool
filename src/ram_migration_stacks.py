@@ -110,6 +110,9 @@ def template_for(groups: list[Group], migration: str) -> dict:
                 "PermissionSnapshots": copy.deepcopy(getattr(group, "permission_snapshots", {})),
             },
         }
+        stationary = getattr(group, "stationary_consumers", ())
+        if stationary:
+            resources[group.logical_id]["Metadata"]["StationaryConsumers"] = list(stationary)
     return {"AWSTemplateFormatVersion": "2010-09-09",
             "Description": "Additive RAM migration sharing; underlying resources are never created here.",
             "Resources": resources}
@@ -163,6 +166,14 @@ def _validate_resource(logical: str, item: dict, migration: str,
     if not isinstance(lineage, list) or not lineage or any(not isinstance(a, str) for a in lineage):
         raise MigrationError(f"{logical}: source lineage missing")
     metadata = item["Metadata"]
+    stationary = metadata.get("StationaryConsumers", [])
+    if not isinstance(stationary, list) or \
+            any(not isinstance(account, str) for account in stationary) or \
+            stationary != sorted(set(stationary)) or \
+            not set(stationary) <= set(properties["Principals"]):
+        raise MigrationError(f"{logical}: invalid stationary-consumer metadata")
+    for account in stationary:
+        account_id(account)
     region, kinds, permissions = (metadata.get("OwnerRegion"), metadata.get("ResourceTypes"),
                                  metadata.get("PermissionTypes"))
     if not isinstance(region, str) or not region or not isinstance(kinds, dict) or \
@@ -222,6 +233,10 @@ def additive_template(old: dict, new: dict, migration: str) -> dict:
         prior_metadata, fresh_metadata = prior["Metadata"], fresh["Metadata"]
         prior_metadata["SourceStackIds"] = sorted(set(
             prior_metadata.get("SourceStackIds", []) + fresh_metadata.get("SourceStackIds", [])))
+        stationary = sorted(set(prior_metadata.get("StationaryConsumers", [])
+                                + fresh_metadata.get("StationaryConsumers", [])))
+        if stationary:
+            prior_metadata["StationaryConsumers"] = stationary
         resource_types = prior_metadata.setdefault("ResourceTypes", {})
         for arn, kind in fresh_metadata.get("ResourceTypes", {}).items():
             if arn in resource_types and resource_types[arn] != kind:
@@ -445,7 +460,8 @@ class Stacks:
                 raise MigrationError(f"{logical}: permission type metadata differs from RAM permissions")
             group = ApprovedGroup(owner, region, tuple(sorted(properties["Principals"])),
                                   permissions, resources, metadata["SourceShareArns"], snapshots,
-                                  metadata.get("SourceStackIds", []))
+                                  metadata.get("SourceStackIds", []),
+                                  tuple(metadata.get("StationaryConsumers", [])))
             if group.logical_id != logical:
                 raise MigrationError(f"{logical}: template entitlement identity does not match approved grants")
             groups.append(group)

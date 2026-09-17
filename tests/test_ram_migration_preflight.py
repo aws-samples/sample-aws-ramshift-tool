@@ -392,7 +392,8 @@ def test_destination_prerequisites_and_policies_are_read_through_the_destination
     assert source["required_by"] == [SHARE]
     assert f"phase=ram-org-prerequisites organization={MNA} status=MET all_features=true " \
            "ram_trusted_access=true shares=1" in lines
-    assert "the RAM service-linked role is not read: IAM is outside this preflight" in result["notes"]
+    assert ("the RAM service-linked role is not read; IAM is read only to verify the "
+            "authenticated caller's role ARN") in result["notes"]
 
 
 def test_a_consolidated_billing_destination_has_no_policies_and_fails_all_features():
@@ -584,11 +585,11 @@ def test_statements_it_can_decide(statement, action, context, expected):
 
 @pytest.mark.parametrize("statement,context,reason", [
     (deny({"ArnNotLike": {"aws:PrincipalArn": "arn:aws:iam::*:role/Migration"}}), CREATE,
-     "condition key aws:PrincipalArn is not evaluated"),
+     "condition key aws:PrincipalArn has no known value for this request"),
     (deny({"StringNotEquals": {"aws:PrincipalAccount": "${aws:ResourceAccount}"}}), CREATE,
      "condition values of aws:PrincipalAccount use a policy variable"),
     (deny({"ArnLike": {"aws:PrincipalOrgID": "o-*"}}), CREATE,
-     "condition operator ArnLike is not evaluated"),
+     "condition operator ArnLike is not evaluated for aws:PrincipalOrgID"),
     (deny({"StringEquals": {"ram:RequestedAllowsExternalPrincipals": "true"}}), CREATE,
      "condition operator StringEquals is not evaluated for ram:RequestedAllowsExternalPrincipals"),
     (deny({"NumericLessThan": {"aws:MultiFactorAuthAge": 3600}}), CREATE,
@@ -632,7 +633,7 @@ def test_a_principal_exception_the_evaluator_cannot_resolve_blocks_as_a_reviewed
     assert gap.startswith(f"phase=org-policy status=GAP decision=UNDECIDED account={OWNER} "
                           "role=owner ")
     assert "actions=ram:CreateResourceShare " in gap and "sid=BlockExternalRAMCreate" in gap
-    assert "(condition key aws:PrincipalArn is not evaluated)" in gap
+    assert "(condition key aws:PrincipalArn has no known value for this request)" in gap
     assert any(line.startswith("phase=org-policy status=REVIEW policy=p-coreguard1 statement=1 ")
                for line in lines)
 
@@ -758,8 +759,12 @@ def test_full_access_everywhere_allows_every_request_and_records_policy_hashes()
     result, lines = run(router, [share()], migrating=[])
     assert result["status"] == "ALLOWED" and result["blockers"] == []
     assert result["accounts"][0]["path"] == [CORE_ROOT, CNPF_OU, OWNER]
-    assert f"phase=org-policy account={OWNER} roles=owner status=EVALUATED organization={CORE} " \
-           f"path={CORE_ROOT}/{CNPF_OU}/{OWNER} scp=ENABLED rcp=NOT_ENABLED" in lines
+    # This fake router serves no STS, so the caller's role ARN stays unknown; no
+    # statement here conditions on it.
+    assert any(line.startswith(
+        f"phase=org-policy account={OWNER} roles=owner status=EVALUATED organization={CORE} "
+        f"path={CORE_ROOT}/{CNPF_OU}/{OWNER} scp=ENABLED rcp=NOT_ENABLED principal_arn=UNKNOWN")
+        for line in lines)
     policies = result["organizations"][CORE]["policies"]
     assert set(policies) == {FULL} and policies[FULL]["aws_managed"] is True
     assert result["evaluator"]["sha256"] == preflight.EVALUATOR_SHA256

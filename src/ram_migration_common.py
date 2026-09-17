@@ -18,7 +18,7 @@ from botocore.tokens import SSOTokenProvider
 
 PURPOSE = "TemporaryMigrationRAMShares"
 PRODUCT = "RAMShift"
-TOOL_VERSION = "1.0.0"
+TOOL_VERSION = "0.0.0"
 CONFIG = Config(retries={"mode": "adaptive", "max_attempts": 8},
                 connect_timeout=10, read_timeout=30)
 ACCOUNT = re.compile(r"^\d{12}$")
@@ -120,6 +120,9 @@ class Plan:
     # organization, so no temporary share duplicates it and the received audit counts
     # that share as covered for that consumer.
     external_access: list[dict] = field(default_factory=list)
+    # Original-share evidence for stationary recipients of a migrating owner.
+    # These accounts receive an account-level bridge but do not join the moving wave.
+    owner_continuity: list[dict] = field(default_factory=list)
 
     def merge(self, other: "Plan") -> None:
         grouped = {g.key: g for g in self.groups}
@@ -137,6 +140,7 @@ class Plan:
         self.permission_changes += other.permission_changes
         self.notes += other.notes
         self.external_access += other.external_access
+        self.owner_continuity += other.owner_continuity
 
     def to_dict(self) -> dict:
         return asdict(self)

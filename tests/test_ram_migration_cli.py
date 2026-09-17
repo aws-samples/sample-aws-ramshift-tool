@@ -259,7 +259,8 @@ class FakeVerification:
         return sorted(share for share in shares if share in temporary and share not in h.deleted_shares
                       and (share, consumer) not in getattr(h, "removed_principals", set()))
 
-    def collect(self, router, groups, *, temporary_shares=frozenset(), workers=4):
+    def collect(self, router, groups, *, temporary_shares=frozenset(), workers=4,
+                allowed_regions=None, include_tgw_routes=True):
         self.harness.calls.append(("collect", len(groups), tuple(sorted(temporary_shares))))
         return SimpleNamespace(observed_at=f"t{len(self.harness.calls)}",
                                items=self.items(groups, temporary_shares),
@@ -1509,7 +1510,7 @@ def test_merge_retains_optional_permission_and_stack_evidence():
 def test_discovery_may_not_broaden_requested_consumer_population(harness, capsys):
     harness.source[OWNER, REGION] = [group(consumer=OTHER_CONSUMER)]
     assert main(args("apply"), input_fn=lambda _: pytest.fail("Plan is blocked")) == 1
-    assert "outside the approved population" in capsys.readouterr().out
+    assert "outside the moving population" in capsys.readouterr().out
     assert not harness.writes()
 
 
@@ -2535,7 +2536,7 @@ def test_complete_refuses_a_selected_account_outside_the_record(harness, capsys,
     assert main(mode_args("complete", migration_record, "--settle-seconds", "0",
                           "--consumers", OTHER_CONSUMER),
                 input_fn=lambda _: pytest.fail("must not confirm")) == 1
-    assert f"--consumers {OTHER_CONSUMER}: not a migrating account of this migration record" \
+    assert f"--consumers {OTHER_CONSUMER}: not a tracked account of this migration record" \
         in capsys.readouterr().out
     assert [call[0] for call in harness.calls] == ["router"]
     assert read_record(migration_record)["revision"] == record["revision"]
@@ -3465,7 +3466,7 @@ def test_an_undecidable_statement_blocks_as_a_gap_listed_for_review(harness, cap
     assert main(args()) == 1
     output = capsys.readouterr().out
     assert "phase=org-policy status=GAP decision=UNDECIDED " in output
-    assert "(condition key aws:PrincipalArn is not evaluated)" in output
+    assert "(condition key aws:PrincipalArn has no known value for this request)" in output
     assert f"phase=org-policy status=REVIEW policy={GUARD} statement=1 text=" in output
     gap, = [line for line in blocker_summary(output) if "category=" in line]
     assert gap.startswith("phase=blocker-summary category=organization-policy-gap blockers=1 "
@@ -3562,7 +3563,7 @@ def test_selected_consumers_must_be_migrating_accounts_of_the_record(tmp_path):
     opts.selected = None
     assert cli.selected_consumers(opts, {}) == sorted([CONSUMER, "444455556666"])
     opts.selected = ["999988887777"]
-    with pytest.raises(MigrationError, match="999988887777: not a migrating account"):
+    with pytest.raises(MigrationError, match="999988887777: not a tracked account"):
         cli.selected_consumers(opts, {})
 
 
@@ -3653,7 +3654,7 @@ def test_monitor_observes_only_the_chosen_accounts(harness, migration_record):
 def test_monitor_refuses_an_account_outside_the_record(harness, migration_record):
     applied(harness, migration_record)
     output = monitor_run(migration_record, "--consumers", "999988887777", code=1)
-    assert "--consumers 999988887777: not a migrating account of this migration record" in output
+    assert "--consumers 999988887777: not a tracked account of this migration record" in output
     assert [call[0] for call in harness.calls] == ["router"]
 
 

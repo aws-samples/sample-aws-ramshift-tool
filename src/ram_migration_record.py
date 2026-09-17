@@ -516,13 +516,17 @@ def latest(record: dict, *modes: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def group_identity(group: Any) -> dict:
-    return {
+    result = {
         "owner": group.owner, "region": group.region,
         "consumers": sorted(group.consumers),
         "permissions": dict(sorted(group.permissions.items())),
         "resources": dict(sorted(group.resources.items())),
         "source_shares": sorted(set(group.source_shares)),
     }
+    stationary = getattr(group, "stationary_consumers", ())
+    if stationary:
+        result["stationary_consumers"] = sorted(stationary)
+    return result
 
 
 def plan_digest(groups: list, scope: dict) -> str:

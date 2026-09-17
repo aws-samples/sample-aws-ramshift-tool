@@ -147,6 +147,28 @@ def lookup(cache: LookupCache | None, key: tuple, load: Callable[[], Any]) -> An
     return load() if cache is None else cache.get(key, load)
 
 
+def evidence_pages(client: Any, operation: str, key: str, **kwargs: Any) -> list[dict]:
+    """Complete read with a checked response shape; missing data never proves absence."""
+    rows: list[dict] = []
+    seen: set[str] = set()
+    while True:
+        response = getattr(client, operation)(**kwargs)
+        values = response.get(key) if isinstance(response, dict) else None
+        if not isinstance(values, list) or any(not isinstance(row, dict) for row in values):
+            raise MigrationError(f"{operation}: {key} inventory was not returned correctly")
+        rows.extend(values)
+        if any(response.get(name) is not None and not isinstance(response[name], str)
+               for name in ("nextToken", "NextToken")):
+            raise MigrationError(f"{operation}: pagination token was not returned correctly")
+        token = response.get("nextToken") or response.get("NextToken")
+        if not token:
+            return rows
+        if not isinstance(token, str) or token in seen:
+            raise MigrationError(f"{operation}: invalid or repeated pagination token")
+        seen.add(token)
+        kwargs["nextToken" if response.get("nextToken") else "NextToken"] = token
+
+
 def template_key(account: str, region: str, stack: dict) -> tuple | None:
     """One template version. A StackId survives updates, so the key also carries when
     the stack last changed and its status, from the same DescribeStacks as the caller's
@@ -213,6 +235,7 @@ class ApprovedGroup(Group):
     """Compatible Group carrying the reviewed permission policies and source stacks."""
     permission_snapshots: dict[str, dict] = field(default_factory=dict)
     source_stacks: list[str] = field(default_factory=list)
+    stationary_consumers: tuple[str, ...] = ()
 
 
 def policy_semantics(policy: str | dict) -> Any:
@@ -824,7 +847,9 @@ class Discovery:
                  overrides: dict, capabilities: dict[str, bool],
                  migrating_owners: set[str] | None = None,
                  share_workers: int = 1, cache: LookupCache | None = None,
-                 deployed: dict[str, dict[str, dict]] | None = None):
+                 deployed: dict[str, dict[str, dict]] | None = None,
+                 excluded_consumers: set[str] | None = None,
+                 consumer_exclusion_reason: str | None = None):
         for consumer in consumers:
             account_id(consumer)
         if type(share_workers) is not int or not 1 <= share_workers <= 16:
@@ -832,6 +857,16 @@ class Discovery:
         self.router, self.consumers, self.migration = router, consumers, migration
         self.overrides, self.capabilities = overrides, capabilities
         self.migrating_owners = set(migrating_owners or ())
+        self.excluded_consumers = set(excluded_consumers or ())
+        for consumer in self.excluded_consumers:
+            account_id(consumer)
+        if self.excluded_consumers & (self.consumers | self.migrating_owners):
+            raise MigrationError("Excluded recipients overlap the migrating account scope")
+        if self.excluded_consumers and (
+                not isinstance(consumer_exclusion_reason, str) or
+                not consumer_exclusion_reason.strip()):
+            raise MigrationError("Excluded recipients require an explicit recorded reason")
+        self.consumer_exclusion_reason = consumer_exclusion_reason
         self.share_workers, self.cache = share_workers, cache
         # Entitlement key -> {resource type: permission snapshot} of each temporary share
         # already in a migration stack, as recorded in its template. Such a share keeps
@@ -1042,8 +1077,69 @@ class Discovery:
                     raise MigrationError("Conflicting RAM types for the same source resource")
             plan.merge(Plan(self.migration, groups=[group]))
             plan.permission_changes.extend(part.permission_changes)
+            plan.owner_continuity.extend(part.owner_continuity)
         except Exception as exc:
             plan.blocked.append(share_blocker(owner, region, arn, exc))
+
+    def _orphan_policy_ca(self, owner: str, region: str, ram: Any, share: dict,
+                          associations: list[dict]) -> str | None:
+        """Exclude only a policy-created CA share with independently proven missing CAs.
+
+        Any principal association, an existing/restorable CA, a mixed resource type,
+        or an unsuccessful read leaves the share blocked. Nothing is promoted or deleted.
+        """
+        if share.get("featureSet") != "CREATED_FROM_POLICY" or \
+                share.get("status") != "ACTIVE" or associations:
+            return None
+        partition = ram.meta.partition
+        arn = share["resourceShareArn"]
+        prefix = f"arn:{partition}:ram:{region}:{owner}:resource-share/"
+        if not arn.startswith(prefix) or not re.fullmatch(
+                r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", arn[len(prefix):]):
+            raise MigrationError("Policy-created share ARN does not match its owner/Region")
+        resources = evidence_pages(ram, "list_resources", "resources", resourceOwner="SELF",
+                                    resourceShareArns=[arn])
+        if not resources or any(row.get("type") != "acm-pca:CertificateAuthority"
+                                for row in resources):
+            return None
+        ca_prefix = f"arn:{partition}:acm-pca:{region}:{owner}:certificate-authority/"
+
+        def checked_arn(value: Any) -> str:
+            if not isinstance(value, str) or not value.startswith(ca_prefix) or \
+                    not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}",
+                                     value[len(ca_prefix):]):
+                raise MigrationError("Private CA evidence does not match its owner/Region")
+            return value
+
+        missing = sorted({checked_arn(row.get("arn")) for row in resources})
+        pca = self.router.client(owner, "acm-pca", region)
+        if pca.meta.partition != partition or pca.meta.region_name != region:
+            raise MigrationError("Private CA client does not match the RAM partition/Region")
+        for ca in missing:
+            try:
+                pca.describe_certificate_authority(CertificateAuthorityArn=ca)
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") != "ResourceNotFoundException":
+                    raise
+            else:
+                return None  # Including DELETED CAs still within their restoration period.
+
+        def inventory():
+            rows = evidence_pages(pca, "list_certificate_authorities", "CertificateAuthorities",
+                                   MaxResults=100, ResourceOwner="SELF")
+            for row in rows:
+                checked_arn(row.get("Arn"))
+                if row.get("OwnerAccount", owner) != owner:
+                    raise MigrationError("Private CA inventory contains an unexpected owner")
+            return sorted({row["Arn"] for row in rows})
+
+        owned = lookup(self.cache, ("owned-private-cas", owner, region), inventory)
+        if set(missing) & set(owned):
+            return None
+        return (f"{arn}: orphan CREATED_FROM_POLICY private CA share; owner={owner} "
+                f"region={region}; no principal associations; CAs {missing} each returned "
+                "DescribeCertificateAuthority ResourceNotFoundException and were absent from "
+                "complete ListCertificateAuthorities(ResourceOwner=SELF); read-only exclusion")
 
     def _inspect_share(self, owner: str, region: str, ram: Any, share: dict,
                        members: LookupCache) -> tuple[Plan, ApprovedGroup | None]:
@@ -1063,12 +1159,17 @@ class Discovery:
             if feature != "STANDARD":
                 # A service-principal-only share is never replicated account-wide, whatever
                 # its featureSet (for example pca-connector-ad shares created from policy).
-                principals = [r["associatedEntity"] for r in pages(
+                associations = evidence_pages(
                     ram, "get_resource_share_associations", "resourceShareAssociations",
-                    associationType="PRINCIPAL", resourceShareArns=[arn]) if r.get("status") in LIVE]
+                    associationType="PRINCIPAL", resourceShareArns=[arn])
+                principals = [r["associatedEntity"] for r in associations if r.get("status") in LIVE]
                 if principals and all(SERVICE_PRINCIPAL.fullmatch(p) for p in principals):
                     part.excluded.append(f"{arn}: service-principal-only share (featureSet "
                                          f"{feature}); never replicated account-wide")
+                    return part, None
+                orphan = self._orphan_policy_ca(owner, region, ram, share, associations)
+                if orphan is not None:
+                    part.excluded.append(orphan)
                     return part, None
                 raise MigrationError(feature_set_problem(owner, region, arn, feature))
             if self._migration_owned(owner, region, share):
@@ -1140,13 +1241,13 @@ class Discovery:
                     "so it is outside the owner's organization and keeps this access whatever "
                     "organization it is in; that access is pre-existing, not created by this tool, "
                     "so no temporary share duplicates it and the original share is never modified")
-            if not principals:
+            if not principals and not (owner in self.migrating_owners and original):
                 if explicit is not None:
                     part.excluded.append(f"{arn}: explicitly approved empty consumer inventory")
                     return part, None
                 raise MigrationError("Original account-facing consumers are unresolved; "
                                      "provide a principal-map override")
-            if all(SERVICE_PRINCIPAL.fullmatch(p) for p in principals):
+            if principals and all(SERVICE_PRINCIPAL.fullmatch(p) for p in principals):
                 part.excluded.append(f"{arn}: service-principal-only share")
                 return part, None
             consumers: set[str] = set()
@@ -1168,31 +1269,49 @@ class Discovery:
                         f"{arn}: selected active source-organization consumers outside "
                         f"this principal scope: {sorted(outside_scope)}")
             unrelated = consumers - self.consumers - {owner}
+            stationary: set[str] = set()
             if owner in self.migrating_owners:
-                # A stationary consumer of a migrating owner loses access when the owner
-                # leaves; bridging that direction is not supported (requirements §10).
-                # An override names the intended migrating consumers. It never hides who
-                # holds this share now (live) or is configured to (owning template).
-                at_risk = set(unrelated)
+                # Preserve the original share's stationary recipients as account IDs.
+                # An override can resolve historical moving recipients, but cannot remove
+                # a live/configured stationary recipient or invent another one.
+                stationary = set(unrelated)
                 if explicit is not None:
+                    proven: set[str] = set()
                     for principal in sorted(set(configured) | set(live)):
-                        at_risk.update(self._expand(owner, principal, partition=ram.meta.partition))
-                    at_risk -= self.consumers | {owner}
-                if at_risk:
-                    raise MigrationError(
-                        f"migrating owner {owner} shares with stationary consumers "
-                        f"{sorted(at_risk)}; their access ends when the owner leaves its "
-                        "organization and owner-migration continuity is not supported by this "
-                        "tool version" + ("" if explicit is None else
-                                          "; a principal-map override does not remove the "
-                                          "share's live or owning-template principals from "
-                                          "this check"))
-            if unrelated:
+                        proven.update(self._expand(owner, principal, partition=ram.meta.partition))
+                    unproven = unrelated - proven - self.excluded_consumers
+                    if unproven:
+                        raise MigrationError(
+                            f"principal-map stationary consumers {sorted(unproven)} have no "
+                            "live or owning-template principal evidence on the original share")
+                    stationary = proven - self.consumers - {owner}
+                omitted = (consumers | stationary) & self.excluded_consumers
+                if omitted:
+                    part.excluded.append(
+                        f"{arn}: recipient accounts {sorted(omitted)} explicitly excluded "
+                        f"by operator: {self.consumer_exclusion_reason}")
+                consumers -= self.excluded_consumers
+                stationary -= self.excluded_consumers
+                external_stationary = self._external_access(
+                    associations, stationary, ram.meta.partition)
+                if external_stationary:
+                    part.external_access.extend(
+                        {"owner": owner, "region": region, "share": arn, "consumer": consumer,
+                         "status": "ASSOCIATED", "external": True}
+                        for consumer in sorted(external_stationary))
+                    part.excluded.append(
+                        f"{arn}: stationary consumers {sorted(external_stationary)} already "
+                        "hold ASSOCIATED external account-level access on the original share; "
+                        "no temporary share duplicates that access")
+                recovered |= external_stationary
+                consumers = (consumers & self.consumers) | stationary
+            elif unrelated:
                 part.excluded.append(
                     f"{arn}: unrelated consumers outside migration population: {sorted(unrelated)}")
-            consumers &= self.consumers
+                consumers &= self.consumers
             consumers.discard(owner)
             consumers -= recovered
+            stationary &= consumers
             if not consumers:
                 if not recovered:
                     part.excluded.append(f"{arn}: no selected consumers")
@@ -1270,7 +1389,20 @@ class Discovery:
             if set(permission_map) != kinds:
                 raise MigrationError("Source permissions do not exactly match its resource types")
             group = ApprovedGroup(owner, region, tuple(sorted(consumers)),
-                                  permission_map, available, [arn], snapshots, source_stacks)
+                                  permission_map, available, [arn], snapshots, source_stacks,
+                                  tuple(sorted(stationary)))
+            if stationary:
+                part.owner_continuity.append({
+                    "owner": owner, "region": region, "share": arn,
+                    "stationary_consumers": sorted(stationary),
+                    "resources": sorted(available),
+                    "original_principals": sorted(set(configured) | set(live)),
+                })
+                part.notes.append(
+                    f"phase=owner-continuity owner={owner} region={region} share={arn} "
+                    f"stationary_consumers={','.join(sorted(stationary))} "
+                    "status=PLANNED account-level external shares retain these recipients; "
+                    "baseline capture and invitation acceptance are required before the owner moves")
             # Only a share that is planned reports its difference.
             part.permission_changes.extend(changes)
             return part, group

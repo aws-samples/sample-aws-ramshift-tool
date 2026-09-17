@@ -281,7 +281,7 @@ def allocation(allocation_id=ALLOCATION_ID, consumer=CONSUMER, cidr="10.1.0.0/16
                resource_type="vpc"):
     return item("ipam_allocation", [OWNER, REGION, POOL_ID, allocation_id], consumer, POOL,
                 pool_id=POOL_ID, allocation_id=allocation_id, cidr=cidr, resource_id=resource_id,
-                resource_type=resource_type)
+                resource_type=resource_type, allocation_region=REGION)
 
 
 def pca(consumer=CONSUMER, ca_status="ACTIVE", read="OK"):
@@ -618,8 +618,17 @@ def test_transit_gateway_failures_on_either_side_are_independent(world):
         gap("tgw_routes", TGW, "RequestLimitExceeded operation=DescribeRouteTables request=req-routes")]
 
 
+
+def pool_described(target):
+    """DescribeIpamPools for POOL: the collector reads the pool's Locale first."""
+    target.reply(OWNER, "ec2", "describe_ipam_pools", {"IpamPools": [
+        {"IpamPoolId": POOL_ID, "IpamPoolArn": POOL, "OwnerId": OWNER, "Locale": REGION}]},
+        IpamPoolIds=[POOL_ID])
+
+
 def test_ipam_allocations_owned_by_consumers_are_read_from_the_pool_owner(world):
     g = group({POOL: IPAM}, consumers=(CONSUMER, SECOND))
+    pool_described(world)
     world.reply(OWNER, "ec2", "get_ipam_pool_allocations", {"IpamPoolAllocations": [
         {"Cidr": "10.1.0.0/16", "IpamPoolAllocationId": ALLOCATION_ID, "ResourceId": VPC,
          "ResourceType": "vpc", "ResourceRegion": REGION, "ResourceOwner": CONSUMER},
@@ -1090,6 +1099,7 @@ def fake_world(state, temporary, *, reads=True, pool_error=False):
     if reads:
         target.reply(OWNER, "route53resolver", "list_resolver_rules", {"ResolverRules": [
             rule_row(SYSTEM_RULE, SYSTEM_RULE_ID, rule_type="SYSTEM", endpoint=None)]})
+        pool_described(target)
         if pool_error:
             target.fail(OWNER, "ec2", "get_ipam_pool_allocations", code="UnauthorizedOperation",
                         request="req-pool", IpamPoolId=POOL_ID)

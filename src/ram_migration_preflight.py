@@ -148,16 +148,37 @@ DESTINATION_ACTIONS = (
     Action("organizations:DescribeOrganization", region=ORGANIZATIONS_REGION),
 )
 
+
+def continuity_read_actions(kinds: Iterable[str], include_tgw_routes: bool) -> tuple[Action, ...]:
+    """Reads collect() makes in a stationary recipient; owner reads run elsewhere."""
+    kinds = {kind.lower() for kind in kinds}
+    actions = [
+        Action("ram:GetResourceShares"),
+        Action("ram:ListResources"),
+        Action("organizations:DescribeOrganization", region=ORGANIZATIONS_REGION),
+    ]
+    if "route53resolver:resolverrule" in kinds:
+        actions.append(Action("route53resolver:ListResolverRuleAssociations"))
+    if "ec2:transitgateway" in kinds:
+        actions.append(Action("ec2:DescribeTransitGatewayVpcAttachments"))
+        if include_tgw_routes:
+            actions.append(Action("ec2:DescribeRouteTables"))
+    if "acm-pca:certificateauthority" in kinds:
+        actions.append(Action("acm-pca:GetCertificateAuthorityCertificate", resource="owner"))
+    return tuple(actions)
+
 # Condition keys this evaluator decides, with their type. Every other key is a gap.
 STRING_KEYS = frozenset({"aws:requestedregion", "aws:principalorgid", "aws:resourceorgid",
-                         "aws:principalaccount", "aws:resourceaccount"})
+                         "aws:principalaccount", "aws:resourceaccount", "aws:principalarn"})
+ARN_KEYS = frozenset({"aws:principalarn"})
 BOOL_KEYS = frozenset({"ram:requestedallowsexternalprincipals"})
 # Positive string operators: (case-folded, wildcards). Negated ones invert them.
 _STRING_OPERATORS = {"StringEquals": (False, False), "StringEqualsIgnoreCase": (True, False),
                      "StringLike": (False, True)}
+_ARN_OPERATORS = frozenset({"ArnEquals", "ArnLike"})
 _NEGATED = {"StringNotEquals": "StringEquals", "StringNotEqualsIgnoreCase": "StringEqualsIgnoreCase",
-            "StringNotLike": "StringLike"}
-OPERATORS = tuple(sorted({*_STRING_OPERATORS, *_NEGATED, "Bool", "Null"}))
+            "StringNotLike": "StringLike", "ArnNotEquals": "ArnEquals", "ArnNotLike": "ArnLike"}
+OPERATORS = tuple(sorted({*_STRING_OPERATORS, *_ARN_OPERATORS, *_NEGATED, "Bool", "Null"}))
 _ELEMENTS = frozenset({"Sid", "Effect", "Action", "NotAction", "Resource", "NotResource",
                        "Condition", "Principal", "NotPrincipal"})
 # Request-context value of a key the request is known not to carry.
@@ -185,6 +206,18 @@ def _glob(pattern: str, fold: bool) -> re.Pattern:
 
 def _matches(pattern: str, value: str, fold: bool = False) -> bool:
     return _glob(pattern, fold).fullmatch(value) is not None
+
+
+def _arn_parts(value: Any, *, pattern: bool = False) -> list[str] | None:
+    """ARN operators match six components separately, with case-sensitive wildcards."""
+    if not isinstance(value, str) or any(char.isspace() for char in value):
+        return None
+    parts = value.split(":", 5)
+    if len(parts) != 6 or parts[0] != "arn" or not all(parts[i] for i in (1, 2, 5)):
+        return None
+    if not pattern and any(char in value for char in "*?"):
+        return None
+    return parts
 
 
 @lru_cache(maxsize=4096)
@@ -293,10 +326,14 @@ def _clause(operator: str, key: Any, values: Any, context: dict) -> tuple[bool |
     name = key.lower() if isinstance(key, str) else None
     if name not in STRING_KEYS and name not in BOOL_KEYS:
         return None, f"condition key {key} is not evaluated"
-    if base not in _STRING_OPERATORS and base not in _NEGATED and base not in ("Bool", "Null") \
+    positive = _NEGATED.get(base, base)
+    if base not in _STRING_OPERATORS and base not in _ARN_OPERATORS and base not in _NEGATED \
+            and base not in ("Bool", "Null") \
             or (base == "Null" and (qualifier or if_exists)):
         return None, f"condition operator {operator} is not evaluated"
     if base != "Null" and (base == "Bool") != (name in BOOL_KEYS):
+        return None, f"condition operator {operator} is not evaluated for {key}"
+    if positive in _ARN_OPERATORS and name not in ARN_KEYS:
         return None, f"condition operator {operator} is not evaluated for {key}"
     items = values if isinstance(values, list) else [values]
     if not items or any(not isinstance(item, (str, bool)) for item in items):
@@ -320,9 +357,19 @@ def _clause(operator: str, key: Any, values: Any, context: dict) -> tuple[bool |
         return base in _NEGATED, None
     if base == "Bool":
         return ("true" if actual is True else "false") in {text.lower() for text in texts}, None
-    fold, wildcards = _STRING_OPERATORS[_NEGATED.get(base, base)]
-    hit = any(_matches(text, actual, fold) if wildcards else
-              (text.lower() == actual.lower() if fold else text == actual) for text in texts)
+    if positive in _ARN_OPERATORS:
+        actual_parts = _arn_parts(actual)
+        patterns = [_arn_parts(text, pattern=True) for text in texts]
+        if actual_parts is None or any(parts is None for parts in patterns):
+            return None, f"condition ARN values of {key} are malformed or unknown"
+        hit = any(all(_matches(wanted, value) for wanted, value in zip(parts, actual_parts))
+                  for parts in patterns)
+    else:
+        if not isinstance(actual, str):
+            return None, f"condition key {key} has no known string value for this request"
+        fold, wildcards = _STRING_OPERATORS[positive]
+        hit = any(_matches(text, actual, fold) if wildcards else
+                  (text.lower() == actual.lower() if fold else text == actual) for text in texts)
     return (not hit) if base in _NEGATED else hit, None
 
 
@@ -411,6 +458,8 @@ class Governance:
     attached: dict[str, list[tuple[str, list[Policy]]]] = field(default_factory=dict)
     enabled: dict[str, str] = field(default_factory=dict)
     problem: str | None = None
+    principal_arn: str | None = None
+    principal_arn_problem: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -422,7 +471,8 @@ class Governance:
             "attachments": {target: {kind: [p.id for p in dict(self.attached.get(kind, [])).get(target, [])]
                                      for kind in KINDS if kind in self.attached}
                             for target in self.path},
-            "problem": self.problem}
+            "problem": self.problem, "principal_arn": self.principal_arn,
+            "principal_arn_problem": self.principal_arn_problem}
 
 
 def _not_enabled(exc: Exception) -> bool:
@@ -446,7 +496,7 @@ def _organization(raw: Any) -> dict:
 
 
 class _Reader:
-    """Memoized read-only Organizations reads for one preflight run; a failure is
+    """Memoized read-only governance and caller identity reads for one preflight run; a failure is
     remembered too, so one unreadable item is read once and reported everywhere."""
     def __init__(self, router: Any):
         self.router = router
@@ -466,6 +516,42 @@ class _Reader:
     def client(self, account: str) -> Any:
         return self._once(("client", account), lambda: self.router.client(
             account, "organizations", ORGANIZATIONS_REGION))
+
+    def principal_arn(self, account: str) -> str:
+        """Resolve the authenticated caller's IAM ARN, retaining the role's actual path.
+
+        aws:PrincipalArn for a role is its IAM role ARN, not its STS session ARN.
+        GetRole and the STS unique role ID must agree; no ARN is invented from a role name.
+        """
+        def load():
+            identity = self.router.client(account, "sts", ORGANIZATIONS_REGION).get_caller_identity()
+            if not isinstance(identity, dict) or identity.get("Account") != account:
+                raise MigrationError(f"{account}: authenticated caller account mismatch")
+            arn = identity.get("Arn")
+            parts = _arn_parts(arn)
+            if parts is None or parts[1] not in PARTITIONS or parts[3] or parts[4] != account:
+                raise MigrationError(f"{account}: authenticated caller ARN is not recognized")
+            if parts[2] == "iam" and (parts[5] == "root" or
+                                     re.fullmatch(r"user/[\w+=,.@/-]+", parts[5])):
+                return arn
+            session = re.fullmatch(r"assumed-role/([\w+=,.@-]{1,64})/([\w+=,.@-]{2,64})", parts[5])
+            if parts[2] != "sts" or session is None:
+                raise MigrationError(f"{account}: authenticated caller principal type is not evaluated")
+            role_name, session_name = session.groups()
+            response = self.router.client(account, "iam", ORGANIZATIONS_REGION).get_role(
+                RoleName=role_name)
+            role = response.get("Role") if isinstance(response, dict) else None
+            role_parts = _arn_parts(role.get("Arn")) if isinstance(role, dict) else None
+            if role_parts is None or role_parts[:5] != ["arn", parts[1], "iam", "", account] or \
+                    role.get("RoleName") != role_name or not re.fullmatch(
+                        rf"role/(?:[\w+=,.@-]+/)*{re.escape(role_name)}", role_parts[5]):
+                raise MigrationError(f"{account}: GetRole ARN does not match the authenticated role")
+            role_id, user_id = role.get("RoleId"), identity.get("UserId")
+            if not isinstance(role_id, str) or not role_id or \
+                    user_id != f"{role_id}:{session_name}":
+                raise MigrationError(f"{account}: GetRole unique ID does not match the STS session")
+            return role["Arn"]
+        return self._once(("principal-arn", account), load)
 
     def member(self, account: str) -> dict | None:
         """The organization an account belongs to, as the account sees it; None
@@ -575,6 +661,11 @@ def _load_policies(reader: _Reader, governance: Governance) -> None:
 def _govern(reader: _Reader, account: str) -> Governance:
     governance = Governance(account, EVALUATED)
     try:
+        governance.principal_arn = reader.principal_arn(account)
+    except Exception as exc:
+        # An unknown value remains a condition-evaluation gap when a policy needs it.
+        governance.principal_arn_problem = failure_text(exc)
+    try:
         member = reader.member(account)
         if member is None:
             governance.status = STANDALONE
@@ -640,6 +731,8 @@ def _context(action: Action, region: str, principal: Governance, organization: s
         "aws:principalorgid": organization or ABSENT,
         "ram:requestedallowsexternalprincipals": True if action.external else ABSENT,
     }
+    if principal.principal_arn is not None and principal.organization == organization:
+        context["aws:principalarn"] = principal.principal_arn
     if resource is not None and resource.account and resource.status != UNREADABLE:
         context["aws:resourceaccount"] = resource.account
         context["aws:resourceorgid"] = resource.organization or ABSENT
@@ -857,27 +950,36 @@ def _prerequisites(reader: _Reader, needed: dict[str, dict]) -> tuple[list[dict]
 def organization_preflight(router: Any, groups: Iterable[Any], migrating: Iterable[str], *,
                            destination: str | None = None,
                            organization_shares: dict[str, list[str]] | None = None,
+                           include_tgw_routes: bool = True,
                            emit: Callable[[str], None] | None = None) -> dict:
     """Evaluate the organization policies for ``groups`` (Group objects or record
     group dicts). ``migrating`` lists the accounts that move; with ``destination``
     (an OU or root ARN) those in the groups are evaluated on the destination path.
     ``organization_shares`` maps original share ARNs to their OU and organization
     principals. Returns the JSON-serializable result; its ``blockers`` join the plan's."""
+    if type(include_tgw_routes) is not bool:
+        raise MigrationError("include_tgw_routes must be a boolean")
+    destination_actions = tuple(action for action in DESTINATION_ACTIONS
+                                if include_tgw_routes or action.name != "ec2:DescribeRouteTables")
     emit = emit or (lambda _line: None)
     reader = _Reader(router)
     moving = set(migrating)
     owners: dict[str, set[str]] = defaultdict(set)
     consumers: dict[str, set[tuple[str, str]]] = defaultdict(set)
     regions: dict[str, set[str]] = defaultdict(set)
+    continuity_types: dict[tuple[str, str, str], set[str]] = defaultdict(set)
     for group in groups:
         owner = group["owner"] if isinstance(group, dict) else group.owner
         region = group["region"] if isinstance(group, dict) else group.region
         members = group["consumers"] if isinstance(group, dict) else group.consumers
+        resources = group["resources"] if isinstance(group, dict) else group.resources
         owners[owner].add(region)
         regions[owner].add(region)
         for consumer in members:
             consumers[consumer].add((owner, region))
             regions[consumer].add(region)
+            if owner in moving and consumer not in moving:
+                continuity_types[consumer, owner, region].update(resources.values())
     accounts = sorted(set(owners) | set(consumers))
     roles = {account: [role for role, scope in (("owner", owners), ("consumer", consumers))
                        if account in scope] for account in accounts}
@@ -928,8 +1030,11 @@ def organization_preflight(router: Any, groups: Iterable[Any], migrating: Iterab
             blockers.append(_unreadable(target, [], destination))
         else:
             for account in [a for a in accounts if a in moving]:
-                principal = Governance(account, EVALUATED, organization=target.organization)
-                for action in DESTINATION_ACTIONS:
+                current = governance[account]
+                principal = current if current.status != UNREADABLE and \
+                    current.organization == target.organization else \
+                    Governance(account, EVALUATED, organization=target.organization)
+                for action in destination_actions:
                     for region in ([action.region] if action.region else sorted(regions[account])):
                         context = _context(action, region, principal, target.organization, None)
                         for kind in KINDS:
@@ -945,6 +1050,42 @@ def organization_preflight(router: Any, groups: Iterable[Any], migrating: Iterab
             notes.append("policies attached directly to each account after it joins the "
                          "destination organization are not known before the move and are not "
                          "evaluated")
+
+    # A stationary recipient stays on its own policy path while its resources move
+    # to the destination owner's path. Its known current role remains applicable;
+    # only the resource organization changes. Evaluate the actual baseline reads
+    # on both sides, including destination-owner RCPs where supplied.
+    continuity_sites = []
+    for (account, owner, region), kinds in sorted(continuity_types.items()):
+        principal, held = governance[account], governance[owner]
+        actions = continuity_read_actions(kinds, include_tgw_routes)
+        continuity_sites.append({
+            "consumer": account, "owner": owner, "region": region,
+            "actions": [action.name for action in actions],
+            "destination_checked": target is not None and target.status != UNREADABLE,
+        })
+        if principal.status == UNREADABLE:
+            continue
+        future = Governance(owner, EVALUATED, organization=target.organization) \
+            if target is not None and target.status != UNREADABLE else None
+        for action in actions:
+            action_region = action.region or region
+            context = _context(action, action_region, principal, principal.organization,
+                               held if action.resource == "owner" else None)
+            if principal.status == EVALUATED:
+                _evaluate(found, principal, SCP, account, "stationary-consumer",
+                          action.name, action_region, context, share_owner=owner)
+            if held.status == EVALUATED:
+                _evaluate(found, held, RCP, account, "stationary-consumer",
+                          action.name, action_region, context, share_owner=owner)
+            if future is not None:
+                context = _context(action, action_region, principal, principal.organization,
+                                   future if action.resource == "owner" else None)
+                if principal.status == EVALUATED:
+                    _evaluate(found, principal, SCP, account, "owner-continuity",
+                              action.name, action_region, context, share_owner=owner)
+                _evaluate(found, target, RCP, account, "owner-continuity",
+                          action.name, action_region, context, share_owner=owner)
 
     needed: dict[str, dict] = {}
     for share, principals in sorted((organization_shares or {}).items()):
@@ -965,7 +1106,8 @@ def organization_preflight(router: Any, groups: Iterable[Any], migrating: Iterab
             entry["scope"].add("destination")
     prerequisites, unmet = _prerequisites(reader, needed)
     if needed:
-        notes.append("the RAM service-linked role is not read: IAM is outside this preflight")
+        notes.append("the RAM service-linked role is not read; IAM is read only to verify "
+                     "the authenticated caller's role ARN")
 
     findings = found.to_list()
     blockers += [_blocker(row) for row in findings]
@@ -989,10 +1131,11 @@ def organization_preflight(router: Any, groups: Iterable[Any], migrating: Iterab
                       "condition_keys": sorted(STRING_KEYS | BOOL_KEYS), "operators": list(OPERATORS),
                       "owner_actions": [a.name for a in OWNER_ACTIONS],
                       "consumer_actions": [a.name for a in CONSUMER_ACTIONS],
-                      "destination_actions": [a.name for a in DESTINATION_ACTIONS]},
+                      "destination_actions": [a.name for a in destination_actions]},
         "accounts": [{"account": account, "roles": roles[account],
                       "regions": sorted(regions[account]), **governance[account].to_dict()}
                      for account in accounts],
+        "owner_continuity": continuity_sites,
         "destination": None if target is None else {
             "arn": destination, **target.to_dict(),
             "accounts": [a for a in accounts if a in moving]},
@@ -1015,6 +1158,10 @@ def _report(result: dict, emit: Callable[[str], None]) -> None:
         if entry["path"]:
             line += (f" path={'/'.join(entry['path'])} "
                      f"scp={entry['service_control_policies']} rcp={entry['resource_control_policies']}")
+        if entry.get("principal_arn"):
+            line += f" principal_arn={entry['principal_arn']}"
+        elif entry.get("principal_arn_problem"):
+            line += f" principal_arn=UNKNOWN principal_arn_problem={entry['principal_arn_problem']}"
         emit(line)
     if result["destination"] is not None:
         entry = result["destination"]

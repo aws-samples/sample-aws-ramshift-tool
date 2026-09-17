@@ -27,6 +27,7 @@ from typing import Any, Callable
 from botocore.exceptions import ClientError
 
 from ram_migration_common import PURPOSE, Api, MigrationError, account_id, managed, pages, timestamp
+from ram_migration_discovery import evidence_pages
 
 KINDS = ("entitlement", "resolver_association", "resolver_endpoint", "tgw_attachment",
          "tgw_route", "ipam_allocation", "pca_access")
@@ -238,20 +239,26 @@ def _resource_id(arn: str, resource_type: str) -> str | None:
 
 class _Task:
     """The reads of one account in one Region; one thread uses its clients."""
-    def __init__(self, router: Any, account: str, region: str):
+    def __init__(self, router: Any, account: str, region: str,
+                 allowed_regions: set[str] | None = None):
         self.router, self.account, self.region = router, account, region
+        self.allowed_regions = frozenset(allowed_regions if allowed_regions is not None else {region})
         self.items: list[dict] = []
         self.gaps: list[dict] = []
-        self._clients: dict[str, Any] = {}
+        self._clients: dict[tuple[str, str], Any] = {}
 
-    def client(self, service: str) -> Any:
-        if service not in self._clients:
+    def client(self, service: str, region: str | None = None) -> Any:
+        region = self.region if region is None else region
+        if region not in self.allowed_regions:
+            raise _Unreadable("RegionOutsideVerificationScope")
+        key = (service, region)
+        if key not in self._clients:
             try:
                 # Requested read-only; the Api boundary also refuses any mutation.
-                self._clients[service] = Api(self.router.client(self.account, service, self.region))
+                self._clients[key] = Api(self.router.client(self.account, service, region))
             except Exception as exc:  # every read that needs this client becomes a gap
-                self._clients[service] = exc
-        value = self._clients[service]
+                self._clients[key] = exc
+        value = self._clients[key]
         if isinstance(value, Exception):
             raise value
         return value
@@ -273,8 +280,8 @@ class _Task:
 # Owner side ----------------------------------------------------------------
 
 def _owner(router: Any, owner: str, region: str, resources: dict[str, str],
-           users: dict[str, set[str]]) -> dict:
-    task = _Task(router, owner, region)
+           users: dict[str, set[str]], allowed_regions: set[str] | None = None) -> dict:
+    task = _Task(router, owner, region, allowed_regions)
     found: dict[str, Any] = {"task": task, "rules": {}, "tgw": {}, "ca": {}}
     families: dict[str, list[str]] = defaultdict(list)
     for arn, kind in sorted(resources.items()):
@@ -380,10 +387,27 @@ def _allocations(task: _Task, arn: str, consumers: set[str]) -> None:
         task.gap("ipam_allocations", arn, _reason("UnrecognizedArn", "GetIpamPoolAllocations"))
         return
 
+    def describe():
+        rows = evidence_pages(task.client("ec2"), "describe_ipam_pools", "IpamPools",
+                              IpamPoolIds=[pool])
+        if len(rows) != 1 or rows[0].get("IpamPoolId") != pool or \
+                rows[0].get("IpamPoolArn") != arn or rows[0].get("OwnerId") != task.account:
+            raise _Unreadable("IpamPoolIdentityMismatch")
+        locale = rows[0].get("Locale")
+        if not isinstance(locale, str) or not _REGION.fullmatch(locale):
+            raise _Unreadable("IpamPoolLocaleUnknown")
+        return locale
+
+    locale = task.attempt("ipam_allocations", arn, "describe_ipam_pools", describe)
+    if locale is _FAILED:
+        return
+
     def read():
         found: dict[str, dict] = {}
-        for row in pages(task.client("ec2"), "get_ipam_pool_allocations", "IpamPoolAllocations",
-                         IpamPoolId=pool):
+        # The pool ARN is global and its RAM share can be in the IPAM home Region;
+        # GetIpamPoolAllocations must be sent to the verified pool's Locale.
+        for row in evidence_pages(task.client("ec2", locale), "get_ipam_pool_allocations",
+                                  "IpamPoolAllocations", IpamPoolId=pool):
             allocation = row.get("IpamPoolAllocationId")
             if not _text(allocation) or allocation in found or \
                     (row.get("ResourceOwner") in consumers and not _text(row.get("Cidr"))):
@@ -400,7 +424,7 @@ def _allocations(task: _Task, arn: str, consumers: set[str]) -> None:
                 "ipam_allocation", [task.account, task.region, pool, allocation],
                 row["ResourceOwner"], task.account, task.region, arn, pool_id=pool,
                 allocation_id=allocation, cidr=row["Cidr"], resource_id=row.get("ResourceId"),
-                resource_type=row.get("ResourceType")))
+                resource_type=row.get("ResourceType"), allocation_region=locale))
 
 
 def _ca_status(task: _Task, arn: str) -> str | None:
@@ -456,7 +480,8 @@ def _visible(task: _Task, received: dict[str, tuple[str, str]]) -> dict[str, dic
 
 
 def _consumer(router: Any, consumer: str, region: str, received: dict[str, tuple[str, str]],
-              owners: dict[tuple[str, str], dict], temporary: frozenset[str]) -> _Task:
+              owners: dict[tuple[str, str], dict], temporary: frozenset[str],
+              include_tgw_routes: bool = True) -> _Task:
     task = _Task(router, consumer, region)
     visible = _visible(task, received)
     rules: dict[str, tuple[str, str]] = {}
@@ -472,7 +497,7 @@ def _consumer(router: Any, consumer: str, region: str, received: dict[str, tuple
             if arn in inventory["rules"]:  # otherwise the owner's gap covers this rule
                 rules[inventory["rules"][arn]] = (arn, owner)
         elif family == TRANSIT_GATEWAY:
-            _consumer_tgw(task, arn, owner, inventory["tgw"].get(arn))
+            _consumer_tgw(task, arn, owner, inventory["tgw"].get(arn), include_tgw_routes)
         elif family == PRIVATE_CA:
             _ca_read(task, arn, owner, inventory["ca"].get(arn))
         elif family != IPAM_POOL:  # IPAM allocations are read from the owner
@@ -527,11 +552,14 @@ def _owner_state(task: _Task, view: dict | None, attachment: str, owner: str, ar
     return "not_associated" if association is None else state
 
 
-def _consumer_tgw(task: _Task, arn: str, owner: str, view: dict | None) -> None:
+def _consumer_tgw(task: _Task, arn: str, owner: str, view: dict | None,
+                  include_tgw_routes: bool = True) -> None:
     tgw, consumer, region = _resource_id(arn, "transit-gateway"), task.account, task.region
     if tgw is None:
-        for collector, operation in (("tgw_attachments", "DescribeTransitGatewayVpcAttachments"),
-                                     ("tgw_routes", "DescribeRouteTables")):
+        collectors = [("tgw_attachments", "DescribeTransitGatewayVpcAttachments")]
+        if include_tgw_routes:
+            collectors.append(("tgw_routes", "DescribeRouteTables"))
+        for collector, operation in collectors:
             task.gap(collector, arn, _reason("UnrecognizedArn", operation))
         return
 
@@ -580,6 +608,8 @@ def _consumer_tgw(task: _Task, arn: str, owner: str, view: dict | None) -> None:
                 "tgw_attachment", [consumer, region, attachment], consumer, owner, region, arn,
                 tgw_id=tgw, attachment_id=attachment, vpc_id=vpc, state=state,
                 owner_association_state=_owner_state(task, view, attachment, owner, arn)))
+    if not include_tgw_routes:
+        return
     rows = task.attempt("tgw_routes", arn, "describe_route_tables", routes)
     if rows is not _FAILED:
         for (table_id, destination), state in sorted(rows.items()):
@@ -619,22 +649,35 @@ def _sorted_gaps(gaps: list[dict]) -> list[dict]:
 
 
 def collect(router: Any, groups: Any, *, temporary_shares: Any = frozenset(),
-            workers: int = 4) -> Observation:
+            workers: int = 4, allowed_regions: Iterable[str] | None = None,
+            include_tgw_routes: bool = True) -> Observation:
     """Observe the groups: owner inventories first, then every consumer.
 
     At most ``workers`` account/Region reads run at once. Only read-only clients
-    are requested.
+    are requested. IPAM allocation reads use the verified pool Locale, only within
+    ``allowed_regions`` (by default the Regions of the supplied groups).
+    ``include_tgw_routes=False`` excludes route collection only; entitlement and
+    existing attachment reads still run. The CLI binds this choice to the record.
     """
+    if type(include_tgw_routes) is not bool:
+        raise MigrationError("include_tgw_routes must be a boolean")
     scope = _scope(groups)
     temporary = _share_arns(temporary_shares)
     count = _workers(workers)
     owned, received = sorted(scope.owned), sorted(scope.received)
+    scoped_regions = {region for _, region in owned + received}
+    if allowed_regions is not None and not _sequence(allowed_regions):
+        raise MigrationError("allowed_regions must be a collection of Region names")
+    allowed = set(allowed_regions) if allowed_regions is not None else scoped_regions
+    if any(not isinstance(region, str) or not _REGION.fullmatch(region) for region in allowed) or \
+            not scoped_regions <= allowed:
+        raise MigrationError("allowed_regions must include every group Region and be valid Regions")
     with ThreadPoolExecutor(max_workers=count) as pool:
         owners = dict(zip(owned, pool.map(lambda key: _owner(
             router, *key, scope.owned[key],
-            {arn: scope.users[(*key, arn)] for arn in scope.owned[key]}), owned)))
+            {arn: scope.users[(*key, arn)] for arn in scope.owned[key]}, allowed), owned)))
         consumers = list(pool.map(lambda key: _consumer(
-            router, *key, scope.received[key], owners, temporary), received))
+            router, *key, scope.received[key], owners, temporary, include_tgw_routes), received))
     items: dict[str, dict] = {}
     gaps: list[dict] = []
     for task in [owners[key]["task"] for key in owned] + consumers:

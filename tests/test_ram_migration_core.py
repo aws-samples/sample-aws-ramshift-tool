@@ -1644,14 +1644,6 @@ def test_a_stack_with_earlier_permission_change_rows_is_read_verified_and_not_re
 # ---------------------------------------------------------------------------
 # Account roles: migrating owners (v0.2.0)
 # ---------------------------------------------------------------------------
-def test_migrating_owner_sharing_with_stationary_consumers_blocks(clients):
-    cs, stubs = clients
-    stub_discovery(stubs, principals={SOURCE: [CONSUMER, OTHER]}, read_permissions=False)
-    result = Discovery(OfflineRouter(cs), {CONSUMER, OWNER}, MIGRATION, {}, {KIND.lower(): True},
-                       migrating_owners={OWNER}).inspect(OWNER, REGION)
-    assert not result.groups
-    assert f"migrating owner {OWNER} shares with stationary consumers ['{OTHER}']" in result.blocked[0]
-
 
 def test_stationary_owner_with_unrelated_consumers_only_excludes_them(clients):
     cs, stubs = clients
@@ -2295,23 +2287,3 @@ def test_preflight_checks_an_existing_share_against_its_kept_version_not_the_def
                                              r"temporary share .*keeps version 2"):
         Stacks(OfflineRouter(cs), MIGRATION).prepare(OWNER, REGION, [stale], fresh=True)
 
-
-@pytest.mark.parametrize("live,configured", [
-    ([CONSUMER, OTHER], None),            # the stationary consumer holds the share now
-    ([CONSUMER], [CONSUMER, OTHER]),      # the owning template configures it
-])
-def test_a_principal_map_override_never_hides_a_migrating_owners_stationary_consumers(
-        clients, live, configured):
-    """Finding 16: the override lists only the migrating consumer."""
-    cs, stubs = clients
-    if configured is None:
-        stub_discovery(stubs, principals={SOURCE: live}, read_permissions=False)
-    else:
-        stub_original_principals(stubs, live, configured)
-    result = Discovery(OfflineRouter(cs), {CONSUMER, OWNER}, MIGRATION, {SOURCE: [CONSUMER]},
-                       {KIND.lower(): True}, migrating_owners={OWNER}).inspect(OWNER, REGION)
-    assert not result.groups and not result.excluded
-    reason, = result.blocked
-    assert f"migrating owner {OWNER} shares with stationary consumers ['{OTHER}']" in reason
-    assert "a principal-map override does not remove the share's live or owning-template " \
-           "principals from this check" in reason
