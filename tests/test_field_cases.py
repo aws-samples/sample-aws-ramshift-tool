@@ -26,7 +26,7 @@ from ram_migration_record import plan_digest, tool_identity
 from ram_migration_verification import _allocations, _Task, collect, Observation
 from temporary_migration_ram_shares import (
     account_scope, build_parser, capture_problems, fill_scope_from_record, new_baseline,
-    observe, options, recorded_verification_exclusions, reviewed_plan_problem, summary,
+    observe, options, pre_existing, recorded_verification_exclusions, reviewed_plan_problem, summary,
     verification_exclusions, verification_scope_problem, WriteGate,
 )
 
@@ -478,7 +478,7 @@ class IpamLocaleReads(unittest.TestCase):
                 collect(self.router, [group], allowed_regions=regions)
         self.assertEqual(self.calls, [])
 
-    def test_existing_blackhole_routes_still_block_capture(self):
+    def test_existing_blackhole_routes_are_recorded_as_found_and_never_block(self):
         tables = ("rtb-0311c0f5daf5b3fe3", "rtb-0de2834b36db8c3b3",
                   "rtb-0ebb044c3afc21cd6")
         items = [{"kind": "tgw_route", "key": f"tgw_route|{self.consumer}|{REGION}|{table}|0.0.0.0/0",
@@ -486,9 +486,10 @@ class IpamLocaleReads(unittest.TestCase):
                   "resource_arn": "arn:aws:ec2:us-east-1:400000000005:transit-gateway/tgw-example",
                   "tgw_id": "tgw-example", "route_table_id": table,
                   "destination": "0.0.0.0/0", "state": "blackhole"} for table in tables]
-        problems = capture_problems({"items": items, "gaps": []})
-        self.assertEqual(len(problems), 3)
-        self.assertTrue(all("capture requires a stable original state" in p for p in problems))
+        self.assertEqual(capture_problems({"items": items, "gaps": []}), [])
+        notes = pre_existing({"items": items, "gaps": []}, "baseline-preflight")
+        self.assertEqual(len(notes), 3)
+        self.assertTrue(all("not active before the migration; recorded as found" in n for n in notes))
 
 
 class TgwRouteExclusion(unittest.TestCase):
@@ -553,11 +554,12 @@ class TgwRouteExclusion(unittest.TestCase):
             argv += ["--exclude-tgw-routes", "--exclude-tgw-routes-reason", reason or self.reason]
         return options(build_parser().parse_args(argv), lambda _prompt: self.fail("Unexpected prompt"))
 
-    def test_default_still_observes_and_blocks_blackhole_routes(self):
+    def test_default_still_observes_and_records_blackhole_routes(self):
         observed = collect(self.router, [self.group])
         routes = [item for item in observed.items if item["kind"] == "tgw_route"]
         self.assertEqual([item["state"] for item in routes], ["blackhole"])
-        self.assertEqual(len(capture_problems(observed)), 1)
+        self.assertEqual(capture_problems(observed), [])
+        self.assertEqual(len(pre_existing(observed, "baseline")), 1)
 
     def test_cli_exclusion_skips_route_api_and_retains_entitlement_and_attachment(self):
         lines = []
@@ -594,19 +596,22 @@ class TgwRouteExclusion(unittest.TestCase):
         self.assertTrue(any(gap["collector"] == "tgw_owner_attachments" for gap in observed.gaps))
         self.assertTrue(capture_problems(observed))
 
-    def test_unhealthy_existing_attachment_still_blocks(self):
+    def test_unhealthy_existing_attachment_is_recorded_as_found(self):
         row = self.consumer_ec2.handlers[
             "describe_transit_gateway_vpc_attachments"]["TransitGatewayVpcAttachments"][0]
         row["State"] = "deleting"
         observed = collect(self.router, [self.group], include_tgw_routes=False)
-        self.assertTrue(capture_problems(observed))
+        self.assertEqual(capture_problems(observed), [])
+        self.assertTrue(pre_existing(observed, "baseline"))
 
-    def test_missing_ram_visibility_still_blocks(self):
+    def test_missing_ram_visibility_is_recorded_as_found(self):
         self.ram.handlers["list_resources"] = {"resources": []}
         observed = collect(self.router, [self.group], include_tgw_routes=False)
         entitlement = next(item for item in observed.items if item["kind"] == "entitlement")
         self.assertEqual(entitlement["via_shares"], [])
-        self.assertTrue(capture_problems(observed))
+        self.assertEqual(capture_problems(observed), [])
+        self.assertTrue(any("not visible to the consumer before the migration" in line
+                            for line in pre_existing(observed, "baseline")))
 
     def test_visible_tgw_does_not_invent_a_vpc_attachment(self):
         self.owner_ec2.handlers["describe_transit_gateway_attachments"] = {

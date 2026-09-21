@@ -55,10 +55,11 @@ COLLECTORS: dict[str, tuple[str, tuple[str, ...]]] = {
     "pca_read": ("consumer", ("pca_access",)),
     "resource_checks": ("consumer", ()),
 }
-# Loss rules ("Loss when", section 2). A REQUIRED state must hold now, whatever
-# the baseline held. A RETAINED state ("was", "left", "no longer") is a loss only
-# when it held at baseline. IDENTITY fields never change for one key; a change
-# means the original binding was replaced.
+# Loss rules ("Loss when", section 2). A REQUIRED or RETAINED state is a loss only
+# when it held at baseline and no longer holds: a state already unhealthy before the
+# migration is pre-existing, not something the migration changed. REQUIRED states are
+# the ones a stable original state is expected to show. IDENTITY fields never change
+# for one key; a change means the original binding was replaced.
 REQUIRED = {"resolver_association": (("status", "COMPLETE"),),
             "tgw_attachment": (("state", "available"),),
             "tgw_route": (("state", "active"),)}
@@ -86,6 +87,10 @@ class Observation:
     observed_at: str
     items: list[dict] = field(default_factory=list)
     gaps: list[dict] = field(default_factory=list)
+    # Resources of a type with no resource-specific collector: their RAM access is
+    # observed (entitlement items), their resource health is not. Never a gap: the
+    # migration cannot be judged less complete for what no collector reads.
+    limits: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -245,6 +250,7 @@ class _Task:
         self.allowed_regions = frozenset(allowed_regions if allowed_regions is not None else {region})
         self.items: list[dict] = []
         self.gaps: list[dict] = []
+        self.limits: list[dict] = []
         self._clients: dict[tuple[str, str], Any] = {}
 
     def client(self, service: str, region: str | None = None) -> Any:
@@ -501,7 +507,9 @@ def _consumer(router: Any, consumer: str, region: str, received: dict[str, tuple
         elif family == PRIVATE_CA:
             _ca_read(task, arn, owner, inventory["ca"].get(arn))
         elif family != IPAM_POOL:  # IPAM allocations are read from the owner
-            task.gap("resource_checks", arn, UNAVAILABLE)
+            task.limits.append({"collector": "resource_checks", "account": consumer,
+                                "region": region, "resource_arn": arn, "type": kind,
+                                "reason": UNAVAILABLE})
     if rules:
         _associations(task, rules)
     return task
@@ -680,13 +688,16 @@ def collect(router: Any, groups: Any, *, temporary_shares: Any = frozenset(),
             router, *key, scope.received[key], owners, temporary, include_tgw_routes), received))
     items: dict[str, dict] = {}
     gaps: list[dict] = []
+    limits: list[dict] = []
     for task in [owners[key]["task"] for key in owned] + consumers:
         for item in task.items:
             if item["key"] in items:
                 raise MigrationError(f"Duplicate verification item {item['key']}")
             items[item["key"]] = item
         gaps.extend(task.gaps)
-    return Observation(timestamp(), [items[key] for key in sorted(items)], _sorted_gaps(gaps))
+        limits.extend(task.limits)
+    return Observation(timestamp(), [items[key] for key in sorted(items)], _sorted_gaps(gaps),
+                       _sorted_gaps(limits))
 
 
 # ---------------------------------------------------------------------------
@@ -742,14 +753,16 @@ def _state(name: str, now: Any, healthy: str, lost: list[str], unread: list[str]
 def _judge(before: dict, after: dict, hidden: bool) -> tuple[list[str], list[str]]:
     """(losses, conditions that could not be judged) for one present baseline item."""
     kind, lost, unread = before["kind"], [], []
-    if kind == "entitlement" and not after.get("via_shares"):
+    # The migration is judged only on what it can change: an entitlement the consumer
+    # could not see, or a state that was already unhealthy, before the migration is
+    # recorded as found and is no loss while it stays so (it may still be lost
+    # entirely, or have its identity replaced).
+    if kind == "entitlement" and not after.get("via_shares") and before.get("via_shares"):
         if hidden:  # a share that could not be listed may still supply it
             unread.append("visible through no listed share; not every received share was listed")
         else:
             lost.append("not visible to the consumer")
-    for name, healthy in REQUIRED.get(kind, ()):
-        _state(name, after.get(name), healthy, lost, unread)
-    for name, healthy in RETAINED.get(kind, ()):
+    for name, healthy in (*REQUIRED.get(kind, ()), *RETAINED.get(kind, ())):
         if before.get(name) == healthy:
             _state(name, after.get(name), healthy, lost, unread)
     if kind == "resolver_endpoint":

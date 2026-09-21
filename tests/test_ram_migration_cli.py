@@ -275,10 +275,10 @@ class FakeVerification:
                 missing.append({"key": item["key"], "item": item})
                 continue
             reasons = []
-            if item["kind"] == "entitlement" and not now.get("via_shares"):
+            if item["kind"] == "entitlement" and not now.get("via_shares") and item.get("via_shares"):
                 reasons.append("not visible to the consumer")
             if item["kind"] == "resolver_association":
-                if now.get("status") != "COMPLETE":
+                if item.get("status") == "COMPLETE" and now.get("status") != "COMPLETE":
                     reasons.append(f"status {now.get('status')}")
                 for field in ("vpc_id", "rule_id"):
                     if now.get(field) != item.get(field):
@@ -1476,11 +1476,15 @@ def test_unassociated_rules_are_reported_not_claimed_as_missing(harness, capsys)
     assert "PASS" not in output
 
 
-def test_unhealthy_resolver_baseline_blocks_before_confirmation(harness):
+def test_unhealthy_resolver_baseline_is_recorded_as_found_and_never_blocks(harness, capsys):
+    """An association already unhealthy before the migration is not something it changes."""
     harness.source[OWNER, REGION] = [group(kind=RESOLVER)]
     harness.resolver_samples[CONSUMER, REGION] = [[association(status="CREATING")]]
-    assert main(args("apply"), input_fn=lambda _: pytest.fail("Baseline is blocked")) == 1
-    assert not harness.writes()
+    assert main(args("apply"), input_fn=harness.confirm) == 0
+    output = capsys.readouterr().out
+    assert "phase=baseline-preflight status=PRE_EXISTING kind=resolver_association" in output
+    assert "not COMPLETE before the migration; recorded as found, never a blocker" in output
+    assert "status=SHARING_READY" in summary_line(output) and harness.writes()
 
 
 def test_collector_access_denial_blocks_baseline_before_writes(harness, capsys, migration_record):
@@ -1911,20 +1915,35 @@ def test_verify_without_a_baseline_is_inconclusive_and_never_creates_one(
     assert not harness.writes()
 
 
-@pytest.mark.parametrize("persisting", [True, False])
-def test_verify_with_an_incomplete_baseline_is_inconclusive(
-        harness, capsys, migration_record, persisting):
-    harness.collect_gaps = [gap("pca", "resource_checks_unavailable")]
-    record = applied(harness, migration_record, code=1)  # gaps never count as success
-    assert record["baseline"]["complete"] is False and record["shares"]
-    if not persisting:
-        harness.collect_gaps = []  # a later complete observation cannot complete the baseline
+def incomplete_baseline(migration_record):
+    """A baseline that recorded a read gap: an apply never captures one, so only an older
+    or damaged record holds it."""
+    baseline = read_record(migration_record)["baseline"]
+    rewrite(migration_record, baseline=dict(baseline, complete=False, gaps=[gap("pca", "AccessDenied")]))
+    return read_record(migration_record)
+
+
+def test_verify_with_an_incomplete_baseline_is_inconclusive(harness, capsys, migration_record):
+    applied(harness, migration_record)
+    record = incomplete_baseline(migration_record)
     capsys.readouterr()
     assert main(mode_args("verify", migration_record)) == 3
     output = capsys.readouterr().out
     assert "status=INCONCLUSIVE" in summary_line(output)
-    assert "migration_status=INCONCLUSIVE baseline is incomplete: pca resource_checks_unavailable" in output
+    assert "migration_status=INCONCLUSIVE baseline is incomplete: pca AccessDenied" in output
     assert read_record(migration_record)["baseline"] == record["baseline"]
+
+
+def test_a_baseline_whose_only_gaps_are_unchecked_resource_types_is_complete(
+        harness, capsys, migration_record):
+    """Older baselines recorded types without a health collector as gaps; they are limits."""
+    applied(harness, migration_record)
+    baseline = read_record(migration_record)["baseline"]
+    rewrite(migration_record, baseline=dict(baseline, complete=False,
+                                            gaps=[gap("resource_checks", "resource_checks_unavailable")]))
+    capsys.readouterr()
+    assert main(mode_args("verify", migration_record)) == 0
+    assert "baseline is incomplete" not in capsys.readouterr().out
 
 
 def test_verify_observation_gaps_are_inconclusive(harness, capsys, migration_record):
@@ -2262,9 +2281,9 @@ def test_baseline_is_captured_once_and_a_later_apply_never_replaces_it(harness, 
     ("association-missing", f"original state changed during confirmation (missing): {ASSOCIATION_KEY}"),
     ("association-replaced", f"original state changed during confirmation (missing): {ASSOCIATION_KEY}"),
     ("association-moved", f"original state changed during confirmation (vpc_id changed): {ASSOCIATION_KEY}"),
-    ("association-failed", "status=FAILED: not COMPLETE; capture requires a stable original state"),
-    ("entitlement-lost", f"resource_arn={RULE} via_shares=0 via_temporary=0 via_other=0: "
-                         "not visible to the consumer"),
+    ("association-failed", f"original state changed during confirmation (status FAILED): {ASSOCIATION_KEY}"),
+    ("entitlement-lost", "original state changed during confirmation (not visible to the consumer): "
+                         f"entitlement|{CONSUMER}|{REGION}|{RULE}"),
 ])
 def test_state_change_during_confirmation_blocks_at_the_write_gate(
         harness, capsys, migration_record, change, expected):
@@ -2405,9 +2424,8 @@ def test_complete_refuses_without_a_baseline(harness, capsys, migration_record):
 
 
 def test_complete_refuses_with_an_incomplete_baseline(harness, capsys, migration_record):
-    harness.collect_gaps = [gap("pca", "resource_checks_unavailable")]
-    applied(harness, migration_record, code=1)
-    harness.collect_gaps = []
+    applied(harness, migration_record)
+    incomplete_baseline(migration_record)
     capsys.readouterr()
     refused(harness, migration_record, capsys,
             "a complete original baseline is required before the temporary path is retired")

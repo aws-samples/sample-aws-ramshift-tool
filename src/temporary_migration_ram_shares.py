@@ -1318,6 +1318,11 @@ def observe(router: Any, groups: list, temporary: frozenset[str], opts: Options,
         report.emit(f"phase={phase} status=GAP collector={gap.get('collector')} "
                     f"account={gap.get('account')} region={gap.get('region')} "
                     f"resource={gap.get('resource_arn')} reason={gap.get('reason')}")
+    for limit in limits_of(observation):
+        report.emit(f"phase={phase} status=LIMITED account={limit.get('account')} "
+                    f"region={limit.get('region')} resource={limit.get('resource_arn')} "
+                    f"type={limit.get('type')} RAM access is verified; this resource type has no "
+                    "resource-specific health check")
     return observation
 
 
@@ -1334,21 +1339,46 @@ def unassociated_rules(groups: list, observation: Any,
 
 
 def capture_problems(observation: Any) -> list[str]:
-    """A baseline is captured only from a complete, stable observation."""
-    problems = [f"phase=baseline status=BLOCKED collector={gap.get('collector')} "
-                f"account={gap.get('account')} region={gap.get('region')} "
-                f"resource={gap.get('resource_arn')} {gap.get('reason')}; the original baseline "
-                "cannot be captured completely" for gap in value(observation, "gaps")
-                if gap.get("reason") != UNAVAILABLE]
+    """A baseline is captured only from a complete observation: an unread item could be
+    anything. What was read is recorded as found (see pre_existing)."""
+    return [f"phase=baseline status=BLOCKED collector={gap.get('collector')} "
+            f"account={gap.get('account')} region={gap.get('region')} "
+            f"resource={gap.get('resource_arn')} {gap.get('reason')}; the original baseline "
+            "cannot be captured completely" for gap in value(observation, "gaps")
+            if gap.get("reason") != UNAVAILABLE]
+
+
+def pre_existing(observation: Any, phase: str) -> list[str]:
+    """Items already unhealthy, or entitlements already invisible, before the migration.
+    The migration cannot have caused them and they never block: the baseline records
+    them as found, and they are a loss only if they disappear or their binding changes."""
+    lines = []
     for item in value(observation, "items"):
         rule = HEALTH.get(item["kind"])
         if rule and item.get(rule[0]) != rule[1]:
-            problems.append(f"phase=baseline status=BLOCKED {describe_item(item)}: not {rule[1]}; "
-                            "capture requires a stable original state")
+            lines.append(f"phase={phase} status=PRE_EXISTING {describe_item(item)}: not {rule[1]} "
+                         "before the migration; recorded as found, never a blocker")
         if item["kind"] == "entitlement" and not item.get("via_shares"):
-            problems.append(f"phase=baseline status=BLOCKED {describe_item(item)}: "
-                            "not visible to the consumer")
-    return problems
+            lines.append(f"phase={phase} status=PRE_EXISTING {describe_item(item)}: not visible "
+                         "to the consumer before the migration; recorded as found, never a blocker")
+    return lines
+
+
+def limits_of(observation: Any) -> list[dict]:
+    """Resources whose RAM access is observed but whose type has no health collector."""
+    if isinstance(observation, dict):
+        return list(observation.get("limits") or [])
+    return list(getattr(observation, "limits", None) or [])
+
+
+def baseline_gaps(baseline: dict) -> list[dict]:
+    """Read gaps of a captured baseline. Older baselines recorded resource types without a
+    health collector as gaps (resource_checks_unavailable); those are limits, not gaps."""
+    return [gap for gap in baseline.get("gaps", []) if gap.get("reason") != UNAVAILABLE]
+
+
+def baseline_complete(baseline: dict | None) -> bool:
+    return baseline is not None and (bool(baseline.get("complete")) or not baseline_gaps(baseline))
 
 
 def losses(comparison: Any) -> list[dict]:
@@ -1423,9 +1453,10 @@ def consumer_organizations(router: Any, consumers: list[str],
 def new_baseline(observation: Any, organizations: dict, revision: int,
                  excluded_verification: dict | None = None,
                  excluded_consumers: dict | None = None) -> dict:
-    gaps = list(value(observation, "gaps"))
+    gaps = [gap for gap in value(observation, "gaps") if gap.get("reason") != UNAVAILABLE]
     return {"schema": 1, "captured_at": value(observation, "observed_at"),
             "captured_in_revision": revision, "complete": not gaps, "gaps": gaps,
+            "limits": limits_of(observation),
             "consumer_organizations": dict(sorted(organizations.items())),
             "verification_exclusions": excluded_verification,
             "excluded_consumers": excluded_consumers,
@@ -1513,9 +1544,9 @@ def migration_status(record: dict, comparison: Any | None, organizations: dict,
         return "FAILED", sorted(set(reasons))
     if baseline is None:
         return "INCONCLUSIVE", ["no original baseline is recorded; apply captures it before its first write"]
-    if not baseline.get("complete"):
+    if not baseline_complete(baseline):
         return "INCONCLUSIVE", [f"baseline is incomplete: {gap.get('collector')} {gap.get('reason')}"
-                                for gap in baseline.get("gaps", [])] or ["baseline is incomplete"]
+                                for gap in baseline_gaps(baseline)] or ["baseline is incomplete"]
     if comparison is None or value(comparison, "status") != "INTACT":
         gaps = value(comparison, "gaps") if comparison is not None else []
         return "INCONCLUSIVE", [f"observation gap: {gap.get('collector')} {gap.get('account')} "
@@ -2529,6 +2560,9 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         preflight = observe(gate, plan.groups, temporary_share_arns(record, {}), opts, report,
                             "baseline-preflight")
         problems, comparison = baseline_check(record, preflight, plan.groups)
+        if record is None or record.get("baseline") is None:
+            for line in pre_existing(preflight, "baseline-preflight"):
+                report.emit(line)
         plan.blocked.extend(problems)
         pending_drops = drops_from(comparison, preflight, organizations, "apply",
                                    record["baseline"]["captured_at"] if record and record.get("baseline")
@@ -3128,7 +3162,7 @@ def run_complete(router: Router, opts: Options, ask: Callable[[str], str], repor
         organizations, checks = consumer_organizations(gate, chosen, opts)
         observation = observe(gate, list(retiring.values()), temporary, opts, report,
                               "complete-preflight")
-        if baseline is None or not baseline.get("complete"):
+        if not baseline_complete(baseline):
             checks.append("a complete original baseline is required before the temporary path "
                           "is retired")
         else:
@@ -3445,9 +3479,9 @@ def run_monitor(router: Router, opts: Options, report: Reporter) -> int:
     reasons: list[str] = []
     if baseline is None:
         reasons.append("no original baseline is recorded; apply captures it before its first write")
-    elif not baseline.get("complete"):
+    elif not baseline_complete(baseline):
         reasons += [f"the original baseline is incomplete: {gap.get('collector')} {gap.get('account')} "
-                    f"{gap.get('region')} {gap.get('reason')}" for gap in baseline.get("gaps", [])] \
+                    f"{gap.get('region')} {gap.get('reason')}" for gap in baseline_gaps(baseline)] \
             or ["the original baseline is incomplete"]
     before = (baseline or {}).get("consumer_organizations", {})
     reasons += [f"consumer {consumer} is not covered by the original baseline"
@@ -3483,7 +3517,7 @@ def run_monitor(router: Router, opts: Options, report: Reporter) -> int:
     report.emit(f"migration={migration} phase=monitor status=STARTED consumers={','.join(chosen)} "
                 f"baseline_captured_at={(baseline or {}).get('captured_at')} "
                 f"baseline_items={len((baseline or {}).get('items', []))}{excluded}")
-    if baseline is None or not baseline.get("complete"):
+    if not baseline_complete(baseline):
         return finish("INCONCLUSIVE", {})
     blocked = authenticate(router, {g.owner for g in groups} | set(chosen), opts, report)
     if blocked:

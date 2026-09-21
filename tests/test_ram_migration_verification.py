@@ -324,9 +324,12 @@ def test_entitlements_follow_active_received_shares_across_pages(world):
     assert observation.items == [
         entitlement(PREFIX_LIST, via=(ORIGINAL, TEMPORARY), temporary=(TEMPORARY,)),
         entitlement(SECOND_PREFIX_LIST, via=())]
-    # Unsupported types still yield their entitlement, plus an exact-reason gap.
-    assert observation.gaps == [gap("resource_checks", PREFIX_LIST, "resource_checks_unavailable"),
-                                gap("resource_checks", SECOND_PREFIX_LIST, "resource_checks_unavailable")]
+    # Unsupported types still yield their entitlement, plus an exact-reason limit, never
+    # a gap: their RAM access is observed, only resource-specific health is not.
+    assert observation.gaps == []
+    assert [(row["resource_arn"], row["type"], row["reason"]) for row in observation.limits] == [
+        (PREFIX_LIST, PREFIX, "resource_checks_unavailable"),
+        (SECOND_PREFIX_LIST, PREFIX, "resource_checks_unavailable")]
     assert {(account, service) for account, service, *_ in world.requests} == {(CONSUMER, "ram")}
     assert observation.observed_at and json.loads(json.dumps(observation.to_dict()))["items"]
 
@@ -359,9 +362,9 @@ def test_api_failures_are_gaps_with_code_operation_and_request_id_only(world):
         gap("entitlement", None, "AccessDeniedException operation=GetResourceShares request=req-shares"),
         gap("entitlement", None, "ThrottlingException operation=ListResources request=req-throttled",
             account=SECOND),
-        gap("entitlement", None, "MigrationError operation=GetResourceShares request=none", account=THIRD),
-        *[gap("resource_checks", PREFIX_LIST, "resource_checks_unavailable", account=consumer)
-          for consumer in (CONSUMER, SECOND, THIRD)]]
+        gap("entitlement", None, "MigrationError operation=GetResourceShares request=none", account=THIRD)]
+    assert [(row["account"], row["reason"]) for row in observation.limits] == [
+        (consumer, "resource_checks_unavailable") for consumer in (CONSUMER, SECOND, THIRD)]
     assert "do-not-copy" not in json.dumps(observation.to_dict())
 
 
@@ -542,7 +545,9 @@ def test_resolver_endpoint_failures_keep_what_was_read(world):
     assert observation.gaps == [gap(
         "resolver_endpoints", RULE,
         "AccessDeniedException operation=ListResolverEndpointIpAddresses request=req-ips", account=OWNER)]
-    assert len(cli.capture_problems(observation)) == 3  # gap, endpoint and association block capture
+    assert len(cli.capture_problems(observation)) == 1  # only the read gap blocks capture
+    # The unhealthy endpoint and association were so before the migration: recorded as found.
+    assert len(cli.pre_existing(observation, "baseline")) == 2
 
 
 def test_resolver_owner_listing_failure_hides_associations_rather_than_losing_them(world):
@@ -735,7 +740,6 @@ def test_an_absent_baseline_item_is_missing(before):
     (entitlement(PREFIX_LIST), entitlement(PREFIX_LIST, via=()), ["not visible to the consumer"]),
     (association(), association(status="FAILED"), ["status FAILED"]),
     (association(), association(status="OVERRIDDEN"), ["status OVERRIDDEN"]),
-    (association(status="CREATING"), association(status="CREATING"), ["status CREATING"]),
     (association(), association(vpc=OTHER_VPC), ["vpc_id changed"]),
     (association(), association(rule_id=SECOND_RULE_ID), ["rule_id changed"]),
     (association(), association(status="DELETING", vpc=OTHER_VPC), ["status DELETING", "vpc_id changed"]),
@@ -749,7 +753,6 @@ def test_an_absent_baseline_item_is_missing(before):
     (attachment(), attachment(owner_state="not_listed"), ["owner_association_state not_listed"]),
     (attachment(), attachment(vpc=OTHER_VPC), ["vpc_id changed"]),
     (route(), route(state="blackhole"), ["state blackhole"]),
-    (route(state="blackhole"), route(state="blackhole"), ["state blackhole"]),
     (allocation(), allocation(consumer=SECOND), ["consumer changed"]),
     (allocation(), allocation(cidr="10.1.0.0/24"), ["cidr changed"]),
     (pca(), pca(ca_status="DISABLED"), ["ca_status DISABLED"]),
@@ -1195,3 +1198,21 @@ def test_replacement_access_agrees_with_the_reference_fake(changes):
         return sorted((row["consumer"], row["region"], row["resource_arn"]) for row in result[name])
     for name in ("covered", "uncovered", "gaps"):
         assert rows(name, real) == rows(name, fake)
+
+
+@pytest.mark.parametrize("before", [
+    association(status="CREATING"), association(status="FAILED"), route(state="blackhole"),
+    attachment(state="pending"), endpoint(status="ACTION_NEEDED"), entitlement(PREFIX_LIST, via=()),
+    pca(ca_status="DISABLED"),
+], ids=lambda value: value["kind"])
+def test_state_already_unhealthy_before_the_migration_is_no_loss(before):
+    """The migration is judged only on what it can change."""
+    comparison = verification.compare([before], observed([copy.deepcopy(before)]))
+    assert comparison.status == "INTACT" and comparison.present == [before["key"]]
+
+
+def test_a_pre_existing_unhealthy_item_is_still_lost_when_it_disappears_or_is_replaced():
+    before = association(status="FAILED")
+    assert verification.compare([before], observed([])).status == "LOSS"
+    replaced = verification.compare([before], observed([association(status="FAILED", vpc=OTHER_VPC)]))
+    assert replaced.status == "LOSS" and replaced.degraded[0]["reasons"] == ["vpc_id changed"]
