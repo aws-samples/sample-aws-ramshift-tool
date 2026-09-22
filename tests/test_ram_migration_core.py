@@ -1379,26 +1379,50 @@ def test_deleted_migration_tagged_share_is_excluded_without_provenance_reads(cli
     assert result.excluded == [f"{TEMP}: deleted share (status DELETED)"]
 
 
-@pytest.mark.parametrize("status", ["DELETING", "PENDING", "FAILED"])
-def test_unsettled_or_failed_source_shares_still_block(clients, status):
+def test_a_pending_source_share_still_blocks(clients):
+    cs, stubs = clients
+    stubs["ram"].add_response("get_resource_shares", {"resourceShares": [
+        live_share(SOURCE, "PENDING")]}, {"resourceOwner": "SELF"})
+    result = inspect(cs)
+    assert not result.groups and not result.excluded
+    assert result.blocked == [f"{SOURCE}: owner={OWNER} region={REGION} source status PENDING"]
+
+
+@pytest.mark.parametrize("status", ["DELETING", "FAILED"])
+def test_a_source_share_that_grants_nothing_now_is_excluded_not_blocked(clients, status):
+    """The migration cannot change access a share does not give."""
     cs, stubs = clients
     stubs["ram"].add_response("get_resource_shares", {"resourceShares": [
         live_share(SOURCE, status)]}, {"resourceOwner": "SELF"})
     result = inspect(cs)
-    assert not result.groups and not result.excluded
-    assert result.blocked == [f"{SOURCE}: owner={OWNER} region={REGION} source status {status}"]
+    assert not result.groups and not result.blocked
+    assert result.excluded == [f"{SOURCE}: source status {status}; it grants no access now, so "
+                               "the migration does not change it"]
 
 
-@pytest.mark.parametrize("status", [
-    "UNAVAILABLE", "PENDING", "ZONAL_RESOURCE_INACCESSIBLE", "LIMIT_EXCEEDED"])
-def test_explicit_owner_side_resource_status_still_blocks(clients, status):
+def test_an_owner_side_resource_being_added_still_blocks(clients):
+    cs, stubs = clients
+    stubs["ram"].add_response("get_resource_shares", {"resourceShares": [live_share(SOURCE)]},
+                             {"resourceOwner": "SELF"})
+    stub_live_source(stubs, SOURCE, [live_resource(status="PENDING")])
+    result = inspect(cs)
+    assert not result.groups
+    assert result.blocked == [f"{SOURCE}: owner={OWNER} region={REGION} {RESOURCE}: resource status PENDING"]
+
+
+@pytest.mark.parametrize("status", ["UNAVAILABLE", "ZONAL_RESOURCE_INACCESSIBLE", "LIMIT_EXCEEDED"])
+def test_an_owner_side_resource_the_share_cannot_provide_now_is_left_out(clients, status):
     cs, stubs = clients
     stubs["ram"].add_response("get_resource_shares", {"resourceShares": [live_share(SOURCE)]},
                              {"resourceOwner": "SELF"})
     stub_live_source(stubs, SOURCE, [live_resource(status=status)])
     result = inspect(cs)
-    assert not result.groups
-    assert result.blocked == [f"{SOURCE}: owner={OWNER} region={REGION} {RESOURCE}: resource status {status}"]
+    assert not result.groups and not result.blocked
+    assert result.excluded == [
+        f"{SOURCE}: resource {RESOURCE} status {status}; it is not available through this share "
+        "now, so the migration does not change it",
+        f"{SOURCE}: no resource is available through this share now; the migration does not "
+        "change it"]
 
 
 @pytest.mark.parametrize("status", [None, "UNAVAILABLE"])

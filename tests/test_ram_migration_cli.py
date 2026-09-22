@@ -3528,21 +3528,21 @@ def test_destination_ou_is_validated_evaluated_recorded_and_must_match_at_apply(
     assert "status=SHARING_READY" in summary_line(capsys.readouterr().out)
 
 
-def test_ou_principal_shares_check_the_ram_organization_prerequisites(
+def test_ou_principal_shares_check_the_ram_organization_prerequisites_without_blocking(
         harness, capsys, migration_record):
+    """The temporary shares name accounts directly and do not use RAM sharing with AWS
+    Organizations: an unmet prerequisite is a warning, never a blocker."""
     harness.organization_principals = {
         ORIGINAL_SHARE: [OU_PRINCIPAL],
         f"arn:aws:ram:{REGION}:{OWNER}:resource-share/not-planned": [OU_PRINCIPAL]}
     harness.org_services = ["sso.amazonaws.com"]
-    assert main(with_record(args(), migration_record)) == 1
+    assert main(with_record(args(), migration_record)) == 0
     output = capsys.readouterr().out
-    assert ("phase=ram-org-prerequisites status=BLOCKED organization=o-sourceorg01 "
+    assert ("phase=ram-org-prerequisites status=WARNING organization=o-sourceorg01 "
             f"management_account={MANAGER} decision=NOT_MET prerequisite=ram-trusted-access "
             "shares=1: ") in output
-    prerequisite, = [line for line in blocker_summary(output) if "category=" in line]
-    assert prerequisite.startswith("phase=blocker-summary category=ram-organization-prerequisites "
-                                   "blockers=1 organizations=1 next_action=")
-    assert "never enables them" in prerequisite
+    assert "the temporary shares do not need it, so this never blocks" in output
+    assert "status=PLANNED" in summary_line(output)
     harness.org_services = ["ram.amazonaws.com"]
     assert main(with_record(args(), migration_record)) == 0
     entry, = read_record(migration_record)["plan"]["organization_policy_preflight"][
@@ -4166,3 +4166,23 @@ def test_a_replan_that_drops_an_account_keeps_its_temporary_access_retirable(har
     args_ = cli.build_parser().parse_args(["complete", "--consumers", OTHER_CONSUMER])
     opts = cli.Options(args_, [], [CONSUMER], [], [], {}, {}, None, selected=[OTHER_CONSUMER])
     assert cli.selected_consumers(opts, read_record(migration_record)) == [OTHER_CONSUMER]
+
+
+@pytest.mark.parametrize("status", ["ZONAL_RESOURCE_INACCESSIBLE", "LIMIT_EXCEEDED", "UNAVAILABLE"])
+def test_a_received_resource_the_account_cannot_use_now_never_blocks(harness, capsys, status):
+    """Access the account does not have today is not something the migration changes."""
+    share = harness.receive(resource_status="AVAILABLE")
+    resources = harness.received_resources[CONSUMER, REGION, share["resourceShareArn"]]
+    resources.append(dict(resources[0], arn=resources[0]["arn"] + "-zonal", status=status))
+    assert main(args()) == 0
+    output = capsys.readouterr().out
+    assert f"status=EXCLUDED received resource status {status}: the account has no access" in output
+    assert "status=PLANNED" in summary_line(output)
+
+
+def test_a_received_resource_being_added_still_blocks(harness, capsys):
+    share = harness.receive(resource_status="AVAILABLE")
+    resources = harness.received_resources[CONSUMER, REGION, share["resourceShareArn"]]
+    resources.append(dict(resources[0], arn=resources[0]["arn"] + "-pending", status="PENDING"))
+    assert main(args()) == 1
+    assert "intended received resource status PENDING" in capsys.readouterr().out

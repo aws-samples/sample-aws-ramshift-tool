@@ -1081,10 +1081,14 @@ def classify_received(audit: ReceivedAudit, plan: Plan, proven: dict, owner_scop
             audit.blocked.append(f"{context} status=BLOCKED "
                                  "resource owner's Region is outside the selected discovery scope")
         for item in items:
-            if item["status"] != "AVAILABLE":
+            if item["status"] == "PENDING":  # being added: intended access not settled yet
                 entry["status"] = "BLOCKED"
                 audit.blocked.append(f"{context} resource={item['arn']} status=BLOCKED "
                                      f"intended received resource status {item['status']}")
+            elif item["status"] != "AVAILABLE":
+                audit.excluded.append(f"{context} resource={item['arn']} status=EXCLUDED received "
+                                      f"resource status {item['status']}: the account has no access "
+                                      "to it now, so the migration does not change it")
         upstream = any(arn in reason for reason in plan.blocked)
         uncovered = [item["arn"] for item in items if item["status"] == "AVAILABLE"
                      and (account, owner, region, item["arn"]) not in covered]

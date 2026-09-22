@@ -378,12 +378,15 @@ def test_destination_prerequisites_and_policies_are_read_through_the_destination
     organization_principal = f"arn:aws:organizations::{MNA_MANAGER}:ou/{MNA}/{APPS_OU}"
     result, lines = run(router, [share()], destination=WORK_DESTINATION,
                         organization_shares={SHARE: [organization_principal]})
-    blocker, = result["blockers"]
-    assert blocker == (
-        f"phase=ram-org-prerequisites status=BLOCKED organization={CORE} "
+    assert result["blockers"] == [] and result["status"] == "ALLOWED"
+    warning, = result["warnings"]
+    assert warning == (
+        f"phase=ram-org-prerequisites status=WARNING organization={CORE} "
         f"management_account={CORE_MANAGER} decision=NOT_MET prerequisite=ram-trusted-access "
         "shares=1: ram.amazonaws.com trusted access, which RAM's sharing with AWS Organizations "
-        "enables, is not enabled; this tool never enables it")
+        "enables, is not enabled; the temporary shares do not need it, so this never blocks; "
+        "this tool never enables it")
+    assert warning in lines
     destination, source = result["ram_organization_prerequisites"]
     assert (destination["organization"], destination["scope"], destination["status"]) == (
         CORE, ["destination"], "NOT_MET")
@@ -410,7 +413,8 @@ def test_a_consolidated_billing_destination_has_no_policies_and_fails_all_featur
     result, _ = run(router, [share()], destination=WORK_DESTINATION, organization_shares={
         SHARE: [f"arn:aws:organizations::{MNA_MANAGER}:organization/{MNA}"]})
     assert result["destination"]["service_control_policies"] == "NOT_ENABLED"
-    all_features, trusted = result["blockers"]
+    assert result["blockers"] == []
+    all_features, trusted = result["warnings"]
     assert "prerequisite=all-features feature_set=CONSOLIDATED_BILLING shares=1" in all_features
     assert "prerequisite=ram-trusted-access" in trusted
 

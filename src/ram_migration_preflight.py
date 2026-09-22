@@ -903,14 +903,19 @@ def _organization_principal(principal: str) -> tuple[str, str] | None:
 
 
 def _prerequisites(reader: _Reader, needed: dict[str, dict]) -> tuple[list[dict], list[str]]:
-    """ALL features and ram.amazonaws.com trusted access, read-only, never enabled."""
+    """ALL features and ram.amazonaws.com trusted access, read-only, never enabled.
+
+    Returns warnings, never blockers: the temporary shares name accounts directly and do
+    not use RAM sharing with AWS Organizations, so the migration does not depend on them.
+    Original OU or organization shares need them to work today, and permanent sharing to
+    a destination OU or organization will."""
     records, blockers = [], []
     for organization, need in sorted(needed.items()):
         manager = need["manager"]
         entry = {"organization": organization, "management_account": manager,
                  "scope": sorted(need["scope"]), "required_by": sorted(need["shares"]),
                  "all_features": None, "ram_trusted_access": None, "status": NOT_MET, "problem": None}
-        head = (f"phase=ram-org-prerequisites status=BLOCKED organization={organization} "
+        head = (f"phase=ram-org-prerequisites status=WARNING organization={organization} "
                 f"management_account={manager}")
         try:
             described = reader.organization(manager)
@@ -921,22 +926,22 @@ def _prerequisites(reader: _Reader, needed: dict[str, dict]) -> tuple[list[dict]
             entry["ram_trusted_access"] = RAM_SERVICE in reader.services(manager)
         except Exception as exc:
             entry["status"], entry["problem"] = UNREADABLE, failure_text(exc)
-            blockers.append(f"{head.replace('status=BLOCKED', 'status=BLOCKED decision=UNREADABLE')}: "
-                            f"{entry['problem']}; the RAM organization prerequisites could not be "
-                            "read, and unread prerequisites never pass")
+            blockers.append(f"{head} decision=UNREADABLE: {entry['problem']}; the RAM "
+                            "organization prerequisites could not be read; the temporary shares "
+                            "do not depend on them, so this never blocks")
             records.append(entry)
             continue
         shares = len(need["shares"])
         if not entry["all_features"]:
             blockers.append(f"{head} decision={NOT_MET} prerequisite=all-features "
                             f"feature_set={described['feature_set']} shares={shares}: sharing with "
-                            "OU or organization principals needs ALL features; this tool never "
-                            "enables them")
+                            "OU or organization principals needs ALL features; the temporary "
+                            "shares do not, so this never blocks; this tool never enables them")
         if not entry["ram_trusted_access"]:
             blockers.append(f"{head} decision={NOT_MET} prerequisite=ram-trusted-access "
                             f"shares={shares}: {RAM_SERVICE} trusted access, which RAM's sharing "
-                            "with AWS Organizations enables, is not enabled; this tool never "
-                            "enables it")
+                            "with AWS Organizations enables, is not enabled; the temporary shares "
+                            "do not need it, so this never blocks; this tool never enables it")
         if entry["all_features"] and entry["ram_trusted_access"]:
             entry["status"] = "MET"
         records.append(entry)
@@ -1121,7 +1126,6 @@ def organization_preflight(router: Any, groups: Iterable[Any], migrating: Iterab
             for _target, policies in state.attached.get(kind, []):
                 for policy in policies:
                     entry["policies"][policy.id] = policy.summary()
-    blockers += unmet
     result = {
         "schema": SCHEMA,
         "status": "BLOCKED" if blockers else "ALLOWED",
@@ -1143,6 +1147,8 @@ def organization_preflight(router: Any, groups: Iterable[Any], migrating: Iterab
         "ram_organization_prerequisites": prerequisites,
         "findings": findings,
         "blockers": blockers,
+        # Findings that never block, such as unmet RAM organization prerequisites.
+        "warnings": unmet,
         "notes": notes,
     }
     _report(result, emit)
@@ -1184,12 +1190,14 @@ def _report(result: dict, emit: Callable[[str], None]) -> None:
                  f"text={row['statement_text']}")
     for note in result["notes"]:
         emit(f"phase=org-policy status=NOTE {note}")
+    for warning in result.get("warnings", []):
+        emit(warning)
     decisions = [row["decision"] for row in result["findings"]]
     emit(f"phase=org-policy status={result['status']} accounts={len(result['accounts'])} "
          f"denies={sum(d in (EXPLICIT_DENY, NO_ALLOW) for d in decisions)} "
          f"gaps={decisions.count(UNDECIDED)} "
          f"unreadable={sum('decision=UNREADABLE' in b for b in result['blockers'])} "
-         f"prerequisites_not_met={sum(f'decision={NOT_MET}' in b for b in result['blockers'])}")
+         f"prerequisites_not_met={sum(f'decision={NOT_MET}' in w for w in result.get('warnings', []))}")
 
 
 def recorded_destination(result: dict | None) -> str | None:

@@ -1150,7 +1150,8 @@ class Discovery:
             if share.get("owningAccountId") != owner:
                 raise MigrationError("Source share owner does not match the inspected account")
             # RAM keeps listing deleted shares for a while; DELETED is terminal and
-            # grants nothing to replicate. DELETING/PENDING/FAILED still block below.
+            # grants nothing to replicate. DELETING and FAILED shares grant nothing now
+            # either (below); a PENDING share is being set up and still blocks.
             if share.get("status") == "DELETED":
                 part.excluded.append(f"{arn}: deleted share (status DELETED)")
                 return part, None
@@ -1174,6 +1175,10 @@ class Discovery:
                 raise MigrationError(feature_set_problem(owner, region, arn, feature))
             if self._migration_owned(owner, region, share):
                 part.existing.append(share)
+                return part, None
+            if share["status"] in ("DELETING", "FAILED"):
+                part.excluded.append(f"{arn}: source status {share['status']}; it grants no access "
+                                     "now, so the migration does not change it")
                 return part, None
             if share["status"] != "ACTIVE":
                 raise MigrationError(f"source status {share['status']}")
@@ -1374,10 +1379,18 @@ class Discovery:
             available: dict[str, str] = {}
             for resource in resources:
                 resource_arn, kind = resource["arn"], resource["type"]
-                # Owner-side (SELF) listings omit status; an explicit non-AVAILABLE
-                # status still blocks.
-                if resource.get("status", "AVAILABLE") != "AVAILABLE":
-                    raise MigrationError(f"{resource_arn}: resource status {resource.get('status')}")
+                # Owner-side (SELF) listings omit status. A resource being added (PENDING)
+                # blocks; one this share cannot provide now (for example
+                # ZONAL_RESOURCE_INACCESSIBLE or LIMIT_EXCEEDED) is not changed by the
+                # migration and is left out.
+                status = resource.get("status", "AVAILABLE")
+                if status == "PENDING":
+                    raise MigrationError(f"{resource_arn}: resource status PENDING")
+                if status != "AVAILABLE":
+                    part.excluded.append(f"{arn}: resource {resource_arn} status {status}; it is "
+                                         "not available through this share now, so the migration "
+                                         "does not change it")
+                    continue
                 if resource_arn.split(":")[4] != owner:
                     raise MigrationError(f"Cannot re-share resource owned by another account: {resource_arn}")
                 if self.capabilities.get(kind.lower()) is not True:
@@ -1385,9 +1398,16 @@ class Discovery:
                 if kind not in permission_map:
                     raise MigrationError(f"{kind}: source managed permission missing")
                 available[resource_arn] = kind
+            if not available:
+                part.excluded.append(f"{arn}: no resource is available through this share now; "
+                                     "the migration does not change it")
+                return part, None
             kinds = set(available.values())
-            if set(permission_map) != kinds:
+            if set(permission_map) != {resource["type"] for resource in resources}:
                 raise MigrationError("Source permissions do not exactly match its resource types")
+            # A resource type left out entirely needs no permission on the temporary share.
+            permission_map = {k: v for k, v in permission_map.items() if k in kinds}
+            snapshots = {k: v for k, v in snapshots.items() if k in kinds}
             group = ApprovedGroup(owner, region, tuple(sorted(consumers)),
                                   permission_map, available, [arn], snapshots, source_stacks,
                                   tuple(sorted(stationary)))
@@ -1403,8 +1423,8 @@ class Discovery:
                     f"stationary_consumers={','.join(sorted(stationary))} "
                     "status=PLANNED account-level external shares retain these recipients; "
                     "baseline capture and invitation acceptance are required before the owner moves")
-            # Only a share that is planned reports its difference.
-            part.permission_changes.extend(changes)
+            # Only a share that is planned reports its difference, for the types it holds.
+            part.permission_changes.extend(c for c in changes if c["resource_type"] in kinds)
             return part, group
         except Exception as exc:
             part.blocked.append(share_blocker(owner, region, arn, exc))
