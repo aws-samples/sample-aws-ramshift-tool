@@ -41,7 +41,8 @@ from ram_migration_discovery import (
     Discovery, LookupCache, describe_difference, external_catalog, failure_text, grants_less,
 )
 from ram_migration_record import (
-    APPLICABLE, add_drops, approve_owner_scope, approved_owners, drop_id, failure_drops, latest,
+    APPLICABLE, accepted_blockers, add_drops, approve_owner_scope, approved_owners, drop_id,
+    failure_drops, latest, record_acceptances,
     new_record, owner_scope_request, plan_digest, retired_consumers, tool_identity,
 )
 from ram_migration_preflight import (
@@ -128,6 +129,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exclude-consumers-reason",
                         help="mandatory reason for --exclude-consumers; recorded with the "
                              "reviewed scope and inherited by verify/monitor/complete")
+    parser.add_argument("--accept-blockers", nargs="+", action="append", default=[],
+                        metavar="BLOCKER",
+                        help="approve: accept these blockers of the recorded plan so plan and "
+                             "apply proceed without them: blocker IDs (blocker=b-... in plan "
+                             "output), blocker categories, or all. Requires --accept-reason; each "
+                             "acceptance is recorded with its consequence and binds to the "
+                             "blocker's exact text")
+    parser.add_argument("--accept-reason",
+                        help="approve: mandatory one-line reason recorded with --accept-blockers")
     parser.add_argument("--all-accounts", action="store_true",
                         help="monitor/complete: act on every tracked account in the migration "
                              "record instead of the accounts named with --consumers")
@@ -475,10 +485,21 @@ def options(args: argparse.Namespace, ask: Callable[[str], str]) -> Options:
         if args.mode not in ("plan", "apply"):
             raise MigrationError("--destination-ou is supported only for plan and apply")
         destination_target(args.destination_ou)
+    if (args.accept_blockers or args.accept_reason is not None) and args.mode != "approve":
+        raise MigrationError("--accept-blockers and --accept-reason are supported only for approve")
     if args.mode == "approve":
         # Approval is an offline review of the record; it needs no AWS access.
         if not args.record:
             raise MigrationError("approve requires --record")
+        if args.accept_blockers:
+            reason = (args.accept_reason or "").strip()
+            if not reason or "\n" in reason or "\r" in reason or len(reason) > MAX_REASON:
+                raise MigrationError("--accept-blockers requires --accept-reason: one nonempty line "
+                                     f"of at most {MAX_REASON} characters, recorded with each "
+                                     "acceptance")
+            args.accept_reason = reason
+        elif args.accept_reason is not None:
+            raise MigrationError("--accept-reason requires --accept-blockers")
         if args.migration_id and not MIGRATION_ID.fullmatch(args.migration_id):
             raise MigrationError("Supply a valid --migration-id or omit it to use the record's")
         excluded_regions(args, [])
@@ -1789,8 +1810,17 @@ def print_plan(plan: Plan, prepared: dict, report: Reporter) -> None:
         report.emit(f"phase=plan status=EXISTING share={share.get('resourceShareArn', 'unknown')}")
     for note in plan.notes:
         report.emit(f"phase=plan status=NOTE {note}")
+    for row in plan.accepted:
+        report.emit(accepted_line(row))
     for reason in plan.blocked:
-        report.emit(f"phase=preflight status=BLOCKED {reason}")
+        report.emit(f"phase=preflight status=BLOCKED {reason} blocker={blocker_id(reason)}")
+
+
+def accepted_line(row: dict) -> str:
+    return (f"phase=preflight status=ACCEPTED blocker={row['blocker_id']} "
+            f"category={row['category']} accepted_at={row.get('accepted_at')} "
+            f"accepted_reason={json.dumps(row.get('accepted_reason'))} "
+            f"consequence={json.dumps(row.get('consequence'))} {row['blocker']}")
 
 
 def account_scope(opts: Options) -> dict:
@@ -1915,6 +1945,7 @@ def record_plan(record: dict, plan: Plan, scope: dict, prepared: dict, received:
         "groups": [group_record(g, plan.migration) for g in
                    sorted(plan.groups, key=lambda g: (g.owner, g.region, g.key))],
         "blocked": list(plan.blocked),
+        "accepted": copy.deepcopy(plan.accepted),
         "excluded": list(plan.excluded),
         "notes": list(plan.notes),
         "owner_continuity": sorted(copy.deepcopy(plan.owner_continuity),
@@ -1977,6 +2008,8 @@ def run_approve(opts: Options, ask: Callable[[str], str], report: Reporter) -> i
     migration = record["migration_id"]
     if latest(record, "plan") is None:
         raise MigrationError("approve requires a recorded plan; run plan --record first")
+    if opts.args.accept_blockers:
+        return run_accept(record, opts, ask, report)
     excluded = (record.get("scope") or {}).get("excluded_regions")
     if excluded:
         report.emit(f"migration={migration} phase=approve scope=REGIONS_EXCLUDED"
@@ -2022,6 +2055,72 @@ def run_approve(opts: Options, ask: Callable[[str], str], report: Reporter) -> i
     return 0
 
 
+def run_accept(record: dict, opts: Options, ask: Callable[[str], str], report: Reporter) -> int:
+    """Accept blockers of the latest recorded plan, chosen by ID, category or all. Each
+    acceptance records its consequence and reason and binds to the blocker's exact text;
+    plan and apply then report it as ACCEPTED instead of stopping on it."""
+    path, migration = opts.args.record, record["migration_id"]
+    revision = latest(record, "plan")["revision"]
+    blockers = list((record.get("plan") or {}).get("blocked") or [])
+    already = {row["blocker_id"] for row in (record.get("plan") or {}).get("accepted") or []} | \
+        set(accepted_blockers(record))
+    chosen: dict[str, str] = {}
+    for selector in split_values(opts.args.accept_blockers):
+        if selector == "all":
+            hits = blockers
+        elif selector in BLOCKER_ACTIONS:
+            hits = [reason for reason in blockers if blocker_category(reason) == selector]
+        else:
+            hits = [reason for reason in blockers if blocker_id(reason) == selector]
+            if not hits and selector in already:
+                report.emit(f"blocker={selector} phase=approve status=ALREADY_ACCEPTED")
+                continue
+            if not hits:
+                raise MigrationError(
+                    f"--accept-blockers {selector}: not a blocker ID or category of the plan "
+                    f"recorded in revision {revision}; run plan --record to list its blockers "
+                    "(blocker=b-... on each phase=preflight status=BLOCKED line)")
+        for reason in hits:
+            chosen.setdefault(blocker_id(reason), reason)
+    rows = []
+    for identity, reason in chosen.items():
+        category, consequence, refusal = acceptance_of(reason)
+        if refusal is not None:
+            report.emit(f"blocker={identity} phase=approve status=NOT_ACCEPTABLE category={category} "
+                        f"why={json.dumps(refusal)} {reason}")
+            continue
+        report.emit(f"blocker={identity} phase=approve category={category} "
+                    f"consequence={json.dumps(consequence)} {reason}")
+        rows.append({"blocker_id": identity, "category": category, "blocker": reason,
+                     "consequence": consequence, "accepted_reason": opts.args.accept_reason,
+                     "plan_revision": revision})
+    if not rows:
+        report.emit(f"migration={migration} phase=approve status=NOTHING_ACCEPTED no acceptable "
+                    "blocker was chosen")
+        return 1 if chosen else 0
+    token = f"ACCEPT-BLOCKERS {migration} {len(rows)}"
+    try:
+        reply = ask(f"Type {token} to accept these {len(rows)} blockers with their consequences: ")
+    except EOFError:
+        reply = ""
+    if reply != token:
+        report.emit(f"migration={migration} phase=approve status=NOT_ACCEPTED confirmation did not match")
+        return 2
+
+    def add(current: dict) -> None:
+        if latest(current, "plan")["revision"] != revision:
+            raise MigrationError("a plan was recorded during review; re-run approve against it")
+        at = timestamp()
+        record_acceptances(current, [dict(row, accepted_at=at) for row in rows])
+    update_record(path, migration, add, mode="approve", status="ACCEPTED",
+                  accepted=[row["blocker_id"] for row in rows], accept_reason=opts.args.accept_reason)
+    for row in rows:
+        report.emit(f"blocker={row['blocker_id']} phase=approve status=ACCEPTED")
+    report.emit("Re-run plan with --record: accepted blockers are reported as ACCEPTED and no "
+                "longer block; a blocker whose text changes needs a new acceptance.")
+    return 0
+
+
 def summary(plan: Plan, report: Reporter, status: str, *, mode: str, recorded: bool,
             created: int = 0, reused: int = 0, accepted: int = 0,
             reused_invitations: int = 0, failures: int = 0, comparison: Any = None,
@@ -2039,6 +2138,8 @@ def summary(plan: Plan, report: Reporter, status: str, *, mode: str, recorded: b
             f"created_shares={created} reused_shares={reused} accepted_invitations={accepted} "
             f"reused_invitations={reused_invitations} exclusions={len(plan.excluded)} "
             f"blockers={len(plan.blocked)} verification_failures={failures}")
+    if plan.accepted:
+        line += f" accepted_blockers={len(plan.accepted)}"
     if sharing:
         line += f" sharing_status={sharing}"
     if migration:
@@ -2264,6 +2365,89 @@ def blocker_category(reason: str) -> str:
     return next((name for name, pattern in BLOCKER_PATTERNS if pattern.search(reason)), "other")
 
 
+# What accepting a blocker means: the run proceeds without what the blocker concerns.
+ACCEPTABLE = {
+    "owner-outside-approved-scope":
+        "that owner's resources are not bridged: the migrating accounts lose access to them "
+        "when they leave their organization",
+    "received-dependency-not-covered":
+        "these received resources are not bridged: the migrating accounts lose access to them "
+        "when they leave their organization",
+    "configuration":
+        "this share is not bridged: its migrating consumers lose access to it when they leave "
+        "their organization",
+    "policy-created-share":
+        "this share is not bridged: its migrating consumers keep access only if its resource "
+        "policy grants them directly rather than through their organization",
+    "organization-policy-deny":
+        "the named policy may deny apply, verify, monitor or complete requests when they run; "
+        "a denied write fails without changing original sharing",
+    "organization-policy-gap":
+        "the undecided statement may deny apply, verify, monitor or complete requests when they "
+        "run; a denied write fails without changing original sharing",
+    "organization-policy-unreadable":
+        "unread policies may deny apply, verify, monitor or complete requests when they run; a "
+        "denied write fails without changing original sharing",
+}
+SHARE_LEVEL = ("this share is not bridged: its migrating consumers lose access to it when they "
+               "leave their organization")
+RECEIVED_LEVEL = ("this received access is not bridged: the account loses it when it leaves its "
+                  "organization")
+# Blockers that guard what the tool knows or the record proves; accepting one would leave
+# the run blind or inconsistent, so each names what to do instead.
+NOT_ACCEPTABLE = {
+    "authentication": "an account that cannot be authenticated cannot be inspected or written; "
+                      "supply its access",
+    "region-scope": "leave a Region out explicitly with --exclude-regions and --exclude-reason",
+    "discovery-api-error": "an unread inventory could hold anything; resolve the error (or exclude "
+                           "the Region explicitly) and re-run",
+    "baseline-loss": "a recorded loss is permanent evidence; start a new migration record",
+    "baseline-capture": "an unread original state cannot be recorded; restore read access and re-run",
+    "baseline-scope": "the recorded baseline is never extended; plan it under a new migration record",
+    "reviewed-record-mismatch": "the run must match the reviewed record; re-run plan and review it",
+    "ram-share-quota": "AWS RAM rejects a share over its fixed quota; split the migration",
+}
+NOT_ACCEPTABLE_OTHER = "it guards the tool's own consistency; resolve it and re-run"
+
+
+def blocker_id(reason: str) -> str:
+    """Stable identity of one blocker's exact text. Request IDs are ignored, and so is the
+    post-confirmation prefix apply adds when it reads the same condition again."""
+    text = re.sub(r"^post-confirmation ", "", reason)
+    text = re.sub(r"\(request [^)]*\)|\brequest[= ][\w-]+", "", text)
+    return "b-" + digest(text, 12)
+
+
+def acceptance_of(reason: str) -> tuple[str, str | None, str | None]:
+    """(category, consequence when accepted, or why it cannot be accepted)."""
+    category = blocker_category(reason)
+    if category in ACCEPTABLE:
+        return category, ACCEPTABLE[category], None
+    if category == "other":
+        if SHARE_ARN.match(reason):
+            return category, SHARE_LEVEL, None
+        if "phase=received-audit" in reason:
+            return category, RECEIVED_LEVEL, None
+        return category, None, NOT_ACCEPTABLE_OTHER
+    return category, None, NOT_ACCEPTABLE.get(category, NOT_ACCEPTABLE_OTHER)
+
+
+def accept_recorded(plan: Plan, record: dict | None) -> None:
+    """Move every blocker the record accepts out of ``plan.blocked`` into ``plan.accepted``.
+    Idempotent; only an acceptable blocker with a recorded acceptance of its exact ID moves."""
+    accepted = accepted_blockers(record) if record is not None else {}
+    if not accepted:
+        return
+    remaining = []
+    for reason in plan.blocked:
+        row = accepted.get(blocker_id(reason))
+        if row is not None and acceptance_of(reason)[1] is not None:
+            plan.accepted.append({**row, "blocker": reason})
+        else:
+            remaining.append(reason)
+    plan.blocked = remaining
+
+
 def blocker_action(category: str, mode: str, recorded: bool) -> str:
     actions = BLOCKER_ACTIONS[category]
     context = "unrecorded" if mode == "plan" and not recorded else mode
@@ -2281,6 +2465,14 @@ def report_blockers(plan: Plan, report: Reporter, status: str, *, mode: str,
     grouped: dict[str, list[str]] = defaultdict(list)
     for reason in plan.blocked:
         grouped[blocker_category(reason)].append(reason)
+    # Which blockers can be accepted instead of resolved; the summary stays the last output.
+    for group, reasons in sorted(grouped.items()):
+        acceptable = sum(acceptance_of(reason)[1] is not None for reason in reasons)
+        if acceptable and mode in ("plan", "apply"):
+            report.emit(f"phase=accept-hint blockers={acceptable} of={group} command=\"approve "
+                        f"--record <path> --accept-blockers {group} --accept-reason <reason>\" "
+                        "(or name blocker IDs); each consequence is shown and recorded before you "
+                        "confirm, and plan then proceeds without what they concern")
     report.emit(f"phase=blocker-summary status=BLOCKED blockers={len(plan.blocked)} "
                 f"categories={len(grouped)}")
     for category in BLOCKER_ACTIONS:
@@ -2558,6 +2750,8 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
     consumers_in_scope = sorted(
         ({c for g in observed for c in g.consumers} | set(scope["migrating_owners"])) - retired)
     preflight, organizations, pending_drops = None, {}, []
+    if args.mode in ("plan", "apply"):
+        accept_recorded(plan, record)  # accepted blockers never stop the checks below
     if args.mode == "apply" and not plan.blocked and plan.groups:
         organizations, errors = consumer_organizations(gate, consumers_in_scope, opts)
         plan.blocked.extend(errors)
@@ -2577,6 +2771,8 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         for line in policy_changes((record.get("plan") or {}).get("organization_policy_preflight"),
                                    org_policy):
             report.emit(line)
+    if args.mode in ("plan", "apply"):
+        accept_recorded(plan, record)
     if args.mode != "verify":
         print_plan(plan, prepared, report)
         print_permission_changes(plan, report)
@@ -2677,9 +2873,13 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
             pending_drops = drops_from(comparison, at_gate, organizations, "apply",
                                        record["baseline"]["captured_at"] if record.get("baseline")
                                        else "", f"record revision {record['revision']}")
+        accepted_before = len(plan.accepted)
+        accept_recorded(plan, record)
+        for row in plan.accepted[accepted_before:]:
+            report.emit(accepted_line(row))
         if plan.blocked:
             for reason in plan.blocked:
-                report.emit(f"phase=preflight status=BLOCKED {reason}")
+                report.emit(f"phase=preflight status=BLOCKED {reason} blocker={blocker_id(reason)}")
             summary(plan, report, "BLOCKED", **run)
             note("BLOCKED", lambda current: add_drops(current, pending_drops),
                  blockers=list(plan.blocked), phase="post-confirmation", drops=len(pending_drops))

@@ -724,7 +724,7 @@ def test_previous_format_entry_after_an_upgrade_is_refused(tmp_path):
 
 def test_a_new_record_has_owner_scope_approvals_only():
     record = rec.new_record(MIGRATION)
-    assert record["approvals"] == {"owner_scope": []} and record["owner_scope_request"] is None
+    assert record["approvals"] == {"owner_scope": [], "blockers": []} and record["owner_scope_request"] is None
     assert "permission_change_requests" not in record
 
 

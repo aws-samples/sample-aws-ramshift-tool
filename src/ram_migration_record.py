@@ -108,7 +108,7 @@ def new_record(migration: str) -> dict:
         "owner_scope_request": None,
         # Records of earlier versions also hold permission_change_requests and
         # approvals.permission_changes; they load, and are kept as history but never read.
-        "approvals": {"owner_scope": []},
+        "approvals": {"owner_scope": [], "blockers": []},
         "baseline": None,
         "shares": [],
         "verifications": [],
@@ -547,6 +547,26 @@ def owner_scope_request(migration: str, proposed: dict[str, dict]) -> dict | Non
             "owners": sorted(proposed),
             "evidence": {owner: proposed[owner] for owner in sorted(proposed)}}
     return {"id": "os-" + sha256(body)[:16], **body}
+
+
+def accepted_blockers(record: dict) -> dict[str, dict]:
+    """Blocker acceptances by blocker ID; see record_acceptances."""
+    return {row["blocker_id"]: row for row in (record.get("approvals") or {}).get("blockers", [])}
+
+
+def record_acceptances(record: dict, rows: list[dict]) -> list[str]:
+    """Append each acceptance once: {blocker_id, category, blocker, consequence,
+    accepted_reason, accepted_at, plan_revision}. An acceptance is bound to the blocker's
+    exact text (its ID): a blocker that changes is a new blocker and needs its own."""
+    accepted = record.setdefault("approvals", {}).setdefault("blockers", [])
+    known = {row["blocker_id"] for row in accepted}
+    added = []
+    for row in rows:
+        if row["blocker_id"] not in known:
+            accepted.append(dict(row))
+            known.add(row["blocker_id"])
+            added.append(row["blocker_id"])
+    return added
 
 
 def approved_owners(record: dict) -> set[str]:

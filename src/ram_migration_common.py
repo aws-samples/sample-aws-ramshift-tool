@@ -124,6 +124,10 @@ class Plan:
     # These accounts receive an account-level bridge but do not join the moving wave.
     owner_continuity: list[dict] = field(default_factory=list)
 
+    # Blockers the operator accepted through approve --accept-blockers, moved out of
+    # ``blocked``: {blocker_id, category, blocker, consequence, accepted_reason, accepted_at}.
+    accepted: list[dict] = field(default_factory=list)
+
     def merge(self, other: "Plan") -> None:
         grouped = {g.key: g for g in self.groups}
         for group in other.groups:

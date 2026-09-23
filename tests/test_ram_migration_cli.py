@@ -5,6 +5,7 @@ import contextlib
 import copy
 import io
 import json
+import re
 import sys
 import threading
 import urllib.request
@@ -1589,7 +1590,8 @@ def test_a_v2_to_v3_difference_plans_as_information_and_the_record_keeps_it(
     assert record["plan"]["status"] == "PLANNED" and record["plan"]["blocked"] == []
     assert record["plan"]["permission_changes"] == [change]
     assert record["history"][-1]["permission_changes"] == 1
-    assert "permission_change_requests" not in record and record["approvals"] == {"owner_scope": []}
+    assert "permission_change_requests" not in record and record["approvals"] == {
+        "owner_scope": [], "blockers": []}
     assert json.loads(export.read_text())["permission_changes"] == [change]
     planned, = record["plan"]["groups"]
     assert planned["source_shares"] == [ORIGINAL_SHARE] and "permission_changes" not in planned
@@ -4186,3 +4188,107 @@ def test_a_received_resource_being_added_still_blocks(harness, capsys):
     resources.append(dict(resources[0], arn=resources[0]["arn"] + "-pending", status="PENDING"))
     assert main(args()) == 1
     assert "intended received resource status PENDING" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Accepting blockers: approve --accept-blockers
+# ---------------------------------------------------------------------------
+
+def accept(path, *selectors, reason="Owner resources are re-shared after the move", token=None,
+           migration=MIGRATION):
+    """approve --accept-blockers, confirming with the expected (or a given) token."""
+    replies = []
+
+    def answer(prompt):
+        replies.append(prompt)
+        expected = prompt.split("Type ", 1)[1].split(" to accept", 1)[0]
+        return token if token is not None else expected
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = main(["approve", "--record", str(path), "--migration-id", migration,
+                     "--accept-blockers", *selectors, "--accept-reason", reason], input_fn=answer)
+    return code, out.getvalue(), replies
+
+
+def blocker_ids(output):
+    return re.findall(r"^phase=preflight status=BLOCKED .* blocker=(b-[0-9a-f]{12})$", output, re.M)
+
+
+def test_an_accepted_owner_scope_blocker_lets_plan_and_apply_proceed(harness, capsys, migration_record):
+    harness.receive(owner=OTHER_OWNER)
+    assert main(with_record(args(), migration_record)) == 1
+    output = capsys.readouterr().out
+    assert "phase=accept-hint blockers=1 of=owner-outside-approved-scope" in output
+    code, out, prompts = accept(migration_record, "owner-outside-approved-scope")
+    assert code == 0 and prompts == [
+        f"Type ACCEPT-BLOCKERS {MIGRATION} 1 to accept these 1 blockers with their consequences: "]
+    assert "category=owner-outside-approved-scope consequence=\"that owner's resources are not " \
+           "bridged" in out and "status=ACCEPTED" in out
+    record = read_record(migration_record)
+    row, = record["approvals"]["blockers"]
+    assert (row["category"], row["accepted_reason"]) == (
+        "owner-outside-approved-scope", "Owner resources are re-shared after the move")
+    assert row["blocker_id"] == blocker_ids(output)[0] and row["accepted_at"]
+    assert main(with_record(args(), migration_record)) == 0
+    output = capsys.readouterr().out
+    assert f"phase=preflight status=ACCEPTED blocker={row['blocker_id']} " \
+           "category=owner-outside-approved-scope" in output
+    assert "status=PLANNED" in summary_line(output) and "accepted_blockers=1" in summary_line(output)
+    plan = read_record(migration_record)["plan"]
+    assert plan["blocked"] == [] and [r["blocker_id"] for r in plan["accepted"]] == [row["blocker_id"]]
+    assert main(with_record(args("apply"), migration_record), input_fn=harness.confirm) == 0
+    assert "status=SHARING_READY" in summary_line(capsys.readouterr().out) and harness.writes()
+
+
+def test_a_blocker_whose_text_changes_needs_a_new_acceptance(harness, capsys, migration_record):
+    harness.receive(owner=OTHER_OWNER)
+    assert main(with_record(args(), migration_record)) == 1
+    capsys.readouterr()
+    assert accept(migration_record, "all")[0] == 0
+    harness.receive(owner=OTHER_OWNER, suffix="another")  # the proposal now names more shares
+    assert main(with_record(args(), migration_record)) == 1
+    output = capsys.readouterr().out
+    assert "status=ACCEPTED" not in output and len(blocker_ids(output)) == 1
+
+
+def test_blockers_that_guard_the_tools_own_knowledge_cannot_be_accepted(harness, capsys,
+                                                                        migration_record):
+    harness.auth_errors[OWNER] = ClientError(
+        {"Error": {"Code": "ExpiredTokenException", "Message": "token expired"}}, "GetCallerIdentity")
+    assert main(with_record(args(), migration_record)) == 1
+    capsys.readouterr()
+    code, out, prompts = accept(migration_record, "all")
+    assert code == 1 and prompts == []
+    assert "status=NOT_ACCEPTABLE category=authentication" in out
+    assert "status=NOTHING_ACCEPTED" in out
+    assert read_record(migration_record)["approvals"]["blockers"] == []
+
+
+def test_accepting_needs_the_exact_token_a_reason_and_a_known_blocker(harness, capsys, migration_record):
+    harness.receive(owner=OTHER_OWNER)
+    assert main(with_record(args(), migration_record)) == 1
+    capsys.readouterr()
+    code, out, _ = accept(migration_record, "all", token="yes")
+    assert code == 2 and "status=NOT_ACCEPTED confirmation did not match" in out
+    assert read_record(migration_record)["approvals"]["blockers"] == []
+    code, out, _ = accept(migration_record, "b-000000000000")
+    assert code == 1 and "not a blocker ID or category of the plan" in out
+    assert main(["approve", "--record", str(migration_record), "--accept-blockers", "all"]) == 1
+    assert "--accept-blockers requires --accept-reason" in capsys.readouterr().out
+    assert main(args() + ["--accept-blockers", "all", "--accept-reason", "x"]) == 1
+    assert "supported only for approve" in capsys.readouterr().out
+
+
+def test_an_accepted_policy_deny_also_passes_the_post_confirmation_recheck(harness, capsys,
+                                                                           migration_record):
+    guard(harness)
+    assert main(with_record(args(), migration_record)) == 1
+    capsys.readouterr()
+    assert accept(migration_record, "organization-policy-deny",
+                  reason="Policy owner confirmed the exception for this wave")[0] == 0
+    assert main(with_record(args(), migration_record)) == 0
+    capsys.readouterr()
+    assert main(with_record(args("apply"), migration_record), input_fn=harness.confirm) == 0
+    output = capsys.readouterr().out
+    assert output.count("phase=preflight status=ACCEPTED") >= 2  # before and after confirmation
+    assert "category=organization-policy-deny" in output and harness.writes()

@@ -643,7 +643,9 @@ def test_expired_credentials_during_real_discovery_are_a_named_authentication_bl
     monkeypatch.setattr(cli, "Discovery", Discovery)
     assert main(args(), input_fn=lambda _: pytest.fail("plan never confirms")) == 1
     output = capsys.readouterr().out
-    blocked = [line for line in output.splitlines() if line.startswith("phase=preflight status=BLOCKED")]
+    # Each blocker line ends with its stable ID (blocker=b-...), used to accept it.
+    blocked = [re.sub(r" blocker=b-[0-9a-f]{12}$", "", line) for line in output.splitlines()
+               if line.startswith("phase=preflight status=BLOCKED")]
     token = ("ExpiredTokenException: The security token included in the request is expired "
              "(request request-ExpiredTokenException)")
     if failing == "listing":
