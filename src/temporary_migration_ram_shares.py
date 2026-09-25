@@ -202,6 +202,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "deletion before deleting the next one")
     parser.add_argument("--export-plan", type=Path,
                         help="optional local JSON plan export (plan/apply only)")
+    parser.add_argument("--raw-output", action="store_true",
+                        help="print the full technical event stream, one key=value line per "
+                             "event, instead of the readable view")
     parser.add_argument("--interactive", action="store_true",
                         help="prompt for missing inputs even when stdin is not a terminal")
     return parser
@@ -3794,13 +3797,26 @@ def run_monitor(router: Router, opts: Options, report: Reporter) -> int:
                            "retired_consumers": sorted(retired & set(chosen))})
 
 
-def main(argv: list[str] | None = None, *, input_fn: Callable[[str], str] | None = None) -> int:
-    report = Reporter()
+def main(argv: list[str] | None = None, *, input_fn: Callable[[str], str] | None = None,
+         readable: bool = False) -> int:
+    """``readable`` renders the run for people (ram_migration_console) unless --raw-output
+    asks for the technical event stream, which is always what the run itself emits."""
+    report: Any = Reporter()
     args = opts = None
     try:
         args = build_parser().parse_args(argv)
-        ask = input_fn if input_fn is not None else input
+        if readable and not args.raw_output:
+            from ram_migration_console import ReadableReporter
+            report = ReadableReporter(args.mode, args)
+        reply = input_fn if input_fn is not None else input
+
+        def ask(prompt: str) -> str:
+            flush = getattr(report, "flush", None)
+            if flush is not None:
+                flush()  # everything a confirmation covers is on screen before it
+            return reply(prompt)
         opts = options(args, ask)
+        report.context = opts
         if args.mode == "approve":
             return run_approve(opts, ask, report)
         if args.mode != "monitor":
@@ -3825,7 +3841,11 @@ def main(argv: list[str] | None = None, *, input_fn: Callable[[str], str] | None
         if opts is not None and opts.interrupt_readback is not None:
             record_failure(args, report, opts, f"{type(exc).__name__}: {exc}")
         raise
+    finally:
+        close = getattr(report, "close", None)
+        if close is not None:
+            close()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(readable=True))

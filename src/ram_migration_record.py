@@ -40,7 +40,7 @@ SOURCES = (
     "temporary_migration_ram_shares.py", "ram_migration_common.py",
     "ram_migration_discovery.py", "ram_migration_stacks.py",
     "ram_migration_record.py",
-    "ram_migration_verification.py", "ram_migration_preflight.py",
+    "ram_migration_verification.py", "ram_migration_preflight.py", "ram_migration_console.py",
 )
 # Plan revisions whose scope apply may consume.
 APPLICABLE = "PLANNED"
