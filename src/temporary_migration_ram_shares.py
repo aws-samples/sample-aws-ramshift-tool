@@ -1948,6 +1948,7 @@ def record_plan(record: dict, plan: Plan, scope: dict, prepared: dict, received:
         "groups": [group_record(g, plan.migration) for g in
                    sorted(plan.groups, key=lambda g: (g.owner, g.region, g.key))],
         "blocked": list(plan.blocked),
+        "blockers": blocker_entries(plan.blocked),
         "accepted": copy.deepcopy(plan.accepted),
         "excluded": list(plan.excluded),
         "notes": list(plan.notes),
@@ -2435,6 +2436,50 @@ def acceptance_of(reason: str) -> tuple[str, str | None, str | None]:
     return category, None, NOT_ACCEPTABLE.get(category, NOT_ACCEPTABLE_OTHER)
 
 
+def export_document(exported: dict, plan: Plan, scope: dict) -> dict:
+    """The --export-plan file for people: a summary first, then every section in a stable
+    reading order (the keys an earlier export had are all kept)."""
+    groups = sorted(plan.groups, key=lambda g: (g.owner, g.region, g.key))
+    summary = {
+        "about": "RAMShift plan export: what plan would create and why it did or did not block. "
+                 "Informational only; apply reads the migration record, not this file.",
+        "migration_id": plan.migration,
+        "status": "BLOCKED" if plan.blocked else "PLANNED",
+        "accounts": {key: scope.get(key, []) for key in (
+            "migrating_consumers", "migrating_owners", "stationary_owners", "stationary_consumers")},
+        "regions": scope.get("regions", []),
+        "temporary_shares": [
+            {"owner": g.owner, "region": g.region, "stack": stack_name(plan.migration, g.owner, g.region),
+             "accounts": list(g.consumers), "resources": len(g.resources),
+             "resource_types": dict(sorted(Counter(g.resources.values()).items())),
+             "source_shares": sorted(set(g.source_shares))} for g in groups],
+        "blockers": len(plan.blocked), "accepted_blockers": len(plan.accepted),
+        "exclusions": len(plan.excluded), "permission_differences": len(plan.permission_changes),
+        "next_step": ("Resolve or accept the blockers, then run plan --record again."
+                      if plan.blocked else
+                      "Review the plan, then run apply with the same inputs and --record."),
+    }
+    order = ("blockers", "accepted", "groups", "permission_changes", "excluded", "notes",
+             "existing", "external_access", "owner_continuity", "scope",
+             "organization_policy_preflight", "received_entitlements", "capability_provenance",
+             "migration_stacks")
+    return {"summary": summary, **{k: exported[k] for k in order if k in exported},
+            **{k: exported[k] for k in sorted(exported) if k not in order}}
+
+
+def blocker_entries(blocked: list[str], mode: str = "plan") -> list[dict]:
+    """Each blocker as people need it: its ID, category, whether it can be accepted and
+    what accepting it means, the next action, and its full text."""
+    rows = []
+    for reason in blocked:
+        category, consequence, refusal = acceptance_of(reason)
+        rows.append({"id": blocker_id(reason), "category": category,
+                     "can_accept": consequence is not None,
+                     "if_accepted": consequence, "why_it_cannot_be_accepted": refusal,
+                     "next_action": blocker_action(category, mode, True), "text": reason})
+    return rows
+
+
 def accept_recorded(plan: Plan, record: dict | None) -> None:
     """Move every blocker the record accepts out of ``plan.blocked`` into ``plan.accepted``.
     Idempotent; only an acceptable blocker with a recorded acceptance of its exact ID moves."""
@@ -2793,6 +2838,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                         f"status={status} digest={record['plan']['digest']}")
         if args.export_plan:
             exported = plan.to_dict()
+            exported["blockers"] = blocker_entries(plan.blocked, args.mode)
             exported["capability_provenance"] = capability_provenance
             exported["received_entitlements"] = received.to_dict()
             exported["scope"] = scope
@@ -2802,8 +2848,8 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                  "existing_stack": old.get("StackId") if old else None}
                 for (owner, region), (body, old) in sorted(prepared.items())
             ]
-            args.export_plan.write_text(json.dumps(exported, indent=2, sort_keys=True) + "\n",
-                                        encoding="utf-8")
+            args.export_plan.write_text(json.dumps(export_document(exported, plan, scope),
+                                                   indent=2) + "\n", encoding="utf-8")
             report.emit(f"phase=plan exported={args.export_plan}")
     if plan.blocked:
         if args.mode == "verify":

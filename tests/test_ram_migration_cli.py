@@ -4292,3 +4292,48 @@ def test_an_accepted_policy_deny_also_passes_the_post_confirmation_recheck(harne
     output = capsys.readouterr().out
     assert output.count("phase=preflight status=ACCEPTED") >= 2  # before and after confirmation
     assert "category=organization-policy-deny" in output and harness.writes()
+
+
+# ---------------------------------------------------------------------------
+# Readable JSON: the record's summary and the plan export
+# ---------------------------------------------------------------------------
+
+def test_the_record_opens_with_a_readable_summary_that_follows_the_migration(harness, capsys,
+                                                                            migration_record):
+    harness.receive(owner=OTHER_OWNER)
+    assert main(with_record(args(), migration_record)) == 1
+    on_disk = json.loads(migration_record.read_text())
+    assert list(on_disk)[:4] == ["summary", "schema", "migration_id", "revision"]
+    assert list(on_disk)[-2:] == ["history", "content_sha256"]
+    summary = on_disk["summary"]
+    assert (summary["last_command"], summary["last_status"]) == ("plan", "BLOCKED")
+    assert summary["next_step"].startswith("Resolve the blockers in summary.blockers")
+    blocker, = summary["blockers"]
+    assert (blocker["category"], blocker["can_accept"]) == ("owner-outside-approved-scope", True)
+    assert blocker["id"].startswith("b-") and summary["accounts"]["migrating"] == [CONSUMER]
+    capsys.readouterr()
+    assert accept(migration_record, "all")[0] == 0
+    assert main(with_record(args(), migration_record)) == 0
+    summary = read_record(migration_record)["summary"]
+    assert summary["plan"]["status"] == "PLANNED" and summary["plan"]["accepted_blockers"] == 1
+    assert summary["accepted_blockers"][0]["reason"] == "Owner resources are re-shared after the move"
+    assert summary["next_step"].startswith("Review the plan, then run apply")
+    assert main(with_record(args("apply"), migration_record), input_fn=harness.confirm) == 0
+    summary = read_record(migration_record)["summary"]
+    assert summary["temporary_shares"]["recorded"] == 1 and summary["baseline"]["complete"] is True
+    assert summary["last_check"]["result"] == "PENDING_MIGRATION"
+    assert summary["next_step"].startswith("Move the accounts, running monitor after each step")
+
+
+def test_the_plan_export_opens_with_a_summary_and_keeps_every_section(harness, tmp_path):
+    exported = tmp_path / "plan.json"
+    assert quietly(args() + ["--export-plan", str(exported)]) == 0
+    document = json.loads(exported.read_text())
+    assert list(document)[0] == "summary"
+    summary = document["summary"]
+    assert summary["status"] == "PLANNED" and summary["accounts"]["migrating_consumers"] == [CONSUMER]
+    share, = summary["temporary_shares"]
+    assert (share["owner"], share["region"], share["accounts"], share["resources"]) == (
+        OWNER, REGION, [CONSUMER], 1)
+    assert document["organization_policy_preflight"]["status"] == "ALLOWED"
+    assert {"groups", "excluded", "migration_stacks", "scope", "blockers"} <= set(document)

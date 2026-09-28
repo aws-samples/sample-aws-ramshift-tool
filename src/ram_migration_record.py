@@ -413,6 +413,110 @@ def save(path: Path, record: dict, *, mode: str, status: str, **details: Any) ->
         return _write(path, record, mode=mode, status=status, **details)
 
 
+# Sections in reading order: the summary first, the evidence after it, integrity last.
+# content_sha256 is computed over the canonical (sorted) form, so this order is free.
+SECTION_ORDER = ("summary", "schema", "migration_id", "revision", "created_at", "updated_at",
+                 "tool", "scope", "plan", "owner_scope_request", "approvals", "baseline",
+                 "shares", "verifications", "drops", "retirements", "completion",
+                 "legacy_history", "history", *INTEGRITY_FIELDS)
+
+
+def _ordered(record: dict) -> dict:
+    return {**{key: record[key] for key in SECTION_ORDER if key in record},
+            **{key: record[key] for key in sorted(record) if key not in SECTION_ORDER}}
+
+
+def _next_step(record: dict, status: str, mode: str) -> str:
+    plan = record.get("plan") or {}
+    if record.get("completion"):
+        return "Nothing left to do: every temporary share of this migration is retired."
+    if failure_drops(record):
+        return ("Investigate the recorded losses in 'drops' before continuing; complete refuses "
+                "the accounts they name unless forced.")
+    if not plan:
+        return "Run plan with --record to discover what the migrating accounts need."
+    if plan.get("status") != APPLICABLE:
+        return ("Resolve the blockers in summary.blockers, or accept them with approve "
+                "--accept-blockers, then run plan --record again.")
+    if not record.get("shares"):
+        return "Review the plan, then run apply with the same inputs to create the temporary shares."
+    last = (record.get("verifications") or [{}])[-1]
+    migration = last.get("migration_status") or last.get("monitor_status")
+    if record.get("retirements"):
+        return "Run complete for the remaining accounts once their permanent sharing exists."
+    if migration == "MIGRATION_VALIDATED":
+        return ("Set up permanent sharing for the moved accounts, check it with monitor, then run "
+                "complete.")
+    return ("Move the accounts, running monitor after each step, then run verify; expect "
+            "MIGRATION_VALIDATED once every account is in its new organization.")
+
+
+def summarize(record: dict, mode: str, status: str) -> dict:
+    """A plain-language digest of the record for people; the sections after it are the evidence.
+    Derived only from the record, rewritten on every write."""
+    scope = record.get("scope") or {}
+    plan = record.get("plan") or {}
+    baseline = record.get("baseline")
+    shares = [row for row in record.get("shares", []) if row.get("share_arn")]
+    retired = retired_consumers(record)
+    last = (record.get("verifications") or [None])[-1]
+    drops = record.get("drops", [])
+    groups = plan.get("groups") or []
+    summary = {
+        "about": "RAMShift migration record. RAMShift writes it and checks its integrity on "
+                 "every read: never edit it. This summary describes the sections below it.",
+        "migration_id": record.get("migration_id"),
+        "last_command": mode, "last_status": status, "updated_at": record.get("updated_at"),
+        "next_step": _next_step(record, status, mode),
+        "accounts": {
+            "migrating": scope.get("migrating_consumers", []),
+            "migrating_owners": scope.get("migrating_owners", []),
+            "stationary_owners": scope.get("stationary_owners", []),
+            "stationary_consumers": scope.get("stationary_consumers", []),
+            "retired": sorted(retired),
+        },
+        "regions": scope.get("regions", []),
+        "excluded_regions": scope.get("excluded_regions"),
+        "plan": None if not plan else {
+            "status": plan.get("status"),
+            "temporary_shares_planned": len(groups),
+            "resources": len({arn for group in groups for arn in group.get("resources", {})}),
+            "blockers": len(plan.get("blocked") or []),
+            "accepted_blockers": len(plan.get("accepted") or []),
+            "exclusions": len(plan.get("excluded") or []),
+            "permission_differences": len(plan.get("permission_changes") or []),
+        },
+        "blockers": [{key: row.get(key) for key in ("id", "category", "can_accept", "text")}
+                     for row in plan.get("blockers") or []],
+        "accepted_blockers": [{"id": row.get("blocker_id"), "category": row.get("category"),
+                               "reason": row.get("accepted_reason"),
+                               "consequence": row.get("consequence")}
+                              for row in plan.get("accepted") or []],
+        "baseline": None if baseline is None else {
+            "captured_at": baseline.get("captured_at"), "items": len(baseline.get("items", [])),
+            "complete": bool(baseline.get("complete")) or not [
+                gap for gap in baseline.get("gaps", [])
+                if gap.get("reason") != "resource_checks_unavailable"],
+            "resources_without_health_checks": len(baseline.get("limits") or []),
+        },
+        "temporary_shares": {"recorded": len(shares), "accounts_retired": len(retired)},
+        "last_check": None if not last else {
+            "command": last.get("mode"), "at": last.get("at"),
+            "result": last.get("migration_status") or last.get("monitor_status"),
+            "sharing": last.get("sharing_status"),
+            "lost": last.get("missing") if last.get("missing") is not None else
+            len((last.get("changes") or {}).get("lost", [])),
+            "degraded": last.get("degraded") if last.get("degraded") is not None else
+            len((last.get("changes") or {}).get("degraded", [])),
+            "read_gaps": last.get("gaps"),
+        },
+        "losses": {"failures": len(failure_drops(record)),
+                   "original_shares_dropped": sum(d.get("kind") == "original_share" for d in drops)},
+        "completed_at": (record.get("completion") or {}).get("completed_at"),
+    }
+    return summary
+
+
 def _write(path: Path, record: dict, *, mode: str, status: str, **details: Any) -> dict:
     """Write the next revision atomically and durably; history entries are never rewritten.
 
@@ -437,6 +541,10 @@ def _write(path: Path, record: dict, *, mode: str, status: str, **details: Any) 
     record["revision"] = int(record.get("revision", 0)) + 1
     record["updated_at"] = timestamp()
     record["tool"] = tool_identity()
+    try:
+        record["summary"] = summarize(record, mode, status)
+    except Exception as exc:  # the digest never stops a write; the evidence is what counts
+        record["summary"] = {"about": "summary unavailable", "error": f"{type(exc).__name__}: {exc}"}
     entry = {
         **details,
         # The tool's own fields follow the writer's details, which never replace them.
@@ -454,7 +562,7 @@ def _write(path: Path, record: dict, *, mode: str, status: str, **details: Any) 
     if key is not None:
         record["content_hmac"] = {"algorithm": HMAC_ALGORITHM, "key_id": key_id,
                                   "value": _content_hmac(key, content)}
-    _replace(path, (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+    _replace(path, (json.dumps(_ordered(record), indent=2) + "\n").encode("utf-8"))
     return record
 
 
