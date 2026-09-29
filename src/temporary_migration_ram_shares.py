@@ -2430,7 +2430,9 @@ def acceptance_of(reason: str) -> tuple[str, str | None, str | None]:
     if category == "other":
         if SHARE_ARN.match(reason):
             return category, SHARE_LEVEL, None
-        if "phase=received-audit" in reason:
+        # A temporary share that differs from what the record holds is a consistency
+        # check, never a choice about access.
+        if "phase=received-audit" in reason and "persisted scope" not in reason:
             return category, RECEIVED_LEVEL, None
         return category, None, NOT_ACCEPTABLE_OTHER
     return category, None, NOT_ACCEPTABLE.get(category, NOT_ACCEPTABLE_OTHER)

@@ -4337,3 +4337,27 @@ def test_the_plan_export_opens_with_a_summary_and_keeps_every_section(harness, t
         OWNER, REGION, [CONSUMER], 1)
     assert document["organization_policy_preflight"]["status"] == "ALLOWED"
     assert {"groups", "excluded", "migration_stacks", "scope", "blockers"} <= set(document)
+
+
+@pytest.mark.parametrize("reason, acceptable", [
+    ("arn:aws:ram:us-west-2:000000000001:resource-share/x: owner=000000000001 region=us-west-2 "
+     "source status PENDING", True),
+    ("account=000000000002 owner=000000000001 region=us-west-2 share=s phase=received-audit "
+     "status=BLOCKED pending intended received entitlements (share status PENDING)", True),
+    ("account=000000000002 owner=000000000001 region=us-west-2 share=s phase=received-audit "
+     "status=BLOCKED received migration entitlement differs from its owning persisted scope; "
+     "reconcile explicitly", False),
+    ("phase=reviewed-record plan revision 4 was recorded after the reviewed revision 3", False),
+    ("owner=000000000001 region=us-west-2 phase=discovery operation=GetResourceShares "
+     "AccessDenied (request r-1)", False),
+])
+def test_which_blockers_can_be_accepted(reason, acceptable):
+    category, consequence, refusal = cli.acceptance_of(reason)
+    assert (consequence is not None) == acceptable and (refusal is None) == acceptable
+
+
+def test_blocker_ids_ignore_request_ids_and_the_post_confirmation_prefix():
+    reason = "phase=org-policy status=BLOCKED decision=EXPLICIT_DENY account=1 (request abc-1)"
+    assert cli.blocker_id(reason) == cli.blocker_id("post-confirmation " +
+                                                    reason.replace("abc-1", "xyz-2"))
+    assert cli.blocker_id(reason) != cli.blocker_id(reason.replace("account=1", "account=2"))
