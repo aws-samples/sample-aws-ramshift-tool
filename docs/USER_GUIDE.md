@@ -1,4 +1,4 @@
-# RAMShift 1.0.0 User Guide
+# RAMShift 1.1.0 User Guide
 
 RAMShift keeps accounts connected to shared AWS resources while they move from one AWS
 Organization to another, and removes its temporary access safely afterwards.
@@ -10,15 +10,18 @@ Contents
 3. [Installation and setup](#3-installation-and-setup)
 4. [Permissions and organization requirements](#4-permissions-and-organization-requirements)
 5. [Before you start](#5-before-you-start)
-6. [Migration procedure, step by step](#6-migration-procedure-step-by-step)
-7. [Mode reference](#7-mode-reference)
-8. [Statuses and exit codes](#8-statuses-and-exit-codes)
-9. [The migration record](#9-the-migration-record)
-10. [Options reference](#10-options-reference)
-11. [Stop conditions](#11-stop-conditions)
-12. [Never do this](#12-never-do-this)
-13. [Troubleshooting and known limitations](#13-troubleshooting-and-known-limitations)
-14. [Validation](#14-validation)
+6. [What never blocks](#6-what-never-blocks)
+7. [Accepting blockers](#7-accepting-blockers)
+8. [Reading the output](#8-reading-the-output)
+9. [Migration procedure, step by step](#9-migration-procedure-step-by-step)
+10. [Mode reference](#10-mode-reference)
+11. [Statuses and exit codes](#11-statuses-and-exit-codes)
+12. [The migration record](#12-the-migration-record)
+13. [Options reference](#13-options-reference)
+14. [Stop conditions](#14-stop-conditions)
+15. [Never do this](#15-never-do-this)
+16. [Troubleshooting and known limitations](#16-troubleshooting-and-known-limitations)
+17. [Validation](#17-validation)
 
 ---
 
@@ -112,22 +115,27 @@ It is added to the owner scope and recorded in `scope.migrating_owners` and
 - **What it receives from other owners:** temporary shares, like any moving account.
 - **Its own resources:** an owner is never a consumer of its own resources; nothing is
   shared back to itself.
-- **What it shares with other moving accounts** in the same migration (also in
-  `--consumers`): temporary shares from it to them. This is supported.
-- **What it shares with accounts that stay behind:** plan blocks:
-
-  ```text
-  migrating owner 333333333333 shares with stationary consumers [...]; their access ends
-  when the owner leaves its organization and owner-migration continuity is not supported
-  by this tool version
-  ```
-
-  When the owner leaves its organization, its organization and OU shares stop reaching
-  the accounts that stay, and RAMShift 1.0.0 does not bridge that direction. A
-  `--principal-map` override never hides a live or configured principal from this
-  check. To proceed, either move those accounts in the same migration (add them to
-  `--consumers`), or arrange their access separately before the owner moves, outside
-  RAMShift, and re-scope the migration.
+- **What it shares with other moving accounts** in the same migration: temporary shares
+  from it to them.
+- **What it shares with accounts that stay behind (stationary recipients):** once the owner
+  leaves its organization, its organization and OU shares stop reaching them. RAMShift
+  bridges that too: it plans retained, external, account-level temporary shares from the
+  owner to each stationary recipient that the original share proves (its live account,
+  organization or OU principals, or its owning CloudFormation template). These accounts are
+  recorded separately as `scope.stationary_consumers`, observed by verify and monitor, and
+  retired by complete like any other account. They can stay in their organization; the
+  migration status waits only for the moving accounts.
+  - Recipients that already hold associated external access on the original share keep it;
+    no duplicate grant is made.
+  - A `--principal-map` override can neither hide a proven recipient nor invent one.
+  - To leave recipients out deliberately, use `--exclude-consumers <account IDs>
+    --exclude-consumers-reason "<reason>"`. Excluded accounts cannot overlap the moving or
+    owner scope; the exclusion is part of the reviewed plan and baseline and is inherited
+    by verify, monitor and complete.
+  - apply needs access to every recipient (it captures their baseline and accepts their
+    invitations).
+- What still blocks: restricted IAM role, user or service principals, resource types that
+  cannot be shared outside an organization, missing permissions and unreadable inventories.
 
 ### Scope in later modes
 
@@ -255,8 +263,9 @@ attaches or enables anything.
 - The owner's organization must allow RAM sharing with external accounts.
 - When an original share uses OU or organization principals, its organization (and the
   destination organization, with `--destination-ou`) must have ALL features enabled and
-  RAM trusted access (`ram.amazonaws.com`). plan blocks with
-  `phase=ram-org-prerequisites status=BLOCKED` otherwise.
+  RAM trusted access (`ram.amazonaws.com`) for those shares to work at all. plan reports a
+  missing prerequisite as a warning (`phase=ram-org-prerequisites status=WARNING`), never
+  a blocker: RAMShift's own temporary shares name accounts directly and do not need it.
 
 ---
 
@@ -272,7 +281,79 @@ attaches or enables anything.
 
 ---
 
-## 6. Migration procedure, step by step
+## 6. What never blocks
+
+RAMShift blocks only on what the migration itself could break or what it cannot read.
+Conditions the migration cannot change are recorded and reported, never blockers:
+
+| Condition | What RAMShift does |
+|---|---|
+| A Resolver association, endpoint, TGW attachment or route, IPAM allocation or Private CA that is already unhealthy before the move (for example a `FAILED` association or a `blackhole` route) | Recorded in the baseline as found (`status=PRE_EXISTING`). It is a loss only if it disappears or its binding (VPC, rule, TGW) changes, never for staying unhealthy. |
+| A planned resource the account cannot see before the move | Recorded as found; not judged as a loss. |
+| A resource type with no RAMShift health check (for example prefix lists or subnets) | Its RAM access is verified like any other; resource-level health is not checked (`status=LIMITED`). This never makes a baseline incomplete or a result inconclusive. |
+| An original share that is `DELETING` or `FAILED` | Excluded with its reason: it grants no access now. |
+| A resource a share cannot provide now (`ZONAL_RESOURCE_INACCESSIBLE`, `LIMIT_EXCEEDED`, `UNAVAILABLE`), on the owner or the receiving side | Left out with its reason; the rest of the share is bridged. |
+| An organization without ALL features or RAM trusted access | A warning (`phase=ram-org-prerequisites status=WARNING`): RAMShift's temporary shares name accounts directly and do not use RAM sharing with AWS Organizations. |
+| A managed-permission version difference | Information (`status=INFO`, `WARNING` when the temporary share grants less). |
+| A Resolver rule the account never associated | Information (`status=NOT_ASSOCIATED`). |
+
+Still blocking (until resolved or accepted, see section 7): a `PENDING` share or resource
+(being set up), anything RAMShift cannot read, received access no temporary share covers,
+owners outside the scope, resource types that cannot be shared externally, restricted
+principals, and organization policies that deny or may deny what the migration needs.
+
+## 7. Accepting blockers
+
+When you decide to proceed without what a blocker concerns, accept it instead of
+resolving it. Each blocker line ends with its ID, for example `blocker=b-1a2b3c4d5e6f`,
+and the blocker summary says which categories can be accepted.
+
+```bash
+ramshift approve --record "$RECORD" --migration-id "$MIGRATION_ID" \
+  --accept-blockers owner-outside-approved-scope b-1a2b3c4d5e6f \
+  --accept-reason "Shared-services resources are re-shared to the new organization on day 1"
+```
+
+- Choose blockers by ID, by category, or `all`. approve lists each one with **what
+  accepting it means** (for example *that owner's resources are not bridged: the migrating
+  accounts lose access to them when they leave their organization*), then asks you to type
+  `ACCEPT-BLOCKERS <migration-id> <count>`.
+- The acceptance is recorded with your reason, the time, the category, the consequence and
+  the blocker's exact text. Re-run `plan --record`: accepted blockers are shown as
+  `status=ACCEPTED` and the plan can be `PLANNED`; apply honours them again after its
+  confirmation.
+- An acceptance binds to the blocker's exact text. If the condition changes (for example
+  the owner shares more resources), it is a new blocker with a new ID and needs its own
+  acceptance.
+- Accepted blockers are listed in the record (`approvals.blockers`, `plan.accepted`) and in
+  the record summary.
+
+| Category | Can be accepted | What accepting it means |
+|---|---|---|
+| `owner-outside-approved-scope` | Yes | That owner's resources are not bridged (the alternative is to approve the owner, section 9 step 2) |
+| `received-dependency-not-covered` | Yes | Those received resources are not bridged |
+| `configuration`, `policy-created-share`, other share-level blockers | Yes | That share is not bridged |
+| `organization-policy-deny`, `organization-policy-gap`, `organization-policy-unreadable` | Yes | The policy may deny a later request; a denied write fails without changing original sharing |
+| `authentication`, `region-scope`, `discovery-api-error`, `baseline-capture`, `baseline-loss`, `baseline-scope`, `reviewed-record-mismatch`, `ram-share-quota` | No | These guard what RAMShift knows or what the record proves; approve shows what to do instead (`status=NOT_ACCEPTABLE`) |
+
+## 8. Reading the output
+
+By default RAMShift shows a readable view: a header, short progress lines, the sections
+that matter for the mode (accounts, planned shares, blockers with their IDs, results), and
+a result block with the status in words, the record revision, the exit code and the next
+step. Nothing that matters is hidden: every blocker, warning, loss, read gap, override and
+error is shown in full.
+
+Add `--raw-output` for the technical event stream: one `key=value` line per event, which
+is what the output tables in this guide quote and what log tools should parse. Exit codes
+and the record are the same in both views.
+
+The migration record (section 12) and `--export-plan` files open with a `summary` written
+for people: the last command and status, the next step, the accounts and their roles, the
+plan, each blocker with its ID and whether it can be accepted, the baseline, the last check
+and any losses. The sections after it are the evidence.
+
+## 9. Migration procedure, step by step
 
 ### Step 1: plan
 
@@ -290,7 +371,7 @@ Read-only toward AWS. It creates the record. Lines to look for:
 | `account=<id> region=<r> phase=received-regions status=EXCLUDED ...` | A requested Region is not enabled in that account. |
 | `... status=EXCLUDED_BY_OPERATOR reason="..."` | A Region you excluded with `--exclude-regions`. |
 | `account=<id> phase=owned-audit status=MIGRATING_OWNER owned_shares=N regions=...` | A moving account owns shares: it is a migrating owner. |
-| `account=... owner=... share=... phase=received-audit status=<S>` | What a moving account receives (statuses in [section 7.1](#71-plan)). |
+| `account=... owner=... share=... phase=received-audit status=<S>` | What a moving account receives (statuses in [section 10.1](#101-plan)). |
 | `owner=<id> phase=scope regions=...` | Regions inspected for that owner. |
 | `owner=... region=... group=... stack=... consumers=... external_principals=true retain_on_organization_leave=true` | One planned temporary share, followed by its resources and source shares. |
 | `phase=plan action=<CREATE or UPDATE_OR_REUSE> template=...` | The exact CloudFormation template. |
@@ -309,7 +390,7 @@ Resolving blockers:
 |---|---|
 | `phase=owner-scope ... APPROVAL_REQUIRED` | Step 2, then add the owner to your account map. |
 | `received dependencies are not covered by any planned temporary share` (`NOT_COVERED`) | The owner's share produced no planned share; see that owner's other blockers. Never continue with it: the account would lose that access when it leaves. |
-| `migrating owner ... shares with stationary consumers` | See [section 2](#what-a-migrating-owner-gets). Re-scope. |
+| `Unsupported account-level principal conversion` | The share names IAM roles, users or service principals; it cannot be widened to whole accounts. Re-share it at account level, or accept the blocker (section 7). |
 | `Provide principal-map override to resolve historical organization/OU membership` | Supply a reviewed `--principal-map` naming the intended accounts of that share. |
 | `pending intended received entitlements` | Accept or resolve the pending sharing first. |
 | `unsupported or unverified external-sharing capability` | That resource type cannot be shared outside an organization; the account would lose it when it leaves. Escalate. |
@@ -555,9 +636,9 @@ handshake IDs with UTC times. No file may contain credentials or session tokens.
 
 ---
 
-## 7. Mode reference
+## 10. Mode reference
 
-### 7.1 plan
+### 10.1 plan
 
 Scope follows what the moving accounts actually receive:
 
@@ -604,15 +685,16 @@ modified. A temporary share that already exists keeps the version it was created
 when AWS publishes a newer default, plan notes it (`status=DEFAULT_CHANGED`) and nothing
 changes. The differences are kept in the record (`plan.permission_changes`).
 
-### 7.2 apply
+### 10.2 apply
 
 apply blocks (`phase=reviewed-record ...`) unless: the latest plan revision is
 `PLANNED`; the RAMShift build is the one that planned (a new build needs a new plan);
 live entitlements and account roles still produce the reviewed plan digest; and
 `--destination-ou` matches the reviewed plan. Before the prompt it observes the original
-state; when no baseline exists yet it blocks on any read gap, any unhealthy item (an
-association not `COMPLETE`, an endpoint not `OPERATIONAL`, an attachment not `available`,
-a route not `active`, a PCA read not `OK`) or a resource not visible to its account.
+state; when no baseline exists yet it blocks on any read gap. An item that is already
+unhealthy (an association not `COMPLETE`, an endpoint not `OPERATIONAL`, an attachment
+not `available`, a route not `active`, a PCA read not `OK`) or a resource not visible to
+its account is recorded as found (`status=PRE_EXISTING`) and never blocks (section 6).
 After `APPLY <id>` it rebuilds every template, re-reads the organization policies and
 observes the original state again; any change blocks with nothing written. Under the
 record lock it checks that the record still holds the reviewed revision, and records the
@@ -623,15 +705,15 @@ change sets that would delete, replace or remove access from an existing tempora
 are rejected. Each moving account accepts only the planned shares from the planned
 owner.
 
-### 7.3 verify
+### 10.3 verify
 
 Read-only toward AWS. It loads the planned shares from the migration stacks, verifies
 every temporary share (in its stack, `ACTIVE`, external, retaining, exactly the planned
 permissions, resources and principals, and visible to every account), observes the
 current state, compares it with the baseline and records the result. Accounts complete
-has retired are out of scope (`status=RETIRED`). Statuses are in [section 8](#8-statuses-and-exit-codes).
+has retired are out of scope (`status=RETIRED`). Statuses are in [section 11](#11-statuses-and-exit-codes).
 
-### 7.4 monitor
+### 10.4 monitor
 
 ```bash
 ramshift monitor --record R --migration-id ID (--consumers C1 [C2 ...] | --all-accounts) <access options>
@@ -673,7 +755,7 @@ the same kind, account, Region and subject is recorded once. If the record canno
 written, the report still prints with `phase=record status=NOT_RECORDED` and the run
 never exits 0.
 
-### 7.5 complete
+### 10.5 complete
 
 For each chosen account, a temporary share serving it is deleted when it serves no other
 account that is not retired; otherwise only the chosen accounts' principals are removed.
@@ -692,7 +774,7 @@ Without `--force` a failed check refuses the run with nothing deleted. RAMShift'
 operations refuse any share that is not this migration's temporary share, and a stack is
 deleted only when it holds no share.
 
-### 7.6 Baseline items and loss rules
+### 10.6 Baseline items and loss rules
 
 | Item | Loss when |
 |---|---|
@@ -708,7 +790,7 @@ A read gap never counts as success: an item it hides is unobserved, not present.
 
 ---
 
-## 8. Statuses and exit codes
+## 11. Statuses and exit codes
 
 | Mode | 0 | 1 | 2 | 3 |
 |---|---|---|---|---|
@@ -735,7 +817,7 @@ no flag that skips a confirmation.
 
 ---
 
-## 9. The migration record
+## 12. The migration record
 
 One JSON file per migration ID, written only by RAMShift:
 
@@ -763,7 +845,7 @@ records in versioned, write-protected storage.
 
 ---
 
-## 10. Options reference
+## 13. Options reference
 
 | Option | Modes | Meaning |
 |---|---|---|
@@ -773,6 +855,10 @@ records in versioned, write-protected storage.
 | `--consumers IDs` | plan, apply; monitor, complete | Moving accounts; for monitor and complete, the accounts to report on or retire |
 | `--all-accounts` | monitor, complete | Every moving account in the record. One of `--consumers` and `--all-accounts` is required. |
 | `--force` | complete | See step 9 |
+| `--accept-blockers SELECTOR ...`, `--accept-reason TEXT` | approve | Accept blockers by ID, category or `all`, with a mandatory reason (section 7) |
+| `--exclude-consumers IDs --exclude-consumers-reason TEXT` | plan, apply (verify, monitor, complete inherit) | Leave recipients out deliberately, including stationary recipients of a migrating owner (section 2) |
+| `--exclude-tgw-routes --exclude-tgw-routes-reason TEXT` | plan, apply (inherited) | Skip TGW-targeted VPC route reads and checks; RAM visibility and attachment checks still run. Bound to the reviewed plan and baseline |
+| `--raw-output` | all | Print the technical event stream instead of the readable view (section 8) |
 | `--regions R ...` | plan, apply | Regions to inspect; us-east-1 is always included |
 | `--scan-enabled-regions` | plan, apply | Also inspect every enabled Region of each owner |
 | `--exclude-regions R ... --exclude-reason TEXT` | plan, apply (verify, complete must match) | Enabled Regions left out, with a mandatory one-line reason; recorded and shown in every summary |
@@ -792,7 +878,7 @@ records in versioned, write-protected storage.
 
 ---
 
-## 11. Stop conditions
+## 14. Stop conditions
 
 Stop and escalate on any of these; none is fixed by retrying with different options.
 
@@ -800,10 +886,10 @@ Stop and escalate on any of these; none is fixed by retrying with different opti
 |---|---|---|
 | `phase=authentication status=BLOCKED` | An account cannot be confirmed as itself | Fix its access mapping and re-run |
 | `integrity check failed` | The record was edited outside RAMShift | Restore the last RAMShift-written copy; never hand-edit it |
-| `migrating owner ... shares with stationary consumers` | Owner migration toward staying accounts is not supported | Re-scope (section 2) |
 | `phase=baseline-scope status=BLOCKED` | A re-plan adds something the baseline does not cover | Plan it under a new migration |
-| `unsupported or unverified external-sharing capability` | That resource type cannot be bridged | Escalate |
-| `phase=baseline status=CAPTURED ... complete=false` | A resource type has no state collector | That migration can never be validated or completed by RAMShift |
+| `unsupported or unverified external-sharing capability` | That resource type cannot be bridged | Escalate, or accept the blocker if losing that access is agreed (section 7) |
+| `phase=baseline status=CAPTURED ... complete=false` | A read gap during capture | Restore read access; re-run apply (a recorded baseline is never replaced) |
+| `phase=preflight status=ACCEPTED` you did not expect | A recorded acceptance applies | Check `approvals.blockers` in the record; acceptances are never implied |
 | apply exits 1, or step 5 is not `PENDING_MIGRATION` + `SHARING_READY` | The temporary path is not proven | Do not start the move |
 | monitor exits 3 | The report could not compare everything | Fix the cause shown and re-run before the next move step |
 | monitor `LOSS` or verify `FAILED` | A baseline item was lost | Incident; the failure drop is permanent |
@@ -814,7 +900,7 @@ Stop and escalate on any of these; none is fixed by retrying with different opti
 
 ---
 
-## 12. Never do this
+## 15. Never do this
 
 - Edit, move or delete the record or its `.lock` file during a migration.
 - Run apply and complete for the same migration at the same time.
@@ -827,14 +913,11 @@ Stop and escalate on any of these; none is fixed by retrying with different opti
 
 ---
 
-## 13. Troubleshooting and known limitations
+## 16. Troubleshooting and known limitations
 
 - **`INCONCLUSIVE`:** read the `status=GAP` and `change=UNOBSERVED` lines. Usually an SCP
   denies a read or a profile cannot reach an account. Nothing is assumed from an unread
   item.
-- **`monitor --all-accounts` is `INCONCLUSIVE`** when the record includes a moving
-  account that receives nothing, for example a migrating owner. Name the accounts that
-  receive resources with `--consumers`.
 - **A deletion interrupted midway** can leave a share deleted in AWS but not yet recorded
   as retired. Re-run complete; if it reports a stored-plan error for that share, keep the
   record and contact support.
@@ -848,7 +931,7 @@ Stop and escalate on any of these; none is fixed by retrying with different opti
 
 ---
 
-## 14. Validation
+## 17. Validation
 
 - 1,089 automated offline tests cover discovery, stacks, the record, verification,
   monitor, complete and the organization-policy preflight.
