@@ -18,7 +18,7 @@ from botocore.tokens import SSOTokenProvider
 
 PURPOSE = "TemporaryMigrationRAMShares"
 PRODUCT = "RAMShift"
-TOOL_VERSION = "0.0.0"
+TOOL_VERSION = "1.1.0"
 CONFIG = Config(retries={"mode": "adaptive", "max_attempts": 8},
                 connect_timeout=10, read_timeout=30)
 ACCOUNT = re.compile(r"^\d{12}$")
