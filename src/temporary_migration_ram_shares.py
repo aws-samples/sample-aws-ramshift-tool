@@ -2248,6 +2248,12 @@ BLOCKER_ACTIONS = {
                   "--scan-enabled-regions (verify takes its Regions from the record), then "
                   "re-run verify with the same --record",
     },
+    "region-denied-by-policy": {
+        "*": "an organization policy (SCP or RCP) explicitly denies RAM reads for the named "
+             "accounts in these Regions, for example a Control Tower Region deny, so nothing "
+             "there can be inspected: leave the Regions out with --exclude-regions <Regions> "
+             "--exclude-reason \"<reason>\", or accept these blockers; then {rerun}",
+    },
     "discovery-api-error": {
         "*": "resolve each named API error (operation and request ID are shown; for throttling "
              "lower {workers}), then {rerun}",
@@ -2335,6 +2341,11 @@ BLOCKER_PATTERNS = (
         r"phase=reviewed-record |plan changed; run plan/apply")),
     ("policy-created-share", re.compile(r"featureSet (?:CREATED_FROM_POLICY|PROMOTING_TO_STANDARD):")),
     ("ram-share-quota", re.compile(r"AWS RAM allows at most \d+ \w+ associations per resource share")),
+    # A read an SCP or RCP explicitly denies (for example a Control Tower Region deny):
+    # known, not an unreadable failure.
+    ("region-denied-by-policy", re.compile(
+        r"phase=(?:received-audit|discovery|owned-audit)\b.*with an explicit deny in a "
+        r"(?:service|resource) control policy")),
     ("discovery-api-error", re.compile(r"operation=\w+|\(request [^)]*\)")),
     ("received-dependency-not-covered", re.compile(r"not covered by any planned temporary share")),
     ("configuration", re.compile(
@@ -2392,6 +2403,10 @@ ACCEPTABLE = {
     "organization-policy-unreadable":
         "unread policies may deny apply, verify, monitor or complete requests when they run; a "
         "denied write fails without changing original sharing",
+    "region-denied-by-policy":
+        "nothing in that Region is inspected for that account: an organization policy denies "
+        "RAM reads there, which usually means the account cannot use shared resources there "
+        "either",
 }
 SHARE_LEVEL = ("this share is not bridged: its migrating consumers lose access to it when they "
                "leave their organization")

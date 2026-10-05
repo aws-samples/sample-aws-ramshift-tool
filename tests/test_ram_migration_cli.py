@@ -4361,3 +4361,19 @@ def test_blocker_ids_ignore_request_ids_and_the_post_confirmation_prefix():
     assert cli.blocker_id(reason) == cli.blocker_id("post-confirmation " +
                                                     reason.replace("abc-1", "xyz-2"))
     assert cli.blocker_id(reason) != cli.blocker_id(reason.replace("account=1", "account=2"))
+
+
+def test_a_read_an_organization_policy_denies_is_its_own_acceptable_category():
+    reason = ("account=000000000002 region=ap-south-1 phase=received-audit status=BLOCKED "
+              "operation=GetResourceShares AccessDeniedException: User: arn:aws:sts::000000000002:"
+              "assumed-role/Admin/x is not authorized to perform: ram:GetResourceShares on resource: "
+              "arn:aws:ram:ap-south-1:000000000002:resource-share/* with an explicit deny in a "
+              "service control policy: arn:aws:organizations::000000000009:policy/o-x/"
+              "service_control_policy/p-abc12345 (request 7dd39aa4)")
+    category, consequence, refusal = cli.acceptance_of(reason)
+    assert category == "region-denied-by-policy" and consequence and refusal is None
+    assert "--exclude-regions" in cli.blocker_action(category, "plan", True)
+    plain = reason.replace(" with an explicit deny in a service control policy: "
+                           "arn:aws:organizations::000000000009:policy/o-x/"
+                           "service_control_policy/p-abc12345", "")
+    assert cli.acceptance_of(plain)[0] == "discovery-api-error" and cli.acceptance_of(plain)[2]
