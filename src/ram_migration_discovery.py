@@ -1299,6 +1299,24 @@ class Discovery:
                 stationary -= self.excluded_consumers
                 external_stationary = self._external_access(
                     associations, stationary, ram.meta.partition)
+                # Continuity keeps access a stationary recipient has now; it never grants
+                # access the original share no longer gives. Only an ASSOCIATED principal
+                # association (an account, or an OU or organization expanded to its active
+                # members) proves current access; a recipient only the owning template names
+                # would receive new access, so it blocks unless explicitly excluded.
+                associated: set[str] = set()
+                for row in associations:
+                    if row.get("status") == "ASSOCIATED":
+                        associated.update(self._expand(owner, row["associatedEntity"],
+                                                       partition=ram.meta.partition))
+                unassociated = stationary - associated
+                if unassociated:
+                    raise MigrationError(
+                        f"stationary recipients {sorted(unassociated)} hold no ASSOCIATED "
+                        "principal association on this original share now (the owning template "
+                        "or a pending association names them), so a temporary share would grant "
+                        "them new access: reconcile the original share, or leave them out with "
+                        "--exclude-consumers and --exclude-consumers-reason")
                 if external_stationary:
                     part.external_access.extend(
                         {"owner": owner, "region": region, "share": arn, "consumer": consumer,

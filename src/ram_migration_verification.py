@@ -111,6 +111,9 @@ class Comparison:
     status: str = INCONCLUSIVE
     # Baseline items a gap hides, wholly or in part: neither present nor lost.
     unobserved: list[dict] = field(default_factory=list)
+    # Baseline items already unhealthy before the migration that are now gone, such as an
+    # association that was DELETING: they ended by themselves and are never a loss.
+    ended: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -400,8 +403,12 @@ def _allocations(task: _Task, arn: str, consumers: set[str]) -> None:
                 rows[0].get("IpamPoolArn") != arn or rows[0].get("OwnerId") != task.account:
             raise _Unreadable("IpamPoolIdentityMismatch")
         locale = rows[0].get("Locale")
+        if locale in (None, "None"):  # a pool with no Locale: read where its share is
+            return task.region
         if not isinstance(locale, str) or not _REGION.fullmatch(locale):
             raise _Unreadable("IpamPoolLocaleUnknown")
+        if locale not in task.allowed_regions:  # name the Region to add to --regions
+            raise _Unreadable(f"IpamPoolLocaleOutsideRegions:{locale}")
         return locale
 
     locale = task.attempt("ipam_allocations", arn, "describe_ipam_pools", describe)
@@ -782,6 +789,15 @@ def _judge(before: dict, after: dict, hidden: bool) -> tuple[list[str], list[str
     return lost, unread
 
 
+def _unhealthy(before: dict) -> bool:
+    """Whether a baseline item was already unhealthy when the baseline was captured."""
+    kind = before["kind"]
+    if kind == "entitlement":
+        return not before.get("via_shares")
+    return any(before.get(name) not in (None, healthy)
+               for name, healthy in (*REQUIRED.get(kind, ()), *RETAINED.get(kind, ())))
+
+
 def compare(baseline_items: Any, observation: Any) -> Comparison:
     """Judge every baseline item by the Loss-when rules of section 2.
 
@@ -797,6 +813,9 @@ def compare(baseline_items: Any, observation: Any) -> Comparison:
     for key in sorted(baseline):
         before, after = baseline[key], current.get(key)
         hiding = [gap for gap in result.gaps if _touches(gap, before)]
+        if after is None and not hiding and _unhealthy(before):
+            result.ended.append({"key": key, "item": before})
+            continue
         if after is None:
             if hiding:
                 result.unobserved.append({"key": key, "before": before, "after": None, "reasons": [

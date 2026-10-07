@@ -452,7 +452,8 @@ class IpamLocaleReads(unittest.TestCase):
         self.metadata["Locale"] = "ap-south-1"
         self.observe()
         self.assertEqual(self.task.items, [])
-        self.assertIn("RegionOutsideVerificationScope", self.task.gaps[0]["reason"])
+        # The gap names the Region to add to --regions; nothing outside them is read.
+        self.assertIn("IpamPoolLocaleOutsideRegions:ap-south-1", self.task.gaps[0]["reason"])
         self.assertEqual(self.calls, [(self.owner, "ec2", REGION, False)])
 
     def test_later_allocation_page_denial_is_not_an_empty_inventory(self):
@@ -604,14 +605,14 @@ class TgwRouteExclusion(unittest.TestCase):
         self.assertEqual(capture_problems(observed), [])
         self.assertTrue(pre_existing(observed, "baseline"))
 
-    def test_missing_ram_visibility_is_recorded_as_found(self):
+    def test_missing_ram_visibility_still_blocks(self):
+        """A temporary share would grant access the consumer does not have now."""
         self.ram.handlers["list_resources"] = {"resources": []}
         observed = collect(self.router, [self.group], include_tgw_routes=False)
         entitlement = next(item for item in observed.items if item["kind"] == "entitlement")
         self.assertEqual(entitlement["via_shares"], [])
-        self.assertEqual(capture_problems(observed), [])
-        self.assertTrue(any("not visible to the consumer before the migration" in line
-                            for line in pre_existing(observed, "baseline")))
+        self.assertTrue(any("not visible to the consumer now" in problem
+                            for problem in capture_problems(observed)))
 
     def test_visible_tgw_does_not_invent_a_vpc_attachment(self):
         self.owner_ec2.handlers["describe_transit_gateway_attachments"] = {

@@ -1211,8 +1211,42 @@ def test_state_already_unhealthy_before_the_migration_is_no_loss(before):
     assert comparison.status == "INTACT" and comparison.present == [before["key"]]
 
 
-def test_a_pre_existing_unhealthy_item_is_still_lost_when_it_disappears_or_is_replaced():
+@pytest.mark.parametrize("before", [association(status="DELETING"), attachment(state="deleting"),
+                                    route(state="blackhole")], ids=lambda v: v["kind"])
+def test_a_pre_existing_unhealthy_item_that_disappears_ended_by_itself(before):
+    """Review finding: an item that was already going away is no loss when it is gone."""
+    comparison = verification.compare([before], observed([]))
+    assert comparison.status == "INTACT" and comparison.missing == []
+    assert comparison.ended == [{"key": before["key"], "item": before}]
+
+
+def test_a_pre_existing_unhealthy_item_whose_binding_is_replaced_is_still_a_loss():
     before = association(status="FAILED")
-    assert verification.compare([before], observed([])).status == "LOSS"
     replaced = verification.compare([before], observed([association(status="FAILED", vpc=OTHER_VPC)]))
     assert replaced.status == "LOSS" and replaced.degraded[0]["reasons"] == ["vpc_id changed"]
+
+
+def test_a_healthy_item_that_disappears_is_still_missing():
+    assert verification.compare([association()], observed([])).status == "LOSS"
+
+
+@pytest.mark.parametrize("locale", [None, "None"])
+def test_an_ipam_pool_without_a_locale_is_read_where_its_share_is(world, locale):
+    g = group({POOL: IPAM})
+    world.reply(OWNER, "ec2", "describe_ipam_pools", {"IpamPools": [
+        {"IpamPoolId": POOL_ID, "IpamPoolArn": POOL, "OwnerId": OWNER,
+         **({} if locale is None else {"Locale": locale})}]}, IpamPoolIds=[POOL_ID])
+    world.reply(OWNER, "ec2", "get_ipam_pool_allocations", {"IpamPoolAllocations": []},
+                IpamPoolId=POOL_ID)
+    visible(world, CONSUMER, g.resources)
+    assert collect(world, [g]).gaps == []
+
+
+def test_an_ipam_pool_locale_outside_the_regions_names_the_region_to_add(world):
+    g = group({POOL: IPAM})
+    world.reply(OWNER, "ec2", "describe_ipam_pools", {"IpamPools": [
+        {"IpamPoolId": POOL_ID, "IpamPoolArn": POOL, "OwnerId": OWNER, "Locale": "eu-west-1"}]},
+        IpamPoolIds=[POOL_ID])
+    visible(world, CONSUMER, g.resources)
+    gap_row, = collect(world, [g]).gaps
+    assert gap_row["reason"].startswith("IpamPoolLocaleOutsideRegions:eu-west-1 ")

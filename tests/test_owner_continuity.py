@@ -193,12 +193,16 @@ class OwnerContinuityDiscovery(unittest.TestCase):
                           {KIND.lower(): True}, migrating_owners={OWNER},
                           excluded_consumers=excluded, consumer_exclusion_reason=reason)
 
-    def test_override_cannot_hide_configured_stationary_recipient(self):
+    def test_a_template_only_stationary_recipient_blocks_instead_of_gaining_access(self):
+        """Review finding: continuity keeps current access; a recipient only the owning
+        template names holds no ASSOCIATED association and would gain new access."""
         self.configured = [STAYING, OTHER]
         self.discovery.overrides[SHARE] = [MOVING]
         part, group = self.inspect()
-        self.assertEqual(part.blocked, [])
-        self.assertEqual(set(group.stationary_consumers), {STAYING, OTHER})
+        self.assertIsNone(group)
+        self.assertIn(f"stationary recipients ['{OTHER}'] hold no ASSOCIATED principal association",
+                      part.blocked[0])
+        self.assertIn("--exclude-consumers", part.blocked[0])
 
     def test_override_cannot_invent_stationary_recipient(self):
         self.discovery.overrides[SHARE] = [OTHER]

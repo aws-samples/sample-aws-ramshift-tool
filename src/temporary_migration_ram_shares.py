@@ -1336,8 +1336,12 @@ def group_accounts(groups: list) -> dict[str, list[str]]:
 def observe(router: Any, groups: list, temporary: frozenset[str], opts: Options,
             report: Reporter, phase: str) -> Any:
     progress = Progress(report, f"observation:{phase}", group_accounts(groups))
+    # Reads stay within the reviewed Regions plus every Region a group was planned in
+    # (dependency Regions, scanned Regions and a migrating owner's enabled Regions).
+    allowed = sorted(set(opts.regions) | {value(group, "region") if isinstance(group, dict)
+                                          else group.region for group in groups})
     observation = verifier().collect(router, groups, temporary_shares=temporary,
-                                     workers=opts.args.region_workers, allowed_regions=opts.regions,
+                                     workers=opts.args.region_workers, allowed_regions=allowed,
                                      include_tgw_routes=opts.tgw_route_exclusion_reason is None)
     progress.observed(observation)
     for item in sorted(value(observation, "items"), key=lambda row: row["key"]):
@@ -1368,12 +1372,25 @@ def unassociated_rules(groups: list, observation: Any,
 
 def capture_problems(observation: Any) -> list[str]:
     """A baseline is captured only from a complete observation: an unread item could be
-    anything. What was read is recorded as found (see pre_existing)."""
-    return [f"phase=baseline status=BLOCKED collector={gap.get('collector')} "
-            f"account={gap.get('account')} region={gap.get('region')} "
-            f"resource={gap.get('resource_arn')} {gap.get('reason')}; the original baseline "
-            "cannot be captured completely" for gap in value(observation, "gaps")
-            if gap.get("reason") != UNAVAILABLE]
+    anything. Two read results block too: a planned entitlement the consumer cannot see
+    (a temporary share would grant access it does not have now), and a consumer's Private
+    CA read that is not OK (this tool's own read was denied or failed, so CA access is
+    unknown). Other unhealthy state is recorded as found (see pre_existing)."""
+    problems = [f"phase=baseline status=BLOCKED collector={gap.get('collector')} "
+                f"account={gap.get('account')} region={gap.get('region')} "
+                f"resource={gap.get('resource_arn')} {gap.get('reason')}; the original baseline "
+                "cannot be captured completely" for gap in value(observation, "gaps")
+                if gap.get("reason") != UNAVAILABLE]
+    for item in value(observation, "items"):
+        if item["kind"] == "entitlement" and not item.get("via_shares"):
+            problems.append(f"phase=baseline status=BLOCKED {describe_item(item)}: not visible "
+                            "to the consumer now, so a temporary share would grant access it does "
+                            "not have; re-run plan, which bridges only current access")
+        if item["kind"] == "pca_access" and item.get("consumer_read") not in (None, "OK"):
+            problems.append(f"phase=baseline status=BLOCKED {describe_item(item)}: the consumer's "
+                            "Private CA read was not confirmed, so its CA access is unknown; grant "
+                            "the read, then re-run apply")
+    return problems
 
 
 def pre_existing(observation: Any, phase: str) -> list[str]:
@@ -1383,12 +1400,11 @@ def pre_existing(observation: Any, phase: str) -> list[str]:
     lines = []
     for item in value(observation, "items"):
         rule = HEALTH.get(item["kind"])
+        if item["kind"] == "pca_access":  # the consumer read is capture_problems' to judge
+            rule = ("ca_status", "ACTIVE")
         if rule and item.get(rule[0]) != rule[1]:
             lines.append(f"phase={phase} status=PRE_EXISTING {describe_item(item)}: not {rule[1]} "
                          "before the migration; recorded as found, never a blocker")
-        if item["kind"] == "entitlement" and not item.get("via_shares"):
-            lines.append(f"phase={phase} status=PRE_EXISTING {describe_item(item)}: not visible "
-                         "to the consumer before the migration; recorded as found, never a blocker")
     return lines
 
 

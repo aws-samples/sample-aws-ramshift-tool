@@ -2284,8 +2284,8 @@ def test_baseline_is_captured_once_and_a_later_apply_never_replaces_it(harness, 
     ("association-replaced", f"original state changed during confirmation (missing): {ASSOCIATION_KEY}"),
     ("association-moved", f"original state changed during confirmation (vpc_id changed): {ASSOCIATION_KEY}"),
     ("association-failed", f"original state changed during confirmation (status FAILED): {ASSOCIATION_KEY}"),
-    ("entitlement-lost", "original state changed during confirmation (not visible to the consumer): "
-                         f"entitlement|{CONSUMER}|{REGION}|{RULE}"),
+    ("entitlement-lost", f"resource_arn={RULE} via_shares=0 via_temporary=0 via_other=0: "
+                         "not visible to the consumer now"),
 ])
 def test_state_change_during_confirmation_blocks_at_the_write_gate(
         harness, capsys, migration_record, change, expected):
@@ -4377,3 +4377,20 @@ def test_a_read_an_organization_policy_denies_is_its_own_acceptable_category():
                            "arn:aws:organizations::000000000009:policy/o-x/"
                            "service_control_policy/p-abc12345", "")
     assert cli.acceptance_of(plain)[0] == "discovery-api-error" and cli.acceptance_of(plain)[2]
+
+
+def test_observation_reads_every_region_a_group_was_planned_in(monkeypatch):
+    """Review finding: shares planned in dependency or scanned Regions outside --regions."""
+    seen = {}
+
+    class Recorder:
+        @staticmethod
+        def collect(router, groups, **kwargs):
+            seen.update(kwargs)
+            return SimpleNamespace(observed_at="t", items=[], gaps=[])
+    monkeypatch.setattr(cli, "verifier", lambda: Recorder)
+    opts = SimpleNamespace(regions=["us-east-1"], tgw_route_exclusion_reason=None,
+                           args=SimpleNamespace(region_workers=2))
+    cli.observe(None, [group(region="eu-west-1"), group(region="us-east-1")], frozenset(), opts,
+                SimpleNamespace(emit=lambda _line: None), "verification")
+    assert seen["allowed_regions"] == ["eu-west-1", "us-east-1"]
