@@ -658,8 +658,9 @@ def owner_scope_request(migration: str, proposed: dict[str, dict]) -> dict | Non
 
 
 def accepted_blockers(record: dict) -> dict[str, dict]:
-    """Blocker acceptances by blocker ID; see record_acceptances."""
-    return {row["blocker_id"]: row for row in (record.get("approvals") or {}).get("blockers", [])}
+    """Blocker acceptances by acceptance key (blocker ID and reviewed moving accounts)."""
+    return {row.get("acceptance_key") or row["blocker_id"]: row
+            for row in (record.get("approvals") or {}).get("blockers", [])}
 
 
 def record_acceptances(record: dict, rows: list[dict]) -> list[str]:
@@ -667,12 +668,13 @@ def record_acceptances(record: dict, rows: list[dict]) -> list[str]:
     accepted_reason, accepted_at, plan_revision}. An acceptance is bound to the blocker's
     exact text (its ID): a blocker that changes is a new blocker and needs its own."""
     accepted = record.setdefault("approvals", {}).setdefault("blockers", [])
-    known = {row["blocker_id"] for row in accepted}
+    known = {row.get("acceptance_key") or row["blocker_id"] for row in accepted}
     added = []
     for row in rows:
-        if row["blocker_id"] not in known:
+        key = row.get("acceptance_key") or row["blocker_id"]
+        if key not in known:
             accepted.append(dict(row))
-            known.add(row["blocker_id"])
+            known.add(key)
             added.append(row["blocker_id"])
     return added
 

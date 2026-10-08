@@ -1402,8 +1402,9 @@ class Discovery:
                 # ZONAL_RESOURCE_INACCESSIBLE or LIMIT_EXCEEDED) is not changed by the
                 # migration and is left out.
                 status = resource.get("status", "AVAILABLE")
-                if status == "PENDING":
-                    raise MigrationError(f"{resource_arn}: resource status PENDING")
+                if status not in ("AVAILABLE", "ZONAL_RESOURCE_INACCESSIBLE", "LIMIT_EXCEEDED",
+                                  "UNAVAILABLE"):  # PENDING, or a status this tool does not know
+                    raise MigrationError(f"{resource_arn}: resource status {status}")
                 if status != "AVAILABLE":
                     part.excluded.append(f"{arn}: resource {resource_arn} status {status}; it is "
                                          "not available through this share now, so the migration "

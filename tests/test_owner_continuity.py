@@ -402,7 +402,8 @@ class ContinuityScopeAndLifecycle(unittest.TestCase):
         values.stationary_consumers = [STAYING]
         record = {
             "scope": account_scope(values), "drops": [],
-            "baseline": {"complete": True, "gaps": [], "items": [],
+            # A baseline this version captures always has excluded_consumers.
+            "baseline": {"complete": True, "gaps": [], "items": [], "excluded_consumers": None,
                          "consumer_organizations": {
                              OWNER: SOURCE_ORG, MOVING: SOURCE_ORG, STAYING: SOURCE_ORG}}}
         return record, compare([], Observation("synthetic-now", [], []))

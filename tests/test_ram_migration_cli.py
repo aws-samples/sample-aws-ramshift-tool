@@ -4394,3 +4394,74 @@ def test_observation_reads_every_region_a_group_was_planned_in(monkeypatch):
     cli.observe(None, [group(region="eu-west-1"), group(region="us-east-1")], frozenset(), opts,
                 SimpleNamespace(emit=lambda _line: None), "verification")
     assert seen["allowed_regions"] == ["eu-west-1", "us-east-1"]
+
+
+def test_a_1_0_baseline_that_records_nothing_for_a_migrating_owner_can_still_validate():
+    """Review finding: in-flight 1.0 records stayed INCONCLUSIVE forever after the upgrade."""
+    record = {"scope": {"migrating_consumers": [CONSUMER], "migrating_owners": [OTHER_OWNER]},
+              "baseline": {"complete": True, "gaps": [], "items": [],
+                           "consumer_organizations": {CONSUMER: "o-sourceorg01"}}, "drops": []}
+    comparison = SimpleNamespace(status="INTACT", missing=[], degraded=[], gaps=[], unobserved=[])
+    status, reasons = cli.migration_status(record, comparison, {
+        CONSUMER: "o-destination1", OTHER_OWNER: "o-sourceorg01"}, [])
+    assert (status, reasons) == ("MIGRATION_VALIDATED", [])
+    record["baseline"]["excluded_consumers"] = None  # a 1.1 baseline must record the owner
+    assert cli.migration_status(record, comparison, {
+        CONSUMER: "o-destination1", OTHER_OWNER: "o-sourceorg01"}, [])[0] == "INCONCLUSIVE"
+
+
+def test_blocker_ids_ignore_the_callers_role_session_name():
+    denied = ("account=000000000002 region=ap-south-1 phase=received-audit status=BLOCKED "
+              "AccessDeniedException: User: arn:aws:sts::000000000002:assumed-role/Admin/{} is not "
+              "authorized ... with an explicit deny in a service control policy")
+    assert cli.blocker_id(denied.format("botocore-session-1700000000")) == \
+        cli.blocker_id(denied.format("someone@example.com"))
+
+
+@pytest.mark.parametrize("reason", [
+    "arn:aws:ram:us-west-2:000000000001:resource-share/x: owner=000000000001 region=us-west-2 "
+    "Could not connect to the endpoint URL",
+    "account=000000000002 region=us-west-2 phase=received-audit status=BLOCKED Read timeout on "
+    "endpoint URL",
+    "account=000000000002 owner=000000000001 region=us-west-2 share=s phase=received-audit "
+    "status=BLOCKED Repeated pagination token: list_resources",
+])
+def test_an_unread_condition_can_never_be_accepted(reason):
+    """Review finding: an unread inventory could hold anything."""
+    assert cli.acceptance_of(reason)[1] is None
+
+
+def test_an_acceptance_binds_to_the_moving_accounts_it_was_reviewed_for(harness, capsys,
+                                                                       migration_record):
+    harness.receive(owner=OTHER_OWNER)
+    assert main(with_record(args(), migration_record)) == 1
+    capsys.readouterr()
+    assert accept(migration_record, "all")[0] == 0
+    harness.receive(receiver=OTHER_CONSUMER, owner=OTHER_OWNER, suffix="other")
+    argv = with_record(args(consumers=f"{CONSUMER},{OTHER_CONSUMER}"), migration_record)
+    assert main(argv) == 1  # a larger moving population needs its own review
+    output = capsys.readouterr().out
+    assert "status=ACCEPTED" not in output and "status=PLANNED" not in summary_line(output)
+
+
+@pytest.mark.parametrize("status", ["UNKNOWN", "SOMETHING_NEW"])
+def test_a_received_resource_status_this_tool_does_not_know_still_blocks(harness, capsys, status):
+    share = harness.receive(resource_status="AVAILABLE")
+    resources = harness.received_resources[CONSUMER, REGION, share["resourceShareArn"]]
+    resources.append(dict(resources[0], arn=resources[0]["arn"] + "-odd", status=status))
+    assert main(args()) == 1
+    assert f"intended received resource status {status}" in capsys.readouterr().out
+
+
+def test_accept_exit_codes_say_whether_everything_chosen_was_accepted(harness, capsys,
+                                                                     migration_record):
+    harness.receive(owner=OTHER_OWNER)
+    assert main(with_record(args(), migration_record)) == 1
+    capsys.readouterr()
+    code, out, _ = accept(migration_record, "configuration")
+    assert code == 1 and "has no blocker of that category" in out
+    assert accept(migration_record, "all")[0] == 0
+    code, out, prompts = accept(migration_record, "all", reason="a second, different reason")
+    assert code == 0 and prompts == [] and "status=ALREADY_ACCEPTED" in out
+    row, = read_record(migration_record)["approvals"]["blockers"]
+    assert row["accepted_reason"] == "Owner resources are re-shared after the move"

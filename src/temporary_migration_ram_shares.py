@@ -1105,11 +1105,11 @@ def classify_received(audit: ReceivedAudit, plan: Plan, proven: dict, owner_scop
             audit.blocked.append(f"{context} status=BLOCKED "
                                  "resource owner's Region is outside the selected discovery scope")
         for item in items:
-            if item["status"] == "PENDING":  # being added: intended access not settled yet
+            if item["status"] not in ("AVAILABLE", *UNUSABLE_STATUSES):  # PENDING, UNKNOWN, ...
                 entry["status"] = "BLOCKED"
                 audit.blocked.append(f"{context} resource={item['arn']} status=BLOCKED "
                                      f"intended received resource status {item['status']}")
-            elif item["status"] != "AVAILABLE":
+            elif item["status"] in UNUSABLE_STATUSES:
                 audit.excluded.append(f"{context} resource={item['arn']} status=EXCLUDED received "
                                       f"resource status {item['status']}: the account has no access "
                                       "to it now, so the migration does not change it")
@@ -1292,6 +1292,8 @@ HEALTH = {
 }
 DROP_KIND = {"resolver_association": "association"}
 UNAVAILABLE = "resource_checks_unavailable"
+# Resource statuses that mean the account cannot use the resource through this share now.
+UNUSABLE_STATUSES = ("ZONAL_RESOURCE_INACCESSIBLE", "LIMIT_EXCEEDED", "UNAVAILABLE")
 RESOLVER_TYPE = "route53resolver:resolverrule"
 
 
@@ -1570,6 +1572,18 @@ def original_share_drops(dropped: list[dict], observation: Any, organizations: d
             for (consumer, owner, region, share), arns in sorted(resources.items())]
 
 
+def untracked(baseline: dict, accounts: Iterable[str]) -> set[str]:
+    """Accounts a baseline captured before migrating owners' organizations were recorded
+    (1.0, whose baselines have no excluded_consumers field) records nothing for, such as a
+    migrating owner that received nothing: nothing of theirs can be judged. A later baseline
+    records every migrating owner's organization, so a missing one stays inconclusive."""
+    if "excluded_consumers" in baseline:
+        return set()
+    named = set((baseline.get("consumer_organizations") or {})) | {
+        item.get("consumer") for item in baseline.get("items", [])}
+    return set(accounts) - named
+
+
 def migration_status(record: dict, comparison: Any | None, organizations: dict,
                      groups: list | None = None,
                      retired: set[str] | frozenset[str] = frozenset()) -> tuple[str, list[str]]:
@@ -1598,6 +1612,9 @@ def migration_status(record: dict, comparison: Any | None, organizations: dict,
                                     "the current observation is incomplete"]
     before = {consumer: organization for consumer, organization
               in baseline.get("consumer_organizations", {}).items() if consumer not in retired}
+    scope = record.get("scope") or {}
+    ignored = untracked(baseline, scope.get("migrating_owners", []))
+    organizations = {k: v for k, v in organizations.items() if k not in ignored}
     unknown = [f"current organization of {consumer} is unknown"
                for consumer in sorted(before) if consumer not in organizations]
     unknown += [f"{consumer} has no baseline organization; the original baseline does not cover it"
@@ -1612,7 +1629,7 @@ def migration_status(record: dict, comparison: Any | None, organizations: dict,
     moving = set(scope.get("migrating_consumers", [])) | set(scope.get("migrating_owners", []))
     if not moving:
         moving = set(before) - set(scope.get("stationary_consumers", []))
-    unrecorded_owners = set(scope.get("migrating_owners", [])) - set(before) - set(retired)
+    unrecorded_owners = set(scope.get("migrating_owners", [])) - set(before) - set(retired) - ignored
     if unrecorded_owners:
         return "INCONCLUSIVE", [
             f"migrating owner {owner} has no original baseline organization"
@@ -2077,22 +2094,27 @@ def run_approve(opts: Options, ask: Callable[[str], str], report: Reporter) -> i
 
 def run_accept(record: dict, opts: Options, ask: Callable[[str], str], report: Reporter) -> int:
     """Accept blockers of the latest recorded plan, chosen by ID, category or all. Each
-    acceptance records its consequence and reason and binds to the blocker's exact text;
-    plan and apply then report it as ACCEPTED instead of stopping on it."""
+    acceptance records its consequence and reason and binds to the blocker's exact text and
+    the moving accounts it was reviewed for; plan and apply then report it as ACCEPTED.
+    Exit 0 when every chosen blocker is accepted, 1 when one cannot be, 2 when not confirmed."""
     path, migration = opts.args.record, record["migration_id"]
     revision = latest(record, "plan")["revision"]
+    scope = record.get("scope") or {}
     blockers = list((record.get("plan") or {}).get("blocked") or [])
-    already = {row["blocker_id"] for row in (record.get("plan") or {}).get("accepted") or []} | \
-        set(accepted_blockers(record))
+    accepted = accepted_blockers(record)
+    reviewed = {row["blocker_id"] for row in (record.get("plan") or {}).get("accepted") or []}
     chosen: dict[str, str] = {}
     for selector in split_values(opts.args.accept_blockers):
         if selector == "all":
             hits = blockers
         elif selector in BLOCKER_ACTIONS:
             hits = [reason for reason in blockers if blocker_category(reason) == selector]
+            if not hits:
+                raise MigrationError(f"--accept-blockers {selector}: the plan recorded in revision "
+                                     f"{revision} has no blocker of that category")
         else:
             hits = [reason for reason in blockers if blocker_id(reason) == selector]
-            if not hits and selector in already:
+            if not hits and selector in reviewed:
                 report.emit(f"blocker={selector} phase=approve status=ALREADY_ACCEPTED")
                 continue
             if not hits:
@@ -2102,22 +2124,29 @@ def run_accept(record: dict, opts: Options, ask: Callable[[str], str], report: R
                     "(blocker=b-... on each phase=preflight status=BLOCKED line)")
         for reason in hits:
             chosen.setdefault(blocker_id(reason), reason)
-    rows = []
+    rows, refused = [], 0
     for identity, reason in chosen.items():
+        key = acceptance_key(identity, scope)
+        if key in accepted:  # accepted already; re-run plan --record to apply it
+            report.emit(f"blocker={identity} phase=approve status=ALREADY_ACCEPTED "
+                        f"accepted_at={accepted[key].get('accepted_at')}")
+            continue
         category, consequence, refusal = acceptance_of(reason)
         if refusal is not None:
+            refused += 1
             report.emit(f"blocker={identity} phase=approve status=NOT_ACCEPTABLE category={category} "
                         f"why={json.dumps(refusal)} {reason}")
             continue
         report.emit(f"blocker={identity} phase=approve category={category} "
                     f"consequence={json.dumps(consequence)} {reason}")
-        rows.append({"blocker_id": identity, "category": category, "blocker": reason,
-                     "consequence": consequence, "accepted_reason": opts.args.accept_reason,
-                     "plan_revision": revision})
+        rows.append({"blocker_id": identity, "acceptance_key": key,
+                     "scope_accounts": scope_accounts(scope), "category": category,
+                     "blocker": reason, "consequence": consequence,
+                     "accepted_reason": opts.args.accept_reason, "plan_revision": revision})
     if not rows:
-        report.emit(f"migration={migration} phase=approve status=NOTHING_ACCEPTED no acceptable "
-                    "blocker was chosen")
-        return 1 if chosen else 0
+        report.emit(f"migration={migration} phase=approve status=NOTHING_ACCEPTED "
+                    f"not_acceptable={refused}")
+        return 1 if refused else 0
     token = f"ACCEPT-BLOCKERS {migration} {len(rows)}"
     try:
         reply = ask(f"Type {token} to accept these {len(rows)} blockers with their consequences: ")
@@ -2133,11 +2162,16 @@ def run_accept(record: dict, opts: Options, ask: Callable[[str], str], report: R
         at = timestamp()
         record_acceptances(current, [dict(row, accepted_at=at) for row in rows])
     update_record(path, migration, add, mode="approve", status="ACCEPTED",
-                  accepted=[row["blocker_id"] for row in rows], accept_reason=opts.args.accept_reason)
+                  accepted=[row["blocker_id"] for row in rows], accept_reason=opts.args.accept_reason,
+                  not_acceptable=refused)
     for row in rows:
         report.emit(f"blocker={row['blocker_id']} phase=approve status=ACCEPTED")
+    if refused:
+        report.emit(f"migration={migration} phase=approve status=PARTLY_ACCEPTED accepted="
+                    f"{len(rows)} not_acceptable={refused}: resolve the others, then re-run plan --record")
+        return 1
     report.emit("Re-run plan with --record: accepted blockers are reported as ACCEPTED and no "
-                "longer block; a blocker whose text changes needs a new acceptance.")
+                "longer block; a blocker whose text or moving accounts change needs a new acceptance.")
     return 0
 
 
@@ -2442,7 +2476,21 @@ NOT_ACCEPTABLE = {
     "reviewed-record-mismatch": "the run must match the reviewed record; re-run plan and review it",
     "ram-share-quota": "AWS RAM rejects a share over its fixed quota; split the migration",
 }
-NOT_ACCEPTABLE_OTHER = "it guards the tool's own consistency; resolve it and re-run"
+NOT_ACCEPTABLE_OTHER = ("it is an unread or unexpected condition, or guards the tool's own "
+                        "consistency; resolve it and re-run")
+# Share-level and received-access blockers that are known decisions about access, not
+# unread state: only these can be accepted.
+SHARE_DECISIONS = re.compile(
+    r"source status PENDING|resource status PENDING|Unsupported account-level principal "
+    r"conversion|Provide principal-map override to resolve historical|Original account-facing "
+    r"consumers are unresolved|Cannot re-share resource owned by another account|external "
+    r"principal association of \d{12} on this original share is not settled|stationary "
+    r"recipients \[[^\]]*\] hold no ASSOCIATED|principal-map stationary consumers|Service-only "
+    r"template conflicts with live account principals|Principal-map override cannot broaden|"
+    r"source managed permission missing|Owning template has no intended principals")
+RECEIVED_DECISIONS = re.compile(
+    r"share=\S+ phase=received-audit .*(?:pending intended received entitlements|intended "
+    r"received resource status)")
 
 
 def blocker_id(reason: str) -> str:
@@ -2450,7 +2498,21 @@ def blocker_id(reason: str) -> str:
     post-confirmation prefix apply adds when it reads the same condition again."""
     text = re.sub(r"^post-confirmation ", "", reason)
     text = re.sub(r"\(request [^)]*\)|\brequest[= ][\w-]+", "", text)
+    # An AccessDenied text names the caller's role session, which differs per session.
+    text = re.sub(r"(arn:[\w-]+:sts::\d{12}:assumed-role/[\w+=,.@-]+)/[\w+=,.@-]+", r"\1/*", text)
     return "b-" + digest(text, 12)
+
+
+def scope_accounts(scope: dict | None) -> list[str]:
+    """The moving accounts an acceptance was reviewed for."""
+    scope = scope or {}
+    return sorted(set(scope.get("migrating_consumers", [])) | set(scope.get("migrating_owners", [])))
+
+
+def acceptance_key(identity: str, scope: dict | None) -> str:
+    """A blocker's ID for one reviewed set of moving accounts: accepting a share-level
+    blocker for some accounts never covers accounts added by a later plan."""
+    return f"{identity}@{digest(scope_accounts(scope), 12)}"
 
 
 def acceptance_of(reason: str) -> tuple[str, str | None, str | None]:
@@ -2459,11 +2521,9 @@ def acceptance_of(reason: str) -> tuple[str, str | None, str | None]:
     if category in ACCEPTABLE:
         return category, ACCEPTABLE[category], None
     if category == "other":
-        if SHARE_ARN.match(reason):
+        if SHARE_ARN.match(reason) and SHARE_DECISIONS.search(reason):
             return category, SHARE_LEVEL, None
-        # A temporary share that differs from what the record holds is a consistency
-        # check, never a choice about access.
-        if "phase=received-audit" in reason and "persisted scope" not in reason:
+        if RECEIVED_DECISIONS.search(reason):
             return category, RECEIVED_LEVEL, None
         return category, None, NOT_ACCEPTABLE_OTHER
     return category, None, NOT_ACCEPTABLE.get(category, NOT_ACCEPTABLE_OTHER)
@@ -2513,15 +2573,16 @@ def blocker_entries(blocked: list[str], mode: str = "plan") -> list[dict]:
     return rows
 
 
-def accept_recorded(plan: Plan, record: dict | None) -> None:
+def accept_recorded(plan: Plan, record: dict | None, scope: dict | None) -> None:
     """Move every blocker the record accepts out of ``plan.blocked`` into ``plan.accepted``.
-    Idempotent; only an acceptable blocker with a recorded acceptance of its exact ID moves."""
+    Idempotent; only an acceptable blocker with a recorded acceptance of its exact ID, for
+    the same moving accounts, moves."""
     accepted = accepted_blockers(record) if record is not None else {}
     if not accepted:
         return
     remaining = []
     for reason in plan.blocked:
-        row = accepted.get(blocker_id(reason))
+        row = accepted.get(acceptance_key(blocker_id(reason), scope))
         if row is not None and acceptance_of(reason)[1] is not None:
             plan.accepted.append({**row, "blocker": reason})
         else:
@@ -2832,7 +2893,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
         ({c for g in observed for c in g.consumers} | set(scope["migrating_owners"])) - retired)
     preflight, organizations, pending_drops = None, {}, []
     if args.mode in ("plan", "apply"):
-        accept_recorded(plan, record)  # accepted blockers never stop the checks below
+        accept_recorded(plan, record, scope)  # accepted blockers never stop the checks below
     if args.mode == "apply" and not plan.blocked and plan.groups:
         organizations, errors = consumer_organizations(gate, consumers_in_scope, opts)
         plan.blocked.extend(errors)
@@ -2853,7 +2914,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                                    org_policy):
             report.emit(line)
     if args.mode in ("plan", "apply"):
-        accept_recorded(plan, record)
+        accept_recorded(plan, record, scope)
     if args.mode != "verify":
         print_plan(plan, prepared, report)
         print_permission_changes(plan, report)
@@ -2956,7 +3017,7 @@ def run_shares(router: Router, opts: Options, ask: Callable[[str], str], report:
                                        record["baseline"]["captured_at"] if record.get("baseline")
                                        else "", f"record revision {record['revision']}")
         accepted_before = len(plan.accepted)
-        accept_recorded(plan, record)
+        accept_recorded(plan, record, scope)
         for row in plan.accepted[accepted_before:]:
             report.emit(accepted_line(row))
         if plan.blocked:
@@ -3770,8 +3831,14 @@ def run_monitor(router: Router, opts: Options, report: Reporter) -> int:
                     f"{gap.get('region')} {gap.get('reason')}" for gap in baseline_gaps(baseline)] \
             or ["the original baseline is incomplete"]
     before = (baseline or {}).get("consumer_organizations", {})
+    ignored = untracked(baseline, chosen) if baseline is not None else set()
+    for consumer in sorted(ignored):
+        report.emit(f"consumer={consumer} phase=monitor status=NOT_TRACKED the original baseline "
+                    "records nothing for this account (it received nothing to protect), so "
+                    "nothing of it is compared")
     reasons += [f"consumer {consumer} is not covered by the original baseline"
-                for consumer in chosen if baseline is not None and consumer not in before]
+                for consumer in chosen
+                if baseline is not None and consumer not in before and consumer not in ignored]
     groups = baseline_groups(baseline, chosen) if baseline is not None else []
 
     def finish(status: str, details: dict) -> int:
