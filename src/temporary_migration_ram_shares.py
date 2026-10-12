@@ -3947,13 +3947,29 @@ def main(argv: list[str] | None = None, *, input_fn: Callable[[str], str] | None
          readable: bool = False) -> int:
     """``readable`` renders the run for people (ram_migration_console) unless --raw-output
     asks for the technical event stream, which is always what the run itself emits."""
-    report: Any = Reporter()
+    state: dict[str, Any] = {"report": Reporter()}
+    code = None
+    try:
+        code = _run(argv, input_fn, readable, state)
+        return code
+    finally:
+        report = state["report"]
+        close = getattr(report, "close", None)
+        if close is not None:
+            if code is not None:
+                report.exit_code = code  # the readable result shows the code the run returns
+            close()
+
+
+def _run(argv: list[str] | None, input_fn: Callable[[str], str] | None, readable: bool,
+         state: dict[str, Any]) -> int:
+    report: Any = state["report"]
     args = opts = None
     try:
         args = build_parser().parse_args(argv)
         if readable and not args.raw_output:
             from ram_migration_console import ReadableReporter
-            report = ReadableReporter(args.mode, args)
+            report = state["report"] = ReadableReporter(args.mode, args)
         reply = input_fn if input_fn is not None else input
 
         def ask(prompt: str) -> str:
@@ -3987,10 +4003,6 @@ def main(argv: list[str] | None = None, *, input_fn: Callable[[str], str] | None
         if opts is not None and opts.interrupt_readback is not None:
             record_failure(args, report, opts, f"{type(exc).__name__}: {exc}")
         raise
-    finally:
-        close = getattr(report, "close", None)
-        if close is not None:
-            close()
 
 
 if __name__ == "__main__":

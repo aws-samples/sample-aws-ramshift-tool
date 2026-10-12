@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from botocore.exceptions import ClientError
 from ram_migration_common import Api, Group, MigrationError, Plan
+from ram_migration_console import ReadableReporter
 from ram_migration_discovery import Discovery, LookupCache
 from ram_migration_preflight import (
     ABSENT, ENABLED, EVALUATED, EXPLICIT_DENY, SCP, UNDECIDED,
@@ -729,41 +730,23 @@ class RouteScopedPolicyPreflight(unittest.TestCase):
 
 
 class MonitorPresentation(unittest.TestCase):
-    """Exercise the packaged console adapter without unpacking or calling AWS."""
-
-    @classmethod
-    def setUpClass(cls):
-        # The launcher source that packaging/build.sh packages as the zipapp __main__.py.
-        launcher = Path(__file__).resolve().parents[1] / "packaging" / "launcher_main.py"
-        tree = ast.parse(launcher.read_text())
-        names = {"_event_fields", "HumanMonitorReporter", "_launch"}
-        nodes = [
-            node for node in tree.body
-            if (isinstance(node, ast.Import)
-                and all(alias.name != "temporary_migration_ram_shares" for alias in node.names))
-            or isinstance(node, ast.ImportFrom)
-            or (isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names)
-            or (isinstance(node, ast.Assign)
-                and any(isinstance(target, ast.Name) and target.id == "MONITOR_COUNTS"
-                        for target in node.targets))
-        ]
-        namespace = {"__name__": "ramshift_console_test"}
-        exec(compile(ast.Module(body=nodes, type_ignores=[]), "<console-adapter>", "exec"),
-             namespace)
-        cls.presentation = SimpleNamespace(**namespace)
+    """The readable monitor view of ram_migration_console, without AWS."""
 
     def setUp(self):
-        self.report = self.presentation.HumanMonitorReporter()
+        self.output = io.StringIO()
+        self.report = ReadableReporter(
+            "monitor", SimpleNamespace(migration_id=None, record=Path("wave1.json")),
+            stream=self.output)
         self.report.context = SimpleNamespace(
             regions=["eu-west-1", "us-east-1"],
             args=SimpleNamespace(record=Path("wave1.json")))
 
-    def render(self, *events):
-        output = io.StringIO()
-        with redirect_stdout(output):
-            for event in events:
-                self.report.emit(event)
-        return output.getvalue()
+    def render(self, *events, close=True):
+        for event in events:
+            self.report.emit(event)
+        if close:
+            self.report.close()
+        return self.output.getvalue()
 
     def start(self):
         return (
@@ -804,15 +787,19 @@ class MonitorPresentation(unittest.TestCase):
                 "organization_now=o-source organization_change=UNCHANGED",
                 self.counts(account)))
         output = self.render(*events, self.finish())
+        self.assertTrue(output.startswith("RAMShift monitor - migration wave1\n"))
         self.assertIn("Result: UNCHANGED", output)
         self.assertIn("No changes detected in the monitored baseline", output)
         self.assertIn("400000000002", output)
+        self.assertIn("Accounts: 3", output)
         self.assertIn("Regions: eu-west-1, us-east-1", output)
         self.assertIn("Baseline: 2026-10-16 13:44:00 UTC", output)
         self.assertIn("TGW route checks excluded: Routes outside this scope", output)
         self.assertEqual(output.count("network reachability"), 1)
         self.assertIn("Lost: 0   Degraded: 0   Unobserved: 0   Read gaps: 0", output)
         self.assertIn("wave1.json (revision 19)", output)
+        self.assertIn("Exit code: 0", output)
+        self.assertIn("One snapshot completed", output)
         self.assertNotIn("phase=monitor", output)
 
     def test_routine_progress_is_condensed_and_owner_read_gap_remains_visible(self):
@@ -826,10 +813,13 @@ class MonitorPresentation(unittest.TestCase):
             self.counts(unobserved=1),
             self.finish("INCONCLUSIVE", gaps=1, code=3, unobserved=1))
         self.assertEqual(output.count("Checking account access"), 1)
+        self.assertIn("Checking account access... 2 accounts verified", output)
+        self.assertIn("Checking baseline access and existing resource bindings...", output)
         self.assertIn("Result: INCONCLUSIVE", output)
         self.assertIn("400000000005: 1 read gap", output)
         self.assertNotIn("No changes detected", output)
         self.assertNotIn("done=1/1", output)
+        self.assertIn("Run with --raw-output for the full technical event stream.", output)
 
     def test_changed_organization_and_access_are_distinguished_from_losses(self):
         output = self.render(
@@ -844,7 +834,9 @@ class MonitorPresentation(unittest.TestCase):
         self.assertIn("Result: CHANGED", output)
         self.assertIn("o-destination", output)
         self.assertIn("Original share access removed", output)
+        self.assertIn("tgw-example", output)
         self.assertIn("current access=AVAILABLE", output)
+        self.assertIn("not losses", output)
         self.assertIn("Lost: 0", output)
         self.assertNotIn("Baseline items were lost", output)
 
@@ -875,20 +867,26 @@ class MonitorPresentation(unittest.TestCase):
         self.assertIn("AccessDenied", output)
         self.assertIn("current organization of 400000000002 is unknown", output)
         self.assertIn("Exit code: 3", output)
+        self.setUp()
         blocked = self.render("status=BLOCKED Error when retrieving token from sso: Token has expired")
         self.assertIn("Monitor could not run", blocked)
         self.assertIn("Token has expired", blocked)
+        self.assertIn("Exit code: 1", blocked)
         self.assertNotIn("No changes detected", blocked)
 
     def test_missing_account_evidence_is_unknown_instead_of_zero(self):
         output = self.render(*self.start(), self.finish("INCONCLUSIVE", code=3))
-        account_row = next(line for line in output.splitlines() if line.startswith("400000000002"))
+        account_row = next(line for line in output.splitlines()
+                           if line.strip().startswith("400000000002"))
         self.assertIn("UNKNOWN", account_row)
         self.assertEqual(account_row.count("?"), 4)
 
     def test_failed_record_write_is_visible(self):
-        output = self.render(self.finish(recorded=False, code=1))
+        output = self.render(
+            "phase=record status=NOT_RECORDED record changed concurrently",
+            self.finish(recorded=False, code=1))
         self.assertIn("result could not be saved", output)
+        self.assertIn("record changed concurrently", output)
         self.assertIn("Exit code: 1", output)
         self.assertNotIn("(revision", output)
 
@@ -896,59 +894,30 @@ class MonitorPresentation(unittest.TestCase):
         diagnostic = "phase=new-collector status=GAP AccessDenied operation=NewAPI"
         malformed = 'phase=monitor reason="unterminated'
         self.assertEqual(self.render(diagnostic, malformed), diagnostic + "\n" + malformed + "\n")
+        self.setUp()
         summary = self.finish().replace("lost=0", "lost=not-a-number")
         self.assertEqual(self.render(summary), summary + "\n")
 
-    def fake_cli(self, return_code=0):
-        original_reporter = SimpleNamespace
-        fake = SimpleNamespace(build_parser=build_parser, Reporter=original_reporter)
+    def test_the_run_exit_code_is_the_one_shown(self):
+        self.report.exit_code = 1  # main sets the code it returns before it closes the reporter
+        output = self.render(*self.start(), self.finish())
+        self.assertIn("Exit code: 1", output)
+        self.assertNotIn("Exit code: 0", output)
 
-        def monitor(router, opts, report):
-            return return_code
-
-        fake.run_monitor = monitor
-        fake.seen = []
-
-        def main(argv):
-            fake.seen.append(list(argv))
-            fake.active_reporter = fake.Reporter
-            return return_code
-
-        fake.main = main
-        return fake, original_reporter, monitor
-
-    def test_human_adapter_preserves_all_native_arguments_and_exit_code(self):
-        fake, reporter, monitor = self.fake_cli(return_code=3)
-        argv = ["monitor", "--record", "wave1.json", "--all-accounts",
-                "--sso-role", "1-global-admin"]
-        code = self.presentation._launch(fake, argv)
-        self.assertEqual(code, 3)
-        self.assertEqual(fake.seen, [argv])
-        self.assertIs(fake.active_reporter, self.presentation.HumanMonitorReporter)
-        self.assertIs(fake.Reporter, reporter)
-        self.assertIs(fake.run_monitor, monitor)
-
-    def test_raw_output_and_other_modes_use_original_reporter(self):
-        for mode, flag in (("monitor", ["--raw-output"]), ("plan", []),
-                           ("apply", []), ("verify", []), ("complete", [])):
-            with self.subTest(mode=mode):
-                fake, reporter, _ = self.fake_cli(return_code=1)
-                argv = [mode, "--record", "example.json", *flag]
-                self.assertEqual(self.presentation._launch(fake, argv), 1)
-                self.assertIs(fake.active_reporter, reporter)
-                self.assertEqual(fake.seen, [[mode, "--record", "example.json"]])
-
-    def test_failed_native_main_restores_original_handlers(self):
-        fake, reporter, monitor = self.fake_cli()
-
-        def fail(argv):
-            raise RuntimeError("synthetic native failure")
-
-        fake.main = fail
-        with self.assertRaisesRegex(RuntimeError, "synthetic native failure"):
-            self.presentation._launch(fake, ["monitor", "--all-accounts"])
-        self.assertIs(fake.Reporter, reporter)
-        self.assertIs(fake.run_monitor, monitor)
+    def test_launcher_runs_the_readable_cli_and_keeps_no_console_code(self):
+        # The launcher source that packaging/build.sh packages as the zipapp __main__.py.
+        launcher = Path(__file__).resolve().parents[1] / "packaging" / "launcher_main.py"
+        source = launcher.read_text()
+        tree = ast.parse(source)
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Attribute) and node.func.attr == "main"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([(k.arg, getattr(k.value, "value", None)) for k in calls[0].keywords],
+                         [("readable", True)])
+        self.assertNotIn("add_argument", source)  # the core parser owns --raw-output
+        self.assertNotIn("parse_args", source)
+        self.assertFalse([node for node in tree.body if isinstance(node, ast.ClassDef)])
+        self.assertIn('cp "$ROOT"/src/*.py', (launcher.parent / "build.sh").read_text())
 
     def test_application_modules_and_recorded_source_identity_are_unchanged(self):
         package = os.environ.get("RAMSHIFT_PACKAGE")
