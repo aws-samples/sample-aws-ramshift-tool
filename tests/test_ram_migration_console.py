@@ -586,3 +586,30 @@ def test_raw_output_restores_the_exact_raw_stream(harness, capsys, migration_rec
     assert cli.main(argv + ["--raw-output"], readable=True) == 0
     assert capsys.readouterr().out == raw
     assert "status=" in raw and "RAMShift" not in raw
+
+
+def test_blockers_with_one_reason_are_listed_compactly_with_the_region_exclusion():
+    denied = ("account=000000000002 region={} phase=received-audit status=BLOCKED "
+              "operation=GetResourceShares AccessDeniedException: User: arn:aws:sts::000000000002:"
+              "assumed-role/Admin/session-{} is not authorized to perform: ram:GetResourceShares on "
+              "resource: arn:aws:ram:{}:000000000002:resource-share/* with an explicit deny in a "
+              "service control policy: arn:aws:organizations::000000000009:policy/o-abcdefghij/"
+              "service_control_policy/p-abc12345 (request r-{})")
+    regions = ["eu-west-1", "ap-south-1", "us-east-2"]
+    out = io.StringIO()
+    report = console.ReadableReporter("plan", None, stream=out)
+    for number, region in enumerate(regions):
+        reason = denied.format(region, number, region, number)
+        report.emit(f"phase=preflight status=BLOCKED {reason} blocker=b-00000000000{number}")
+    report.emit("phase=blocker-summary status=BLOCKED blockers=3 categories=1")
+    report.emit("phase=blocker-summary category=region-denied-by-policy blockers=3 consumers=1 "
+                "next_action=leave the Regions out")
+    report.emit("status=BLOCKED migration=m resources_in_plan=0 expected_entitlements=0 "
+                "planned_shares=0 created_shares=0 reused_shares=0 accepted_invitations=0 "
+                "reused_invitations=0 exclusions=0 blockers=3 verification_failures=0")
+    report.close()
+    text = out.getvalue()
+    assert "3 blockers with the same reason; the first in full:" in text
+    assert text.count("is not authorized to perform") == 1
+    assert all(f"b-00000000000{n}  account 000000000002, {r}" in text for n, r in enumerate(regions))
+    assert "--exclude-regions ap-south-1 eu-west-1 us-east-2 --exclude-reason" in text

@@ -363,6 +363,39 @@ def _org_policy_text(event: Event) -> str:
     return f"Whether {named} denies {actions} for {who} cannot be decided: {detail}"
 
 
+# At least this many blockers with one reason are listed compactly.
+SAME_REASON_MIN = 3
+_VARYING = re.compile(
+    r"arn:[\w-]+:ram:[\w-]*:\d{12}:resource-share/[\w.*-]+|\(request [^)]*\)|\brequest[= ][\w-]+"
+    r"|\b[a-z]{2}(?:-[a-z]+)+-\d\b|(assumed-role/[\w+=,.@-]+)/[\w+=,.@-]+")
+
+
+def _same_reason(rows: list[dict]) -> list[list[dict]]:
+    """Blockers grouped by their text with shares, Regions, request IDs and role session
+    names taken out, in first-seen order."""
+    groups: "OrderedDict[str, list[dict]]" = OrderedDict()
+    for row in rows:
+        key = _VARYING.sub(lambda m: m.group(1) or "*", row["text"])
+        groups.setdefault(key, []).append(row)
+    return list(groups.values())
+
+
+def _where(text: str) -> str:
+    """What sets one blocker apart from others with the same reason."""
+    event = Event(text)
+    parts = []
+    match = _SHARE_SUBJECT.match(text)
+    if match:
+        parts.append(f"share {share_id(match.group(1))}")
+    elif event.get("share"):
+        parts.append(f"share {share_id(event.text('share'))}")
+    for key, label in (("account", "account"), ("owner", "owner"), ("region", "")):
+        value = event.text(key) if event.get(key) else (Event(match.group(2)).text(key) if match else "")
+        if value:
+            parts.append(f"{label} {value}".strip())
+    return ", ".join(parts) or _short(describe(text), WIDTH - 20)
+
+
 def describe(text: str) -> str:
     """A plain sentence for a blocker, warning, problem or reason. The error details it
     carries are kept whole."""
@@ -2179,12 +2212,27 @@ class ReadableReporter:
                      f"{plural(len(rows), 'blocker')}" + (f" ({', '.join(counts)})" if counts else ""))
             body.append("")
             body += wrap(title, "  ", "    ")
-            for blocker in rows:
-                number += 1
-                lead = f"{number}. {blocker['id'] or '(no ID)'}  "
-                body += wrap(lead + _short(describe(blocker["text"]), WIDTH - 6 - len(lead)),
-                             "    ", "       ")
-                body += wrap(f"Full text: {blocker['text']}", "       ", "         ")
+            for same in _same_reason(rows):
+                if len(same) < SAME_REASON_MIN:
+                    for blocker in same:
+                        number += 1
+                        lead = f"{number}. {blocker['id'] or '(no ID)'}  "
+                        body += wrap(lead + _short(describe(blocker["text"]), WIDTH - 6 - len(lead)),
+                                     "    ", "       ")
+                        body += wrap(f"Full text: {blocker['text']}", "       ", "         ")
+                    continue
+                # Many blockers with one reason: the reason once, then one line each.
+                body += wrap(f"{len(same)} blockers with the same reason; the first in full:",
+                             "    ", "      ")
+                body += wrap(same[0]["text"], "       ", "         ")
+                for blocker in same:
+                    number += 1
+                    body.append(f"    {number}. {blocker['id'] or '(no ID)'}  {_where(blocker['text'])}")
+                regions = sorted({Event(b["text"]).text("region") for b in same} - {""})
+                if category == "region-denied-by-policy" and regions:
+                    body.append("    To leave these Regions out instead:")
+                    body.append(f"      --exclude-regions {' '.join(regions)} --exclude-reason "
+                                '"<reason>"')
             if summary is not None and "next_action=" in summary.raw:
                 body += wrap(f"Next step: {summary.raw.split('next_action=', 1)[1]}", "    ",
                              "      ")
