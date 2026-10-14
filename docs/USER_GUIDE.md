@@ -288,8 +288,7 @@ Conditions the migration cannot change are recorded and reported, never blockers
 
 | Condition | What RAMShift does |
 |---|---|
-| A Resolver association, endpoint, TGW attachment or route, IPAM allocation or Private CA that is already unhealthy before the move (for example a `FAILED` association or a `blackhole` route) | Recorded in the baseline as found (`status=PRE_EXISTING`). It is a loss only if it disappears or its binding (VPC, rule, TGW) changes, never for staying unhealthy. |
-| A planned resource the account cannot see before the move | Recorded as found; not judged as a loss. |
+| A Resolver association, endpoint, TGW attachment or route, IPAM allocation or Private CA that is already unhealthy before the move (for example a `FAILED` association, a `blackhole` route or a disabled CA) | Recorded in the baseline as found (`status=PRE_EXISTING`). It is never a loss for staying unhealthy, nor when it goes away by itself (an association that was `DELETING`); it is a loss only if its binding (VPC, rule, TGW) is replaced. |
 | A resource type with no RAMShift health check (for example prefix lists or subnets) | Its RAM access is verified like any other; resource-level health is not checked (`status=LIMITED`). This never makes a baseline incomplete or a result inconclusive. |
 | An original share that is `DELETING` or `FAILED` | Excluded with its reason: it grants no access now. |
 | A resource a share cannot provide now (`ZONAL_RESOURCE_INACCESSIBLE`, `LIMIT_EXCEEDED`, `UNAVAILABLE`), on the owner or the receiving side | Left out with its reason; the rest of the share is bridged. |
@@ -298,9 +297,15 @@ Conditions the migration cannot change are recorded and reported, never blockers
 | A Resolver rule the account never associated | Information (`status=NOT_ASSOCIATED`). |
 
 Still blocking (until resolved or accepted, see section 7): a `PENDING` share or resource
-(being set up), anything RAMShift cannot read, received access no temporary share covers,
-owners outside the scope, resource types that cannot be shared externally, restricted
-principals, and organization policies that deny or may deny what the migration needs.
+(being set up), a resource status RAMShift does not know, anything RAMShift cannot read,
+received access no temporary share covers, owners outside the scope, resource types that
+cannot be shared externally, restricted principals, and organization policies that deny or
+may deny what the migration needs.
+
+Two things always block baseline capture, because bridging them would grant access the
+account does not have today: a planned resource the account cannot see before the move,
+and a Private CA read by the account that RAMShift could not confirm. Re-run plan (it
+bridges only current access) or grant the read.
 
 ## 7. Accepting blockers
 
@@ -342,7 +347,39 @@ By default RAMShift shows a readable view: a header, short progress lines, the s
 that matter for the mode (accounts, planned shares, blockers with their IDs, results), and
 a result block with the status in words, the record revision, the exit code and the next
 step. Nothing that matters is hidden: every blocker, warning, loss, read gap, override and
-error is shown in full.
+error is shown in full. Blockers that share one reason are shown once, with one line per
+blocker. For example, a plan blocked by a Region-deny SCP:
+
+```text
+RAMShift plan - migration wave1
+Regions: us-east-1, us-west-2
+
+Checking account access... 3 accounts verified
+Checking what 1 migrating account receives in 17 Regions...
+Inspecting 2 owners in 2 Regions...
+
+Planned temporary shares (2; 2 migration stacks to create)
+  Owner         Region     Accounts      Resources
+  111111111111  us-east-1  222222222222  6 Resolver rules
+  111111111111  us-west-2  222222222222  6 Resolver rules
+
+BLOCKERS (15)
+
+  Reads denied by an organization policy [region-denied-by-policy]: 15 blockers (1 consumer)
+    15 blockers with the same reason; the first in full:
+       account=222222222222 region=ap-south-1 phase=received-audit status=BLOCKED ... with an
+         explicit deny in a service control policy: ...
+    1. b-7ae51e269483  account 222222222222, ap-south-1
+    ...
+    To leave these Regions out instead:
+      --exclude-regions ap-south-1 eu-west-1 ... --exclude-reason "<reason>"
+    To accept instead (15 of 15 can be accepted):
+      ramshift approve --record wave1.json --accept-blockers region-denied-by-policy --accept-reason "<reason>"
+
+Result: BLOCKED - the plan cannot be applied until each blocker above is resolved or accepted
+  Record: wave1.json (revision 1)
+  Exit code: 1
+```
 
 Add `--raw-output` for the technical event stream: one `key=value` line per event, which
 is what the output tables in this guide quote and what log tools should parse. Exit codes
