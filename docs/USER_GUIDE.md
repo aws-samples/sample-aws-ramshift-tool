@@ -970,8 +970,12 @@ Stop and escalate on any of these; none is fixed by retrying with different opti
 
 ## 17. Validation
 
-- 1,089 automated offline tests cover discovery, stacks, the record, verification,
-  monitor, complete and the organization-policy preflight.
+- 1,254 automated offline tests cover discovery, stacks, the record, verification,
+  monitor, complete, blocker acceptance, the readable output and the organization-policy
+  preflight.
+- 1.1.0 was also checked read-only against live accounts in an organization with a Region
+  deny SCP: 30 blockers, all in acceptable categories, were accepted and the plan became
+  `PLANNED`, with the record summary naming the next step.
 - A full Control Tower to Control Tower move was run in test accounts: before the move
   `UNCHANGED`; after leaving the source OU and organization all 26 original shares showed
   `ORIGINAL_SHARE_DROPPED` with `access=TEMPORARY_ONLY` and nothing was lost; after
