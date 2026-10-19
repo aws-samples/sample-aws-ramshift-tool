@@ -925,7 +925,9 @@ class MonitorPresentation(unittest.TestCase):
             self.skipTest("set RAMSHIFT_PACKAGE to a built .pyz to check its modules")
         identity = tool_identity()
         with zipfile.ZipFile(package) as bundle:
-            self.assertEqual(bundle.read("BUILD_ID").decode().strip(), identity["sources_digest"])
+            # BUILD_ID names the unpack cache and covers every bundled file, dependencies
+            # included; the recorded identity is the application modules' checksums.
+            self.assertRegex(bundle.read("BUILD_ID").decode().strip(), r"^[0-9a-f]{16}$")
             for name, checksum in identity["sources_sha256"].items():
                 with self.subTest(name=name):
                     self.assertEqual(hashlib.sha256(bundle.read(f"lib/{name}")).hexdigest(),
