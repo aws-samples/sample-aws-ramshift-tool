@@ -170,7 +170,7 @@ As one executable (a Python zipapp with boto3, botocore and PyYAML inside):
 
 ```bash
 packaging/build.sh                      # writes dist/ramshift-<version>.pyz
-alias ramshift="$PWD/dist/ramshift-1.0.0.pyz"
+alias ramshift="$PWD/dist/ramshift-1.1.0.pyz"
 ramshift --version
 ```
 
