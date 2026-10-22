@@ -62,7 +62,10 @@ def validate_principal_scopes(principals: list[str], partition: str) -> None:
 def external_catalog(text: str | None = None) -> dict[str, bool]:
     """AWS's table supplies a capability absent from ListResourceTypes."""
     if text is None:
-        with urllib.request.urlopen(CATALOG, timeout=20) as response:
+        if not CATALOG.startswith("https://"):
+            raise MigrationError("The external-sharing catalog must be read over HTTPS")
+        # A fixed https:// AWS documentation URL, never operator input.
+        with urllib.request.urlopen(CATALOG, timeout=20) as response:  # nosec B310
             text = response.read().decode()
     values: dict[str, bool] = {}
     ambiguous: set[str] = set()
@@ -186,7 +189,8 @@ def read_template(cache: LookupCache | None, account: str, region: str, cfn: Any
     def load():
         body = cfn.get_template(StackName=stack["StackId"],
                                 TemplateStage="Processed")["TemplateBody"]
-        return yaml.load(body, Loader=CfnLoader) if isinstance(body, str) else body
+        # CfnLoader is a yaml.SafeLoader subclass that only adds CloudFormation tags.
+        return yaml.load(body, Loader=CfnLoader) if isinstance(body, str) else body  # nosec B506
     key = template_key(account, region, stack)
     return lookup(cache if key is not None else None, key, load)
 

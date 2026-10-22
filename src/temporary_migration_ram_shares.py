@@ -1758,7 +1758,8 @@ def poll(callback: Callable[[], Any], opts: Options, *, verification: bool = Fal
         except Exception as exc:
             if not transient(exc, verification) or attempt + 1 == opts.args.retry_limit:
                 raise
-            delay = min(15, opts.args.poll_interval * 2 ** min(attempt, 6)) * random.uniform(0.75, 1.25)
+            # Retry jitter only; nothing security-relevant depends on it.
+            delay = min(15, opts.args.poll_interval * 2 ** min(attempt, 6)) * random.uniform(0.75, 1.25)  # nosec B311
             remaining = deadline - time.monotonic()
             if remaining <= delay:
                 raise MigrationError(f"Polling timeout: {failure_text(exc)}") from exc
