@@ -32,7 +32,7 @@ REGION, MIGRATION = "us-west-2", "verification-offline"
 RESOLVER, TGW_TYPE, IPAM, PCA, PREFIX = (
     "route53resolver:ResolverRule", "ec2:TransitGateway", "ec2:IpamPool",
     "acm-pca:CertificateAuthority", "ec2:PrefixList")
-SECRET = "do-not-copy: arn:aws:iam::999999999999:role/Secret token=AKIA0000"
+LEAK_MARKER = "do-not-copy: arn:aws:iam::999999999999:role/Secret token=AKIA0000"
 
 
 def share_arn(name, owner=OWNER):
@@ -114,7 +114,7 @@ class World:
 
     def fail(self, account, service, method, code="AccessDeniedException", request="req-0001", **params):
         self.stub(account, service).add_client_error(
-            method, service_error_code=code, service_message=SECRET, http_status_code=400,
+            method, service_error_code=code, service_message=LEAK_MARKER, http_status_code=400,
             expected_params=params, response_meta={"RequestId": request})
 
     def client(self, account, service, region, *args, **kwargs):
@@ -202,19 +202,19 @@ AUTODEFINED_RULE = {"Id": "rslvr-autodefined-rr-internet-resolver", "Name": "Int
 
 def association_row(association_id, rule_id=RULE_ID, vpc=VPC, status="COMPLETE"):
     return {"Id": association_id, "ResolverRuleId": rule_id, "VPCId": vpc, "Status": status,
-            "Name": "offline", "StatusMessage": SECRET}
+            "Name": "offline", "StatusMessage": LEAK_MARKER}
 
 
 def endpoint_reply(world, status="OPERATIONAL", endpoint_id=ENDPOINT_ID):
     world.reply(OWNER, "route53resolver", "get_resolver_endpoint", {"ResolverEndpoint": {
         "Id": endpoint_id, "Name": "outbound", "Direction": "OUTBOUND", "IpAddressCount": 2,
         "Arn": f"arn:aws:route53resolver:{REGION}:{OWNER}:resolver-endpoint/{endpoint_id}",
-        "HostVPCId": VPC, "Status": status, "StatusMessage": SECRET}}, ResolverEndpointId=endpoint_id)
+        "HostVPCId": VPC, "Status": status, "StatusMessage": LEAK_MARKER}}, ResolverEndpointId=endpoint_id)
 
 
 def ip_row(ip, status="ATTACHED", family="Ip"):
     return {"IpId": "rni-0123456789abcdef0", "SubnetId": "subnet-0123456789abcdef0", family: ip,
-            "Status": status, "StatusMessage": SECRET}
+            "Status": status, "StatusMessage": LEAK_MARKER}
 
 
 def owner_attachment(attachment_id, association="associated", resource_owner=CONSUMER):
@@ -355,7 +355,7 @@ def test_api_failures_are_gaps_with_code_operation_and_request_id_only(world):
     # One share's listing fails; its sibling share still counts.
     world.fail(SECOND, "ram", "list_resources", code="ThrottlingException", request="req-throttled",
                resourceOwner="OTHER-ACCOUNTS", resourceShareArns=[PERMANENT])
-    world.broken[THIRD, "ram"] = MigrationError(f"{THIRD}: supply a mapping; {SECRET}")
+    world.broken[THIRD, "ram"] = MigrationError(f"{THIRD}: supply a mapping; {LEAK_MARKER}")
     observation = collect(world, [g])
     assert observation.items == [entitlement(PREFIX_LIST, consumer=SECOND)]
     assert observation.gaps == [
@@ -642,7 +642,7 @@ def test_ipam_allocations_owned_by_consumers_are_read_from_the_pool_owner(world)
         "NextToken": "allocations-2"}, IpamPoolId=POOL_ID)
     world.reply(OWNER, "ec2", "get_ipam_pool_allocations", {"IpamPoolAllocations": [
         {"Cidr": "10.2.0.0/24", "IpamPoolAllocationId": "ipam-pool-alloc-0f", "ResourceType": "custom",
-         "ResourceOwner": SECOND, "Description": SECRET}]}, IpamPoolId=POOL_ID, NextToken="allocations-2")
+         "ResourceOwner": SECOND, "Description": LEAK_MARKER}]}, IpamPoolId=POOL_ID, NextToken="allocations-2")
     visible(world, CONSUMER, g.resources)
     visible(world, SECOND, g.resources)
     observation = collect(world, [g])
@@ -686,7 +686,7 @@ def test_private_ca_owner_failure_and_a_consumer_without_credentials_are_never_d
                 {"Certificate": CERTIFICATE}, CertificateAuthorityArn=CA)
     # An STS denial while building the consumer's client is not the CA denying access.
     world.broken[SECOND, "acm-pca"] = ClientError(
-        {"Error": {"Code": "AccessDenied", "Message": SECRET},
+        {"Error": {"Code": "AccessDenied", "Message": LEAK_MARKER},
          "ResponseMetadata": {"RequestId": "req-sts"}}, "AssumeRole")
     observation = collect(world, [g])
     assert keyed(observation.items) == keyed([
@@ -1014,7 +1014,7 @@ def test_issuance_runs_only_with_the_exact_approval_and_polls_until_issued(issue
     stub.add_response("issue_certificate", {"CertificateArn": certificate_arn}, {
         "CertificateAuthorityArn": CA, "Csr": CSR, "SigningAlgorithm": "SHA256WITHRSA",
         "Validity": {"Value": 1, "Type": "DAYS"}, "IdempotencyToken": token})
-    stub.add_client_error("get_certificate", "RequestInProgressException", SECRET,
+    stub.add_client_error("get_certificate", "RequestInProgressException", LEAK_MARKER,
                           expected_params={"CertificateAuthorityArn": CA, "CertificateArn": certificate_arn})
     stub.add_response("get_certificate", {"Certificate": CERTIFICATE, "CertificateChain": CERTIFICATE},
                       {"CertificateAuthorityArn": CA, "CertificateArn": certificate_arn})
@@ -1061,7 +1061,7 @@ def test_issuance_needs_the_consumers_acm_pca_client_in_the_ca_region():
 
 def test_issuance_failures_report_code_operation_and_request_id(issuer, monkeypatch):
     client, stub = issuer
-    stub.add_client_error("issue_certificate", "AccessDeniedException", SECRET,
+    stub.add_client_error("issue_certificate", "AccessDeniedException", LEAK_MARKER,
                           response_meta={"RequestId": "req-issue"})
     with pytest.raises(MigrationError) as raised:
         issue(client)
@@ -1070,7 +1070,7 @@ def test_issuance_failures_report_code_operation_and_request_id(issuer, monkeypa
     certificate_arn = f"{CA}/certificate/0123456789abcdef0123456789abcdef"
     monkeypatch.setattr(verification, "ISSUANCE_TIMEOUT", 0)
     stub.add_response("issue_certificate", {"CertificateArn": certificate_arn})
-    stub.add_client_error("get_certificate", "RequestInProgressException", SECRET)
+    stub.add_client_error("get_certificate", "RequestInProgressException", LEAK_MARKER)
     with pytest.raises(MigrationError, match="still in progress"):
         issue(client)
 

@@ -35,6 +35,9 @@ from test_ram_migration_core import (  # noqa: F401 - clients is a fixture used 
 OWNER_FAILED = "The resource share owner cannot be associated with the resource share."
 POLICY_NAME = "Resource Share From Policy Created by RAM"
 
+# An offline stand-in for an SSO access value: never a real credential.
+FAKE_SSO_ACCESS = {"token": "offline-sso-access-value"}
+
 
 @pytest.fixture(autouse=True)
 def offline(request, monkeypatch):
@@ -635,14 +638,15 @@ def test_sso_role_sessions_are_verified_on_a_regional_sts_endpoint(aws_files, mo
             assert profile_name == "sso-base"
 
         def load_token(self):
-            return SimpleNamespace(get_frozen_token=lambda: SimpleNamespace(token="sso-token"))
+            return SimpleNamespace(get_frozen_token=lambda: SimpleNamespace(**FAKE_SSO_ACCESS))
     monkeypatch.setattr("ram_migration_common.SSOTokenProvider", Tokens)
     expiry = int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp() * 1000)
     clients.plan("sts", ("get_caller_identity", identity(BASE, "sso"), {}))
     clients.plan("sso", ("get_role_credentials", {"roleCredentials": {
         "accessKeyId": "ASIASSOEXAMPLE000", "secretAccessKey": "synthetic",
         "sessionToken": "synthetic-sso-token", "expiration": expiry}},
-        {"accountId": TARGET, "roleName": "AdministratorAccess", "accessToken": "sso-token"}))
+        {"accountId": TARGET, "roleName": "AdministratorAccess",
+         "accessToken": FAKE_SSO_ACCESS["token"]}))
     clients.plan("sts", ("get_caller_identity", identity(TARGET), {}))
     router = Router(["sso-base"], {}, sso_role="AdministratorAccess")
     session = router.session(TARGET)

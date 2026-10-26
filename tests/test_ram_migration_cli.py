@@ -4194,15 +4194,15 @@ def test_a_received_resource_being_added_still_blocks(harness, capsys):
 # Accepting blockers: approve --accept-blockers
 # ---------------------------------------------------------------------------
 
-def accept(path, *selectors, reason="Owner resources are re-shared after the move", token=None,
+def accept(path, *selectors, reason="Owner resources are re-shared after the move", reply=None,
            migration=MIGRATION):
-    """approve --accept-blockers, confirming with the expected (or a given) token."""
+    """approve --accept-blockers, confirming with the expected (or a given) reply."""
     replies = []
 
     def answer(prompt):
         replies.append(prompt)
         expected = prompt.split("Type ", 1)[1].split(" to accept", 1)[0]
-        return token if token is not None else expected
+        return reply if reply is not None else expected
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         code = main(["approve", "--record", str(path), "--migration-id", migration,
@@ -4268,7 +4268,7 @@ def test_accepting_needs_the_exact_token_a_reason_and_a_known_blocker(harness, c
     harness.receive(owner=OTHER_OWNER)
     assert main(with_record(args(), migration_record)) == 1
     capsys.readouterr()
-    code, out, _ = accept(migration_record, "all", token="yes")
+    code, out, _ = accept(migration_record, "all", reply="yes")
     assert code == 2 and "status=NOT_ACCEPTED confirmation did not match" in out
     assert read_record(migration_record)["approvals"]["blockers"] == []
     code, out, _ = accept(migration_record, "b-000000000000")

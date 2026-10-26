@@ -182,6 +182,12 @@ def template_key(account: str, region: str, stack: dict) -> tuple | None:
     return ("template", account, region, stack["StackId"], version, stack.get("StackStatus"))
 
 
+def load_template(body: str) -> Any:
+    """A CloudFormation template body, parsed. CfnLoader is a yaml.SafeLoader subclass that
+    only adds the CloudFormation intrinsic tags, so no arbitrary objects are built."""
+    return yaml.load(body, Loader=CfnLoader)  # nosec B506
+
+
 def read_template(cache: LookupCache | None, account: str, region: str, cfn: Any,
                   stack: dict) -> dict:
     """GetTemplate (processed) by StackId, parsed; through the run cache if given and
@@ -189,8 +195,7 @@ def read_template(cache: LookupCache | None, account: str, region: str, cfn: Any
     def load():
         body = cfn.get_template(StackName=stack["StackId"],
                                 TemplateStage="Processed")["TemplateBody"]
-        # CfnLoader is a yaml.SafeLoader subclass that only adds CloudFormation tags.
-        return yaml.load(body, Loader=CfnLoader) if isinstance(body, str) else body  # nosec B506
+        return load_template(body) if isinstance(body, str) else body
     key = template_key(account, region, stack)
     return lookup(cache if key is not None else None, key, load)
 

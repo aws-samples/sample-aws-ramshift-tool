@@ -13,7 +13,7 @@ from botocore.stub import Stubber
 
 from ram_migration_common import PURPOSE, Api, Group, MigrationError, check_sdk
 from ram_migration_discovery import (
-    ApprovedGroup, CfnLoader, Discovery, external_catalog, permission_snapshot,
+    ApprovedGroup, CfnLoader, Discovery, external_catalog, load_template, permission_snapshot,
     policy_semantics, resolve,
 )
 from ram_migration_stacks import (
@@ -301,9 +301,9 @@ def test_qualified_catalogue_row_overrides_unqualified_row_conservatively():
 
 
 def test_principal_resolution_preserves_leading_zeros():
-    template = yaml.load(
+    template = load_template(
         "Parameters:\n  Consumers:\n    Type: CommaDelimitedList\n"
-        "Resources:\n  Share:\n    Properties:\n      Principals: !Ref Consumers\n", Loader=CfnLoader)
+        "Resources:\n  Share:\n    Properties:\n      Principals: !Ref Consumers\n")
     assert resolve(template["Resources"]["Share"]["Properties"]["Principals"],
                    {"Consumers": CONSUMER + "," + OTHER}, template, {}) == [CONSUMER, OTHER]
     assert group().consumers == (CONSUMER,)

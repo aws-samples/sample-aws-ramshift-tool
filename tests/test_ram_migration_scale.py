@@ -646,14 +646,14 @@ def test_expired_credentials_during_real_discovery_are_a_named_authentication_bl
     # Each blocker line ends with its stable ID (blocker=b-...), used to accept it.
     blocked = [re.sub(r" blocker=b-[0-9a-f]{12}$", "", line) for line in output.splitlines()
                if line.startswith("phase=preflight status=BLOCKED")]
-    token = ("ExpiredTokenException: The security token included in the request is expired "
-             "(request request-ExpiredTokenException)")
+    denial = ("ExpiredTokenException: The security token included in the request is expired "
+              "(request request-ExpiredTokenException)")
     if failing == "listing":
         assert blocked == [f"phase=preflight status=BLOCKED owner={OWNER} region={REGION} "
-                           f"phase=discovery operation=GetResourceShares {token}"]
+                           f"phase=discovery operation=GetResourceShares {denial}"]
     else:
         assert blocked == [f"phase=preflight status=BLOCKED {arn}: owner={OWNER} region={REGION} "
-                           f"operation=ListResources {token}" for arn in owner.listing]
+                           f"operation=ListResources {denial}" for arn in owner.listing]
     auth, = [line for line in summary_lines(output) if "category=" in line]
     shares = "" if failing == "listing" else f"shares={len(owner.listing)} "
     assert auth.startswith(f"phase=blocker-summary category=authentication "

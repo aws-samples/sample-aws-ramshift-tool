@@ -10,6 +10,8 @@ import urllib.request
 
 import boto3
 import botocore.session
+from botocore import UNSIGNED
+from botocore.config import Config
 import pytest
 from botocore.stub import Stubber
 
@@ -70,8 +72,7 @@ class Router:
     def stub(self, account: str) -> Stubber:
         if account not in self.stubs:
             client = self.session.create_client(
-                "organizations", region_name=HOME, aws_access_key_id="testing",
-                aws_secret_access_key="testing")
+                "organizations", region_name=HOME, config=Config(signature_version=UNSIGNED))
             self.clients[account], self.stubs[account] = client, Stubber(client)
             self.stubs[account].activate()
         return self.stubs[account]
