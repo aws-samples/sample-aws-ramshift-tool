@@ -6,8 +6,8 @@ views, and the CLI runs against the local harness of test_ram_migration_cli.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
-import random
 import re
 import signal
 import threading
@@ -207,8 +207,8 @@ SCOPE = {"migrating_consumers": [CONSUMER, OTHER_CONSUMER], "migrating_owners": 
 # ---------------------------------------------------------------------------
 def test_concurrent_discovery_is_deterministic_for_any_listing_or_completion_order():
     arns = sorted(estate())
-    shuffled = arns[:]
-    random.Random(7).shuffle(shuffled)
+    # A fixed scrambled order, neither sorted nor reversed.
+    shuffled = sorted(arns, key=lambda arn: hashlib.sha256(arn.encode()).hexdigest())
     sequential, _ = discover(FakeOwner())
     forward, forward_order = discover(FakeOwner(listing=arns[::-1]), workers=9, completion=arns)
     backward, backward_order = discover(FakeOwner(listing=shuffled), workers=9,
