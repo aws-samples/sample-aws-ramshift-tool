@@ -13,6 +13,24 @@ cp "$ROOT"/src/*.py "$BUILD/app/lib/"
 "$PYTHON" -m pip install --quiet --no-compile --target "$BUILD/deps" -r "$ROOT/requirements.txt"
 # Pure-Python only: compiled extensions cannot load from a zipapp; PyYAML falls back to Python.
 (cd "$BUILD/deps" && find . -name "*.so" -delete && find . -name "__pycache__" -prune -exec rm -rf {} +)
+# The bundled third-party distributions, their versions and licenses, for the release notes.
+"$PYTHON" - "$BUILD/deps" > "$ROOT/dist/THIRD-PARTY-LICENSES.md" <<'PY'
+import sys
+from email.parser import Parser
+from pathlib import Path
+rows = []
+for meta in sorted(Path(sys.argv[1]).glob("*.dist-info/METADATA")):
+    m = Parser().parsestr(meta.read_text(encoding="utf-8"))
+    license_ = m.get("License-Expression") or next(
+        (c.split("::")[-1].strip() for c in m.get_all("Classifier") or [] if c.startswith("License ::")),
+        None) or (m.get("License") or "see bundled license file").splitlines()[0]
+    rows.append(f"| {m['Name']} | {m['Version']} | {license_} | {m.get('Home-page') or ''} |")
+print("# Third-party software bundled in ramshift-<version>.pyz\n")
+print("The executable bundles these Python distributions unmodified. Each one's license and")
+print("notice files are inside it under lib/THIRD_PARTY_LICENSES/.\n")
+print("| Distribution | Version | License | Home page |\n|---|---|---|---|")
+print("\n".join(rows))
+PY
 for dist in "$BUILD"/deps/*.dist-info; do
   name=$(basename "$dist" .dist-info)
   for lic in "$dist"/licenses/* "$dist"/LICENSE* "$dist"/NOTICE*; do
@@ -25,4 +43,5 @@ cp -R "$BUILD"/deps/* "$BUILD/app/lib/"
 sed "s/^VERSION = \".*\"$/VERSION = \"$VERSION\"/" "$ROOT/packaging/launcher_main.py" > "$BUILD/app/__main__.py"
 "$PYTHON" -m zipapp "$BUILD/app" -o "$ROOT/dist/ramshift-$VERSION.pyz" -p "/usr/bin/env python3" -c
 chmod +x "$ROOT/dist/ramshift-$VERSION.pyz"
+(cd "$ROOT/dist" && shasum -a 256 "ramshift-$VERSION.pyz" THIRD-PARTY-LICENSES.md > SHA256SUMS)
 echo "$ROOT/dist/ramshift-$VERSION.pyz"
