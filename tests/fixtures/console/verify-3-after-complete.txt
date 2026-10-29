@@ -1,0 +1,8 @@
+consumer=400000000009 phase=verification status=RETIRED at=2026-10-15T05:13:51.984983+00:00
+account=400000000017 phase=authentication status=VERIFIED
+account=400000000006 phase=authentication status=VERIFIED
+owner=400000000006 phase=scope regions=us-east-1,us-west-2
+owner=400000000017 phase=scope regions=us-east-1,us-west-2
+status=INCOMPLETE No stored/planned migration entitlements found in the requested scope
+status=INCOMPLETE migration=example-migration resources_in_plan=0 expected_entitlements=0 planned_shares=0 created_shares=0 reused_shares=0 accepted_invitations=0 reused_invitations=0 exclusions=0 blockers=0 verification_failures=1
+Sharing status is not live migration acceptance evidence. Resource totals cover planned entitlements; excluded inventory is reported separately.
